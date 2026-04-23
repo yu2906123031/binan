@@ -432,7 +432,7 @@
    298|- 当前实测可确认：扫描、候选打分、OKX bridge 情绪注入、真实开仓、初始保护止损、reconcile 对账、`strategy_halted` / `protection_missing` / `scan_alert` 通知都可用；但自动保本、TP1/TP2、runner、后台持仓监控仍未完成实现
    299|- 维护/重构该 skill 下脚本时，先做文件级备份（例如复制到 `/tmp/` 或同目录 `.bak`）再执行批量改写；本 skill 目录不是 git 仓库，误用整文件覆写时无法靠 `git diff/checkout` 恢复。特别是对 `scripts/binance_futures_momentum_long.py` 这类大文件，写入后必须立即用 `py_compile` 或导入检查确认核心入口（如 `build_candidate`、`run_scan_once`、`main`）仍存在，避免把策略主干意外截断后才继续后续修改。
    300|- 通知目标支持 Telegram 与企业微信/微信客服通道（`weixin:<chat_id>`）
-   301|- `--notify-target` 支持逗号分隔的多目标；例如：`telegram:-5125444265,weixin:o9cq8057ZI7ybume1S-QWi-5uXlw@im.wechat`，可实现交易事件双发
+   301|- `--notify-target` supports comma-separated multi-target delivery; example: `telegram:<chat_id>,weixin:<chat_id>`
    302|
    303|脚本路径：
    304|`/root/.hermes/skills/binance/binance-futures-momentum-long/scripts/binance_futures_momentum_long.py`
@@ -621,7 +621,7 @@
    487|  --risk-usdt 1 \
    488|  --leverage 3 \
    489|  --square-symbols-file /root/.hermes/binance_square_symbols.txt \
-   490|  --notify-target telegram:-5125444265,weixin:o9cq8057ZI7ybume1S-QWi-5uXlw@im.wechat
+   490|  --notify-target telegram:<chat_id>,weixin:<chat_id>
    491|```
    492|
    493|说明：

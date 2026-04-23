@@ -14,11 +14,11 @@
    - 已由 cron `refresh-binance-square-symbols` 每 15 分钟刷新
 4. 当前账户快照任务：
    - cron `binance-u-futures-account-snapshot` 每 120 分钟推送一次到微信 Home
-5. 当前实盘进程：
-   - 存在一个长期运行进程：
-   - `python -u .../binance_futures_momentum_long.py --live --auto-loop --max-scan-cycles 0 --poll-interval-sec 60 --risk-usdt 1 --leverage 3 --max-open-positions 4 --square-symbols-file /root/.hermes/binance_square_symbols.txt --notify-target telegram:-5125444265,weixin:o9cq8057ZI7ybume1S-QWi-5uXlw@im.wechat`
-6. 当前真实持仓：
-   - ORDIUSDT LONG 1.7，说明系统已在真实运行
+5. 运行示例：
+   - 存在一条长期运行命令模板：
+   - `python -u .../binance_futures_momentum_long.py --live --auto-loop --max-scan-cycles 0 --poll-interval-sec 60 --risk-usdt 1 --leverage 3 --max-open-positions 4 --square-symbols-file /root/.hermes/binance_square_symbols.txt --notify-target telegram:<chat_id>,weixin:<chat_id>`
+6. 账户持仓示例：
+   - 以实际账户查询结果为准。
 
 ## 当前优点
 
