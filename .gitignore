@@ -1,0 +1,22 @@
+# Python cache and test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state and local artifacts
+runtime-state/
+*.log
+*.sqlite
+*.db
+
+# Local backups and editor artifacts
+*.save
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
