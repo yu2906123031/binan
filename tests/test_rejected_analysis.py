@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-SCRIPT_PATH = Path('/root/.hermes/skills/binance/binance-futures-momentum-long/scripts/rejected_analysis.py')
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'rejected_analysis.py'
 spec = importlib.util.spec_from_file_location('rejected_analysis', SCRIPT_PATH)
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod

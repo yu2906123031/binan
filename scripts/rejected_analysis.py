@@ -3,9 +3,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+
+
+DEFAULT_HERMES_HOME = Path(os.path.expanduser(os.getenv('HERMES_HOME', str(Path.home() / '.hermes'))))
+DEFAULT_APP_HOME = DEFAULT_HERMES_HOME / 'binance-futures-momentum-long'
+DEFAULT_RUNTIME_STATE_DIR = DEFAULT_APP_HOME / 'runtime-state'
+DEFAULT_OUTPUT_JSON = DEFAULT_APP_HOME / 'rejected-analysis.json'
+DEFAULT_OUTPUT_MARKDOWN = DEFAULT_APP_HOME / 'rejected-analysis.md'
 
 
 def _to_float(value: Any) -> float:
@@ -165,9 +173,9 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Aggregate candidate_rejected events into JSON and markdown reports.')
-    parser.add_argument('--runtime-state-dir', default='/root/.hermes/binance-futures-momentum-long/runtime-state')
-    parser.add_argument('--output-json', default='/root/.hermes/binance-futures-momentum-long/rejected-analysis.json')
-    parser.add_argument('--output-markdown', default='/root/.hermes/binance-futures-momentum-long/rejected-analysis.md')
+    parser.add_argument('--runtime-state-dir', default=str(DEFAULT_RUNTIME_STATE_DIR))
+    parser.add_argument('--output-json', default=str(DEFAULT_OUTPUT_JSON))
+    parser.add_argument('--output-markdown', default=str(DEFAULT_OUTPUT_MARKDOWN))
     parser.add_argument('--limit', type=int, default=5000)
     args = parser.parse_args()
     payload = run(

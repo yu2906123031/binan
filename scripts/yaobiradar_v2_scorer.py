@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Sequence
 import yaobiradar_v2_output_writer as writer
 
 DEFAULT_ENGINE = 'yaobiradar_v2'
-DEFAULT_INPUT_PATH = Path('/root/.hermes/yaobiradar_v2_candidates.json')
+DEFAULT_INPUT_PATH = writer.SYMBOLS_PATH.parent / 'yaobiradar_v2_candidates.json'
 
 
 def _to_float(value: Any) -> float:
@@ -92,6 +92,18 @@ def build_rows(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             'external_position_size_pct': position_size_pct_for_tier(tier),
             'external_reasons': reasons,
         }
+        for source_key, output_key in (
+            ('portfolio_narrative_bucket', 'portfolio_narrative_bucket'),
+            ('narrative_bucket', 'portfolio_narrative_bucket'),
+            ('theme_bucket', 'portfolio_narrative_bucket'),
+            ('portfolio_theme', 'portfolio_narrative_bucket'),
+            ('portfolio_correlation_group', 'portfolio_correlation_group'),
+            ('correlation_group', 'portfolio_correlation_group'),
+            ('correlation_bucket', 'portfolio_correlation_group'),
+        ):
+            value = str(candidate.get(source_key) or '').strip()
+            if value and output_key not in row:
+                row[output_key] = value
         if blocked:
             row['external_veto'] = True
             row['external_veto_reason'] = veto_reason or 'blocked'

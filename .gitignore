@@ -5,9 +5,11 @@ __pycache__/
 
 # Runtime state and local artifacts
 runtime-state/
+runtime-state-binance-futures-testnet/
 *.log
 *.sqlite
 *.db
+.github-upload-temp/
 
 # Local backups and editor artifacts
 *.save
@@ -17,6 +19,8 @@ runtime-state/
 # Environment and secrets
 .env
 .env.*
+!.env.example
+.venv/
 
 # OS/editor noise
 .DS_Store

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-SCRIPT_PATH = Path('/root/.hermes/skills/binance/binance-futures-momentum-long/scripts/binance_futures_momentum_long.py')
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
 
 
 def load_module():
@@ -38,9 +38,15 @@ class DummyClient:
 class DummyStore:
     def __init__(self):
         self.saved = []
+        self.events = []
 
     def save_json(self, name, payload):
         self.saved.append((name, payload))
+
+    def append_event(self, event_type, payload):
+        row = {'event_type': event_type, **(payload or {})}
+        self.events.append(row)
+        return row
 
 
 
@@ -91,6 +97,357 @@ def test_run_loop_scan_only_returns_before_live_execution(monkeypatch):
     cycle = result['cycles'][0]
     assert cycle['scan']['candidates'] == ['DOGEUSDT']
     assert 'live_execution' not in cycle
+
+
+def test_run_loop_scan_only_persists_candidate_selected_event(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=0.142,
+        price_change_pct_24h=8.4,
+        quote_volume_24h=75_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0002,
+        funding_rate_avg=-0.0001,
+        recent_5m_change_pct=1.8,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=0.14,
+        recent_swing_low=0.136,
+        stop_price=0.137,
+        quantity=1000.0,
+        risk_per_unit=0.005,
+        recommended_leverage=5,
+        rsi_5m=68.0,
+        volume_multiple=2.2,
+        distance_from_ema20_5m_pct=1.1,
+        distance_from_vwap_15m_pct=0.8,
+        higher_tf_summary={'1h': 'trend_up'},
+        score=82.6,
+        reasons=['candidate_selected'],
+        side='LONG',
+        position_side='LONG',
+        state='launch',
+        state_reasons=['launch_breakout'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.1,
+        side_risk_multiplier=1.0,
+        quality_score=18.2,
+        execution_priority_score=9.1,
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='launch',
+        expected_slippage_pct=0.04,
+        book_depth_fill_ratio=0.92,
+        spread_bps=2.1,
+        orderbook_slope=1.3,
+        cancel_rate=0.04,
+        portfolio_narrative_bucket='meme',
+        portfolio_correlation_group='dog-family',
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({
+        'candidate_count': 1,
+        'candidates': ['DOGEUSDT'],
+        'market_regime': {'label': 'risk_on', 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20']},
+    }, candidate, {'DOGEUSDT': {'symbol': 'DOGEUSDT'}}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    result = mod.run_loop(DummyClient(), make_args(scan_only=True, runtime_state_dir=str(tmp_path), profile='scan-only'))
+
+    assert result['ok'] is True
+    rows = store.read_events(limit=10)
+    assert rows[-1]['event_type'] == 'candidate_selected'
+    assert rows[-1]['symbol'] == 'DOGEUSDT'
+    assert rows[-1]['position_key'] == 'DOGEUSDT:LONG'
+    assert rows[-1]['profile'] == 'scan-only'
+    assert rows[-1]['scan_only'] is True
+    assert rows[-1]['live_requested'] is False
+
+
+def test_run_loop_scan_only_skips_reconcile_when_api_secret_missing(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'candidate_count': 0, 'candidates': []}, None, {}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    result = mod.run_loop(mod.BinanceFuturesClient(base_url='https://fapi.binance.com'), make_args(scan_only=True))
+
+    assert result['ok'] is True
+    cycle = result['cycles'][0]
+    assert cycle['reconcile']['skipped'] is True
+    assert cycle['reconcile']['skip_reason'] == 'missing_api_secret'
+    assert cycle['scan']['candidate_count'] == 0
+
+
+def test_run_loop_okx_simulated_trading_submits_okx_order_without_binance_live_calls(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    candidate = SimpleNamespace(
+        symbol='APEUSDT',
+        side='LONG',
+        last_price=0.19,
+        stop_price=0.17,
+        quantity=100.0,
+        recommended_leverage=5,
+        atr_stop_distance=0.01,
+        portfolio_narrative_bucket='test',
+        portfolio_correlation_group='test',
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('Binance reconcile should be skipped')))
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'candidate_count': 1, 'candidates': [candidate]}, candidate, {'APEUSDT': object()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: (_ for _ in ()).throw(AssertionError('Binance open positions should be skipped')))
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('Binance live trade should not be used')))
+    monkeypatch.setattr(mod, 'place_okx_simulated_trade', lambda okx_client, best_candidate, leverage, args: {
+        'exchange': 'OKX',
+        'simulated': True,
+        'symbol': best_candidate.symbol,
+        'inst_id': 'APE-USDT-SWAP',
+        'side': 'LONG',
+        'entry_price': best_candidate.last_price,
+        'filled_quantity': best_candidate.quantity,
+        'entry_order_feedback': {'order_id': 'sim-1', 'status': '0'},
+        'margin_type': 'ISOLATED',
+        'leverage': leverage,
+        'trade_management_plan': dataclasses.asdict(mod.build_trade_management_plan(
+            entry_price=best_candidate.last_price,
+            stop_price=best_candidate.stop_price,
+            quantity=best_candidate.quantity,
+            tp1_r=1.5,
+            tp1_close_pct=0.3,
+            tp2_r=2.0,
+            tp2_close_pct=0.4,
+            side='LONG',
+        )),
+        'stop_order': {},
+        'protection_check': {'status': 'simulated', 'side': 'LONG'},
+    })
+
+    result = mod.run_loop(DummyClient(), make_args(
+        live=True,
+        okx_simulated_trading=True,
+        okx_base_url='https://www.okx.com',
+        runtime_state_dir=str(tmp_path),
+        margin_type='ISOLATED',
+        profile='okx-sim',
+    ))
+
+    cycle = result['cycles'][0]
+    assert cycle['reconcile']['skip_reason'] == 'okx_simulated_trading'
+    assert cycle['execution_exchange'] == 'OKX_SIMULATED'
+    assert cycle['live_execution']['exchange'] == 'OKX'
+    assert cycle['trade_management']['mode'] == 'okx_simulated'
+    positions = store.load_json('positions', {})
+    assert positions['APEUSDT:LONG']['protection_status'] == 'simulated'
+    events = store.read_events(limit=10)
+    assert events[-1]['event_type'] == 'okx_simulated_order_submitted'
+
+
+def test_build_okx_simulated_order_omits_pos_side_in_net_mode():
+    mod = load_module()
+    candidate = SimpleNamespace(symbol='APEUSDT', side='SHORT', quantity=100.0)
+
+    order = mod.build_okx_simulated_order(
+        candidate,
+        leverage=3,
+        args=make_args(margin_type='ISOLATED'),
+        instrument={'instId': 'APE-USDT-SWAP', 'ctVal': '1', 'lotSz': '1', 'minSz': '1'},
+        account_snapshot={'position_mode': 'net_mode'},
+    )
+
+    assert order['instId'] == 'APE-USDT-SWAP'
+    assert order['side'] == 'sell'
+    assert 'posSide' not in order
+
+
+def test_build_okx_simulated_order_keeps_pos_side_in_long_short_mode():
+    mod = load_module()
+    candidate = SimpleNamespace(symbol='APEUSDT', side='SHORT', quantity=100.0)
+
+    order = mod.build_okx_simulated_order(
+        candidate,
+        leverage=3,
+        args=make_args(margin_type='ISOLATED'),
+        instrument={'instId': 'APE-USDT-SWAP', 'ctVal': '1', 'lotSz': '1', 'minSz': '1'},
+        account_snapshot={'position_mode': 'long_short_mode'},
+    )
+
+    assert order['posSide'] == 'short'
+
+
+def test_run_loop_okx_non_retryable_symbol_error_updates_skip_file(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    candidate = SimpleNamespace(
+        symbol='KATUSDT',
+        side='SHORT',
+        last_price=0.19,
+        stop_price=0.21,
+        quantity=100.0,
+        recommended_leverage=5,
+        atr_stop_distance=0.01,
+        setup_ready=True,
+        trigger_fired=True,
+        portfolio_narrative_bucket='test',
+        portfolio_correlation_group='test',
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'candidate_count': 1, 'candidates': []}, candidate, {'KATUSDT': object()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'place_okx_simulated_trade', lambda *args, **kwargs: (_ for _ in ()).throw(
+        mod.OKXAPIError("OKX API error 1: {'data': [{'sCode': '51001'}]}")
+    ))
+    monkeypatch.setattr(mod, 'append_candidate_rejected_event', lambda *args, **kwargs: {})
+
+    result = mod.run_loop(DummyClient(), make_args(
+        live=True,
+        okx_simulated_trading=True,
+        okx_base_url='https://www.okx.com',
+        runtime_state_dir=str(tmp_path),
+        margin_type='ISOLATED',
+        profile='okx-sim',
+    ))
+
+    cycle = result['cycles'][0]
+    assert cycle['live_execution_error']['symbol'] == 'KATUSDT'
+    assert store.load_json('okx-sim-skip-symbols', {}) == {'symbols': ['KATUSDT']}
+
+
+def test_build_okx_reduce_only_order_omits_pos_side_in_net_mode():
+    mod = load_module()
+    position = {'symbol': 'APEUSDT', 'side': 'LONG', 'margin_type': 'ISOLATED'}
+
+    order = mod.build_okx_reduce_only_order(
+        position,
+        quantity=10.0,
+        args=make_args(margin_type='ISOLATED'),
+        instrument={'instId': 'APE-USDT-SWAP', 'ctVal': '0.1', 'lotSz': '1'},
+        account_snapshot={'position_mode': 'net_mode'},
+    )
+
+    assert order['side'] == 'sell'
+    assert order['reduceOnly'] == 'true'
+    assert order['sz'] == '100'
+    assert 'posSide' not in order
+
+
+def test_run_loop_okx_existing_local_position_blocks_new_open(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'APEUSDT:LONG': {
+            'symbol': 'APEUSDT',
+            'side': 'LONG',
+            'status': 'open',
+            'quantity': 10.0,
+            'remaining_quantity': 10.0,
+            'entry_price': 1.0,
+            'stop_price': 0.9,
+        }
+    })
+    candidate = SimpleNamespace(
+        symbol='DOGEUSDT',
+        side='LONG',
+        last_price=0.1,
+        stop_price=0.09,
+        quantity=100.0,
+        notional=10.0,
+        recommended_leverage=3,
+        portfolio_narrative_bucket='',
+        portfolio_correlation_group='',
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'manage_okx_simulated_positions', lambda *args, **kwargs: {'ok': True, 'actions': [], 'errors': [], 'tracked_positions': 1})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'candidate_count': 1, 'candidates': []}, candidate, {'DOGEUSDT': object()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'place_okx_simulated_trade', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not open a new OKX position')))
+    monkeypatch.setattr(mod, 'append_candidate_rejected_event', lambda *args, **kwargs: {})
+
+    result = mod.run_loop(DummyClient(), make_args(
+        live=True,
+        okx_simulated_trading=True,
+        runtime_state_dir=str(tmp_path),
+        max_open_positions=1,
+    ))
+
+    cycle = result['cycles'][0]
+    assert cycle['live_skipped_due_to_existing_positions'][0]['symbol'] == 'APEUSDT'
+
+
+def test_manage_okx_simulated_positions_closes_stale_local_position_after_51169(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'BIOUSDT:SHORT': {
+            'symbol': 'BIOUSDT',
+            'side': 'SHORT',
+            'status': 'open',
+            'quantity': 235.28,
+            'remaining_quantity': 235.28,
+            'entry_price': 0.02803,
+            'stop_price': 0.0282,
+            'current_stop_price': 0.0282,
+            'protection_status': 'simulated',
+            'tp1_hit': True,
+            'tp2_hit': True,
+            'monitor_mode': 'okx_simulated_loop',
+        }
+    })
+
+    monkeypatch.setattr(mod, 'build_okx_account_snapshot', lambda client: {'position_mode': 'long_short_mode'})
+    monkeypatch.setattr(mod, 'fetch_okx_ticker_last', lambda client, inst_id: 0.0283)
+    monkeypatch.setattr(mod, 'fetch_okx_open_positions', lambda client, inst_id='': [])
+    monkeypatch.setattr(
+        mod,
+        'place_okx_reduce_only_market',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            mod.OKXAPIError("OKX API error 1: {'data': [{'sCode': '51169'}]}")
+        ),
+    )
+
+    result = mod.manage_okx_simulated_positions(
+        store,
+        make_args(profile='okx-sim', runtime_state_dir=str(tmp_path)),
+        SimpleNamespace(simulated_trading=True),
+    )
+
+    assert result['ok'] is True
+    assert result['tracked_positions'] == 0
+
+    positions = store.load_json('positions', {})
+    tracked = positions['BIOUSDT:SHORT']
+    assert tracked['status'] == 'closed'
+    assert tracked['remaining_quantity'] == 0.0
+    assert tracked['protection_status'] == 'flat'
+    assert tracked['exit_reason'] == 'stop'
+    assert tracked['exchange_reconcile_reason'] == 'okx_position_missing_after_reduce_failure'
+
+    events = store.read_events(limit=10)
+    assert events[-1]['event_type'] == 'okx_position_reconciled_closed'
+    assert events[-1]['symbol'] == 'BIOUSDT'
+    assert events[-1]['reconcile_reason'] == 'okx_position_missing_after_reduce_failure'
 
 
 def test_run_loop_scan_only_output_reports_scan_only_mode(monkeypatch):
@@ -594,6 +951,158 @@ def test_run_loop_auto_loop_persists_book_ticker_supervisor_health_without_live_
     assert book_ticker_calls[0]['provided_symbols'] == ['DOGEUSDT']
 
 
+def test_run_loop_auto_loop_records_book_ticker_unavailable_when_dependency_missing(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False, 'halt_reason': '', 'symbol_cooldowns': {}, 'daily_realized_pnl_usdt': 0.0, 'consecutive_losses': 0})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *args, **kwargs: ({'ok': True, 'candidate_count': 0, 'candidates': []}, None, {}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'websocket', None, raising=False)
+
+    result = mod.run_loop(DummyClient(), make_args(auto_loop=True, live=False, runtime_state_dir=str(tmp_path)))
+
+    cycle = result['cycles'][0]
+    assert cycle['book_ticker_websocket'] == {
+        'status': 'unavailable',
+        'reason': 'websocket_client_missing',
+    }
+    events = store.read_events(limit=10)
+    assert any(row['event_type'] == 'book_ticker_ws_unavailable' for row in events)
+
+
+def test_run_loop_auto_loop_refreshes_existing_user_data_stream_without_new_trade(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('user_data_stream', {
+        'symbol': 'DOGEUSDT',
+        'listen_key': 'existing-listen-key',
+        'status': 'started',
+        'started_at': '2026-04-20T12:00:00Z',
+        'last_refresh_at': '2026-04-20T12:00:00Z',
+        'updated_at': '2026-04-20T12:00:00Z',
+    })
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'quantity': 12.5,
+            'status': 'monitoring',
+        }
+    })
+    monitor_calls = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False, 'halt_reason': '', 'symbol_cooldowns': {}, 'daily_realized_pnl_usdt': 0.0, 'consecutive_losses': 0})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *args, **kwargs: ({'ok': True, 'candidate_count': 0, 'candidates': []}, None, {}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    def fake_run_user_data_stream_monitor_cycle(client, store, symbol=None, now=None, refresh_interval_minutes=30.0, disconnect_timeout_minutes=65.0):
+        monitor_calls.append({
+            'symbol': symbol,
+            'refresh_interval_minutes': refresh_interval_minutes,
+            'disconnect_timeout_minutes': disconnect_timeout_minutes,
+        })
+        return {
+            'listen_key': 'existing-listen-key',
+            'status': 'refreshed',
+            'action': 'refreshed',
+            'health': {
+                'symbol': 'DOGEUSDT',
+                'listen_key': 'existing-listen-key',
+                'status': 'refreshed',
+                'refresh_failure_count': 0,
+                'disconnect_count': 0,
+                'updated_at': '2026-04-20T12:31:00Z',
+            },
+            'now_utc': '2026-04-20T12:31:00Z',
+        }
+
+    monkeypatch.setattr(mod, 'run_user_data_stream_monitor_cycle', fake_run_user_data_stream_monitor_cycle, raising=False)
+
+    result = mod.run_loop(DummyClient(), make_args(
+        live=True,
+        auto_loop=True,
+        runtime_state_dir=str(tmp_path),
+        user_stream_refresh_interval_minutes=12.0,
+        user_stream_disconnect_timeout_minutes=34.0,
+    ))
+
+    assert monitor_calls == [{'symbol': 'DOGEUSDT', 'refresh_interval_minutes': 12.0, 'disconnect_timeout_minutes': 34.0}]
+    cycle = result['cycles'][0]
+    assert cycle['user_data_stream_monitor']['status'] == 'refreshed'
+    assert cycle['scan']['candidate_count'] == 0
+    tracked = store.load_json('positions', {})['DOGEUSDT:LONG']
+    assert tracked['user_data_stream']['status'] == 'refreshed'
+    assert tracked['user_data_stream']['listen_key'] == 'existing-listen-key'
+
+
+def test_run_loop_auto_loop_alerts_existing_user_data_stream_refresh_failure(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('user_data_stream', {
+        'symbol': 'DOGEUSDT',
+        'listen_key': 'existing-listen-key',
+        'status': 'started',
+        'started_at': '2026-04-20T12:00:00Z',
+        'last_refresh_at': '2026-04-20T12:00:00Z',
+        'updated_at': '2026-04-20T12:00:00Z',
+    })
+    notifications = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False, 'halt_reason': '', 'symbol_cooldowns': {}, 'daily_realized_pnl_usdt': 0.0, 'consecutive_losses': 0})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *args, **kwargs: ({'ok': True, 'candidate_count': 0, 'candidates': []}, None, {}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event_type, payload: notifications.append((event_type, payload)) or {'ok': True})
+    monkeypatch.setattr(mod, 'run_user_data_stream_monitor_cycle', lambda **kwargs: {
+        'listen_key': 'existing-listen-key',
+        'status': 'refresh_failed',
+        'action': 'refresh_failed',
+        'health': {
+            'symbol': 'DOGEUSDT',
+            'listen_key': 'existing-listen-key',
+            'status': 'refresh_failed',
+            'detail': 'refresh timeout',
+            'refresh_failure_count': 2,
+            'disconnect_count': 0,
+            'reconnect_count': 0,
+            'updated_at': '2026-04-20T12:31:00Z',
+        },
+        'error': 'refresh timeout',
+        'now_utc': '2026-04-20T12:31:00Z',
+    }, raising=False)
+
+    result = mod.run_loop(DummyClient(), make_args(live=True, auto_loop=True, runtime_state_dir=str(tmp_path), disable_notify=False))
+
+    assert result['cycles'][0]['user_data_stream_monitor']['status'] == 'refresh_failed'
+    assert result['cycles'][0]['user_data_stream_alert']['refresh_failure_count'] == 2
+    assert notifications == [(
+        'user_data_stream_alert',
+        {
+            'symbol': 'DOGEUSDT',
+            'listen_key': 'existing-listen-key',
+            'status': 'refresh_failed',
+            'action': 'refresh_failed',
+            'error': 'refresh timeout',
+            'detail': 'refresh timeout',
+            'disconnect_count': 0,
+            'refresh_failure_count': 2,
+            'reconnect_count': 0,
+            'started_at': None,
+            'last_refresh_at': None,
+            'updated_at': '2026-04-20T12:31:00Z',
+        },
+    )]
+
+
 
 def test_place_live_trade_returns_fill_feedback_and_emits_entry_before_stop(monkeypatch):
     mod = load_module()
@@ -616,6 +1125,8 @@ def test_place_live_trade_returns_fill_feedback_and_emits_entry_before_stop(monk
     class Client:
         def signed_post(self, path, params):
             calls.append((path, params))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             if path == '/fapi/v1/order':
@@ -638,9 +1149,11 @@ def test_place_live_trade_returns_fill_feedback_and_emits_entry_before_stop(monk
 
     result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
 
-    assert calls[0][0] == '/fapi/v1/leverage'
-    assert calls[1][0] == '/fapi/v1/order'
-    assert calls[1][1]['quantity'] == '12.7'
+    assert calls[0][0] == '/fapi/v1/marginType'
+    assert calls[0][1]['marginType'] == 'ISOLATED'
+    assert calls[1][0] == '/fapi/v1/leverage'
+    assert calls[2][0] == '/fapi/v1/order'
+    assert calls[2][1]['quantity'] == '12.7'
     assert runtime_events[0][0] == 'entry_filled'
     assert notifications[0][0] == 'entry_filled'
     assert runtime_events[1][0] == 'initial_stop_placed'
@@ -654,6 +1167,10 @@ def test_place_live_trade_returns_fill_feedback_and_emits_entry_before_stop(monk
     assert result['entry_order_feedback']['status'] == 'FILLED'
     assert result['entry_order_feedback']['client_order_id'] == 'entry-order-1'
     assert result['entry_order_feedback']['update_time'] == 1710000000123
+    assert result['margin_type'] == 'ISOLATED'
+    assert result['margin_type_check']['ok'] is True
+    assert result['trade_management_plan']['breakeven_confirmation_mode'] == 'ema_support'
+    assert result['trade_management_plan']['breakeven_min_buffer_pct'] == 0.001
 
 
 def test_run_loop_background_buy_fill_confirmed_persists_entry_feedback(monkeypatch, tmp_path):
@@ -664,6 +1181,8 @@ def test_run_loop_background_buy_fill_confirmed_persists_entry_feedback(monkeypa
         quantity=12.5,
         stop_price=0.1234,
         recommended_leverage=3,
+        portfolio_narrative_bucket='meme',
+        portfolio_correlation_group='dog-family',
     )
     meta = SimpleNamespace(symbol='DOGEUSDT')
     live_execution = {
@@ -705,6 +1224,8 @@ def test_run_loop_background_buy_fill_confirmed_persists_entry_feedback(monkeypa
     assert tracked['filled_quantity'] == 12.7
     assert tracked['entry_cum_quote'] == 1.73355
     assert tracked['entry_update_time'] == 1710000000123
+    assert tracked['portfolio_narrative_bucket'] == 'meme'
+    assert tracked['portfolio_correlation_group'] == 'dog-family'
     assert tracked['user_data_stream']['status'] == 'started'
     assert tracked['user_data_stream']['listen_key'] == 'dummy-listen-key'
     assert result['cycles'][0]['trade_management']['user_data_stream']['listen_key'] == 'dummy-listen-key'
@@ -718,6 +1239,53 @@ def test_run_loop_background_buy_fill_confirmed_persists_entry_feedback(monkeypa
     assert buy_fill['filled_quantity'] == 12.7
     assert buy_fill['entry_cum_quote'] == 1.73355
     assert buy_fill['entry_update_time'] == 1710000000123
+
+
+def test_run_loop_live_open_persists_candidate_portfolio_buckets_before_monitor(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    candidate = SimpleNamespace(
+        symbol='SUIUSDT',
+        quantity=4.0,
+        stop_price=1.9,
+        recommended_leverage=3,
+        portfolio_narrative_bucket='l1-beta',
+        portfolio_correlation_group='move-family',
+    )
+    meta = SimpleNamespace(symbol='SUIUSDT')
+    live_execution = {
+        'symbol': 'SUIUSDT',
+        'side': 'LONG',
+        'entry_price': 2.1,
+        'filled_quantity': 4.0,
+        'trade_management_plan': {'quantity': 4.0},
+        'stop_order': {'orderId': 98765},
+        'protection_check': {'status': 'protected'},
+        'entry_order_feedback': {
+            'order_id': 12345,
+            'client_order_id': 'entry-order-1',
+            'status': 'FILLED',
+        },
+    }
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'candidates': ['SUIUSDT']}, candidate, {'SUIUSDT': meta}))
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, best_candidate, leverage, meta, args: live_execution)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda **kwargs: {'status': 'stubbed'})
+
+    result = mod.run_loop(DummyClient(), make_args(live=True, auto_loop=False, runtime_state_dir=str(tmp_path)))
+
+    assert result['cycles'][0]['trade_management'] == {'status': 'stubbed'}
+    positions = store.load_json('positions', {})
+    tracked = positions['SUIUSDT:LONG']
+    assert tracked['portfolio_narrative_bucket'] == 'l1-beta'
+    assert tracked['portfolio_correlation_group'] == 'move-family'
+    assert tracked['position_key'] == 'SUIUSDT:LONG'
 
 
 def test_run_loop_background_buy_fill_confirmed_persists_short_position_key_and_side(monkeypatch, tmp_path):
@@ -1426,6 +1994,89 @@ def test_monitor_live_trade_records_lifecycle_events_and_updates_position_state(
     assert rows[5]['close_qty'] == 3.0
     assert rows[6]['exit_reason'] == 'runner'
     assert rows[6]['protection_status'] == 'flat'
+    assert rows[6]['realized_r'] == 1.5
+    assert rows[6]['mfe_r'] == 2.0
+    assert rows[6]['mae_r'] == 0.0
+    assert rows[6]['time_to_1r'] is not None
+    assert rows[6]['time_in_trade_minutes'] is not None
 
     notified_types = [item[0] for item in notifications]
     assert notified_types == event_types[:-1]
+
+
+def test_monitor_live_trade_prefers_book_ticker_cache_price_and_uses_close_fallback_for_ema(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    args = make_args(
+        live=True,
+        auto_loop=False,
+        profile='test-profile',
+        trailing_buffer_pct=0.02,
+        monitor_poll_interval_sec=0,
+        max_monitor_cycles=1,
+        disable_notify=True,
+    )
+    meta = SimpleNamespace(step_size=0.1, quantity_precision=1, tick_size=0.01, price_precision=2)
+    plan = mod.build_trade_management_plan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=10.0,
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+    )
+    trade = {
+        'symbol': 'DOGEUSDT',
+        'entry_price': 100.0,
+        'stop_order': {'orderId': 555},
+        'trade_management_plan': mod.asdict(plan),
+        'protection_check': {'status': 'protected'},
+    }
+    store.save_json('positions', {
+        'DOGEUSDT': {
+            'symbol': 'DOGEUSDT',
+            'status': 'monitoring',
+            'quantity': 10.0,
+            'remaining_quantity': 10.0,
+            'entry_price': 100.0,
+            'stop_price': 95.0,
+            'stop_order_id': 555,
+            'protection_status': 'protected',
+        }
+    })
+    store.save_json('book_ticker_cache', {
+        'DOGEUSDT': {
+            'updated_at': mod._isoformat_utc(mod._utc_now()),
+            'samples': [
+                {'bidPrice': '104.9', 'askPrice': '105.1', 'bidQty': '10', 'askQty': '8'},
+            ],
+        },
+    })
+
+    captured = {}
+
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(mod, 'fetch_klines', lambda client, symbol, interval='5m', limit=21: [[0, '100', '130', '90', '103', '0', 0, '0', 0, 0, 0, 0] for _ in range(limit)])
+    monkeypatch.setattr(mod, 'evaluate_management_actions', lambda state, plan, current_price, ema5m, trailing_reference, trailing_buffer_pct, allow_runner_exit=False: captured.update({
+        'current_price': current_price,
+        'ema5m': ema5m,
+        'trailing_reference': trailing_reference,
+        'allow_runner_exit': allow_runner_exit,
+    }) or [])
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    result = mod.monitor_live_trade(client=DummyClient(), symbol='DOGEUSDT', meta=meta, args=args, trade=trade, store=store)
+
+    assert result['ok'] is True
+    assert captured == {
+        'current_price': 104.9,
+        'ema5m': 103.0,
+        'trailing_reference': 130.0,
+        'allow_runner_exit': True,
+    }
+    debug_payload = store.load_json('monitor_debug', {})
+    assert debug_payload['current_price_source'] == 'book_ticker_cache_bid'
+    assert debug_payload['book_ticker_snapshot']['mid_price'] == 105.0

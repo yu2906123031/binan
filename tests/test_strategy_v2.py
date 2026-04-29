@@ -1,10 +1,13 @@
 import argparse
+import dataclasses
 import importlib.util
 import json
 import pathlib
 import statistics
 import sys
 import tempfile
+
+import pytest
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
 spec = importlib.util.spec_from_file_location('strategy_mod', MODULE_PATH)
@@ -31,6 +34,24 @@ def make_meta(symbol='TESTUSDT'):
         status='TRADING',
         contract_type='PERPETUAL',
     )
+
+
+def make_breakdown_klines():
+    klines_5m = [make_kline(130 - i, 131 - i, 129 - i, 129.4 - i, volume=1000 + i * 10, quote_volume=100000 + i * 1000) for i in range(29)]
+    klines_5m.append(make_kline(101, 102, 95, 96, volume=5600, quote_volume=720000))
+    klines_15m = [make_kline(220 - (i * 2), 221 - (i * 2), 219 - (i * 2), 219.2 - (i * 2), volume=2000, quote_volume=200000) for i in range(30)]
+    klines_1h = [make_kline(320 - (i * 3), 321 - (i * 3), 319 - (i * 3), 319.1 - (i * 3), volume=3000, quote_volume=300000) for i in range(30)]
+    klines_4h = [make_kline(520 - (i * 4), 521 - (i * 4), 519 - (i * 4), 519.0 - (i * 4), volume=4000, quote_volume=400000) for i in range(30)]
+    return klines_5m, klines_15m, klines_1h, klines_4h
+
+
+def make_bearish_ticker():
+    return {
+        'symbol': 'TESTUSDT',
+        'priceChangePercent': '-12',
+        'quoteVolume': '80000000',
+        'lastPrice': '96',
+    }
 
 
 def test_compute_expected_slippage_r_and_execution_grade():
@@ -122,6 +143,47 @@ def test_derive_side_risk_multiplier_respects_regime_bias():
     assert mod.derive_side_risk_multiplier('SHORT', 'risk_off') == 1.15
     assert mod.derive_side_risk_multiplier('LONG', 'caution') == 0.9
     assert mod.derive_side_risk_multiplier('SHORT', 'neutral') == 1.0
+
+
+def test_directional_score_multiplier_does_not_suppress_risk_off_shorts():
+    assert mod.derive_directional_score_multiplier('SHORT', 'risk_off', 0.55) == 1.0
+    assert mod.derive_directional_score_multiplier('LONG', 'risk_off', 0.55) == 0.55
+    assert mod.derive_directional_score_multiplier('SHORT', 'risk_on', 1.15) == 1.0
+
+
+def test_classify_alert_tier_allows_short_breakdown_in_risk_off():
+    long_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=None,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.8,
+        breakout_level=101.0,
+        recent_swing_low=98.0,
+        stop_price=97.0,
+        quantity=10.0,
+        risk_per_unit=3.0,
+        recommended_leverage=3,
+        rsi_5m=42.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=-1.2,
+        distance_from_vwap_15m_pct=-1.0,
+        higher_tf_summary='aligned',
+        score=82.0,
+        reasons=['seed'],
+        state='launch',
+        regime_label='risk_off',
+        side='LONG',
+    )
+    short_candidate = dataclasses.replace(long_candidate, side='SHORT', position_side='SHORT')
+
+    assert mod.classify_alert_tier(long_candidate) == 'blocked'
+    assert mod.classify_alert_tier(short_candidate) == 'critical'
 
 
 def test_recommended_position_size_pct_multiplies_regime_and_side_bias():
@@ -602,6 +664,88 @@ def test_collect_book_ticker_samples_falls_back_to_rest_when_cache_stale(tmp_pat
     events = store.read_events(limit=10)
     assert events[-1]['event_type'] == 'book_ticker_cache_miss'
     assert events[-1]['fallback'] == 'rest_polling'
+
+
+def test_collect_book_ticker_samples_rate_limits_repeated_cache_miss_events(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = []
+
+    class StubClient:
+        def get(self, path, params=None, timeout=15):
+            calls.append({'path': path, 'params': params, 'timeout': timeout})
+            return {'bidPrice': '100.0', 'askPrice': '100.1', 'bidQty': '7', 'askQty': '5'}
+
+    for _ in range(2):
+        samples = mod.collect_book_ticker_samples(StubClient(), 'TESTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=3.0)
+        assert len(samples) == 1
+
+    events = store.read_events(limit=10)
+    miss_events = [row for row in events if row.get('event_type') == 'book_ticker_cache_miss']
+    assert len(miss_events) == 1
+    assert len(calls) == 2
+    state = store.load_json('event_rate_limit_state', {})
+    assert state['book_ticker_cache_miss']['global']['suppressed_since_last'] == 1
+
+
+def test_resolve_monitor_current_price_uses_side_aware_book_ticker_cache(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    now = mod._isoformat_utc(mod._utc_now())
+    store.save_json('book_ticker_cache', {
+        'TESTUSDT': {
+            'updated_at': now,
+            'samples': [
+                {'bidPrice': '100.0', 'askPrice': '100.2', 'bidQty': '10', 'askQty': '8'},
+            ],
+        },
+    })
+
+    long_price = mod.resolve_monitor_current_price(
+        store,
+        'TESTUSDT',
+        mod.POSITION_SIDE_LONG,
+        fallback_price=99.0,
+        cache_max_age_seconds=5.0,
+    )
+    short_price = mod.resolve_monitor_current_price(
+        store,
+        'TESTUSDT',
+        mod.POSITION_SIDE_SHORT,
+        fallback_price=99.0,
+        cache_max_age_seconds=5.0,
+    )
+
+    assert long_price['price'] == 100.0
+    assert long_price['source'] == 'book_ticker_cache_bid'
+    assert long_price['snapshot']['mid_price'] == 100.1
+    assert short_price['price'] == 100.2
+    assert short_price['source'] == 'book_ticker_cache_ask'
+
+
+def test_resolve_monitor_current_price_falls_back_when_cache_is_stale(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    stale_time = mod._isoformat_utc(mod._utc_now() - mod.datetime.timedelta(seconds=10))
+    store.save_json('book_ticker_cache', {
+        'TESTUSDT': {
+            'updated_at': stale_time,
+            'samples': [
+                {'bidPrice': '100.0', 'askPrice': '100.2', 'bidQty': '10', 'askQty': '8'},
+            ],
+        },
+    })
+
+    payload = mod.resolve_monitor_current_price(
+        store,
+        'TESTUSDT',
+        mod.POSITION_SIDE_LONG,
+        fallback_price=101.5,
+        cache_max_age_seconds=3.0,
+    )
+
+    assert payload == {
+        'price': 101.5,
+        'source': 'kline_close_fallback',
+        'snapshot': None,
+    }
 
 
 def test_derive_microstructure_inputs_includes_orderbook_metrics_from_real_samples():
@@ -1362,6 +1506,185 @@ def test_evaluate_risk_guards_blocks_portfolio_theme_and_correlation_overexposur
     assert result['normalized_risk_state']['portfolio_exposure_pct_by_correlation']['dog-family'] == 2.3
 
 
+def test_evaluate_trigger_confirmation_requires_two_micro_confirmations():
+    payload = mod.evaluate_trigger_confirmation(
+        structure_break=True,
+        price_above_vwap=False,
+        distance_from_ema20_5m_pct=8.0,
+        distance_from_vwap_15m_pct=7.0,
+        taker_buy_ratio=None,
+        oi_change_pct_5m=-1.0,
+        oi_change_pct_15m=-1.0,
+        funding_rate=0.001,
+        funding_rate_threshold=0.0005,
+        funding_rate_avg=0.001,
+        funding_rate_avg_threshold=0.0003,
+        cvd_delta=-120000.0,
+        cvd_zscore=-1.2,
+        state='watch',
+        overextension_flag=False,
+        side=mod.TRADE_SIDE_LONG,
+        min_confirmations=2,
+    )
+
+    assert payload['setup_ready'] is True
+    assert payload['confirmation_count'] == 1
+    assert payload['flags']['breakout_close_confirmed'] is True
+    assert payload['trigger_fired'] is False
+
+
+def test_evaluate_trigger_confirmation_blocks_crowded_high_elastic_long_without_pullback():
+    payload = mod.evaluate_trigger_confirmation(
+        structure_break=True,
+        price_above_vwap=True,
+        distance_from_ema20_5m_pct=7.2,
+        distance_from_vwap_15m_pct=6.4,
+        taker_buy_ratio=0.74,
+        oi_change_pct_5m=1.2,
+        oi_change_pct_15m=1.5,
+        funding_rate=0.0007,
+        funding_rate_threshold=0.0008,
+        funding_rate_avg=0.00045,
+        funding_rate_avg_threshold=0.0005,
+        cvd_delta=120000.0,
+        cvd_zscore=2.0,
+        state='launch',
+        overextension_flag=False,
+        side=mod.TRADE_SIDE_LONG,
+        min_confirmations=2,
+        long_short_ratio=2.6,
+        price_change_pct_24h=11.0,
+        recent_5m_change_pct=1.8,
+    )
+
+    assert payload['flags']['breakout_close_confirmed'] is True
+    assert payload['flags']['high_elastic_long_pullback_confirmed'] is False
+    assert payload['flags']['long_crowding_ok'] is False
+    assert payload['setup_ready'] is False
+    assert payload['trigger_fired'] is False
+
+
+def test_compute_positions_heat_snapshot_tracks_remaining_risk_in_r_units(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'TESTUSDT:LONG': {
+            'symbol': 'TESTUSDT',
+            'side': 'LONG',
+            'position_key': 'TESTUSDT:LONG',
+            'quantity': 10.0,
+            'remaining_quantity': 5.0,
+            'entry_price': 100.0,
+            'stop_price': 98.0,
+            'current_stop_price': 99.0,
+            'portfolio_narrative_bucket': 'meme',
+            'portfolio_correlation_group': 'dog-family',
+        }
+    })
+
+    snapshot = mod.compute_positions_heat_snapshot(store.load_json('positions', {}))
+
+    assert snapshot['tracked_positions'] == 1
+    assert snapshot['open_heat_r'] == 0.25
+    assert snapshot['heat_r_by_theme'] == {'meme': 0.25}
+    assert snapshot['heat_r_by_correlation'] == {'dog-family': 0.25}
+
+
+def test_evaluate_risk_guards_blocks_candidate_when_trigger_not_fired():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='watch',
+        alert_tier='watch',
+        setup_ready=True,
+        trigger_fired=False,
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+    )
+
+    result = mod.evaluate_risk_guards(symbol='DOGEUSDT', candidate=candidate, risk_state=mod.default_risk_state())
+
+    assert result['allowed'] is False
+    assert result['reasons'][0] == 'candidate_trigger_not_fired'
+
+
+def test_evaluate_risk_guards_blocks_heat_caps_in_r_units():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=2.2,
+        setup_ready=True,
+        trigger_fired=True,
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+    )
+
+    result = mod.evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        candidate=candidate,
+        risk_state={
+            'portfolio_heat_open_r': 1.9,
+            'portfolio_heat_pending_r': 0.2,
+            'portfolio_heat_r_by_theme': {'meme': 0.8},
+            'portfolio_heat_r_by_correlation': {'dog-family': 0.4},
+        },
+        base_risk_usdt=20.0,
+        gross_heat_cap_r=2.5,
+        portfolio_narrative_bucket='meme',
+        same_theme_heat_cap_r=1.5,
+        portfolio_correlation_group='dog-family',
+        same_correlation_heat_cap_r=1.2,
+    )
+
+    assert result['allowed'] is False
+    assert 'candidate_portfolio_heat_overexposure' in result['reasons']
+    assert 'candidate_same_theme_heat_overexposure' in result['reasons']
+    assert 'candidate_same_correlation_heat_overexposure' in result['reasons']
+
+
 def test_run_scan_once_applies_execution_quality_position_sizing(monkeypatch, tmp_path):
     args = argparse.Namespace(
         symbol='',
@@ -1733,6 +2056,8 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
     class Client:
         def signed_post(self, path, params):
             calls.append((path, params))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             if path == '/fapi/v1/order':
@@ -1755,10 +2080,71 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
 
     result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
 
-    assert calls[1][0] == '/fapi/v1/order'
-    assert calls[1][1]['quantity'] == '6.5'
+    assert calls[0] == ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'})
+    assert calls[2][0] == '/fapi/v1/order'
+    assert calls[2][1]['quantity'] == '6.5'
     assert result['filled_quantity'] == 6.5
     assert result['trade_management_plan']['quantity'] == 6.5
+    assert result['entry_order_feedback']['status'] == 'FILLED'
+
+
+def test_place_live_trade_blocks_when_exchange_leverage_mismatches(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    calls = []
+
+    class Client:
+        def signed_post(self, path, params):
+            calls.append((path, params))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': 3}
+            raise AssertionError('entry order must not be placed after leverage mismatch')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    with pytest.raises(mod.BinanceAPIError, match='leverage_mismatch'):
+        mod.place_live_trade(
+            Client(),
+            candidate,
+            leverage=5,
+            meta=make_meta(),
+            args=argparse.Namespace(tp1_r=1.5, tp1_close_pct=0.3, tp2_r=2.0, tp2_close_pct=0.4, breakeven_r=1.0, profile='test-profile'),
+        )
+
+    assert calls == [
+        ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
+        ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
+    ]
 
 
 def test_run_scan_once_records_execution_quality_reject_stats(monkeypatch, tmp_path):
@@ -1863,6 +2249,40 @@ def test_run_scan_once_records_execution_quality_reject_stats(monkeypatch, tmp_p
     assert payload['rejected_stats']['by_reason']['execution_slippage_veto'] == 2
     assert payload['rejected_stats']['by_reject_label']['execution_slippage'] == 2
     assert payload['rejected_stats']['by_execution_liquidity_grade']['D'] == 2
+
+
+def test_build_candidate_records_early_reject_reason_for_scan_diagnostics():
+    stats = {'total': 0, 'by_reason': {}, 'by_side': {}}
+
+    candidate = mod.build_candidate(
+        symbol='TESTUSDT',
+        ticker={'symbol': 'TESTUSDT', 'quoteVolume': '100000000', 'priceChangePercent': '2'},
+        klines_5m=[],
+        klines_15m=[],
+        klines_1h=[],
+        klines_4h=[],
+        meta=make_meta(),
+        hot_rank=None,
+        gainer_rank=1,
+        risk_usdt=1.0,
+        lookback_bars=6,
+        swing_bars=5,
+        min_5m_change_pct=0.8,
+        min_quote_volume=10_000_000,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=82.0,
+        min_volume_multiple=1.25,
+        max_distance_from_ema_pct=7.0,
+        funding_rate=0.0,
+        funding_rate_threshold=0.0008,
+        side=mod.TRADE_SIDE_LONG,
+        early_reject_stats=stats,
+    )
+
+    assert candidate is None
+    assert stats['total'] == 1
+    assert stats['by_reason'] == {'insufficient_5m_klines': 1}
+    assert stats['by_side']['long'] == {'insufficient_5m_klines': 1}
 
 
 def test_evaluate_risk_guards_blocks_live_entry_for_execution_quality_candidate():
@@ -1990,6 +2410,9 @@ def test_parse_args_accepts_okx_auto_flags(monkeypatch):
             '/tmp/okx-trade-mcp',
             '--okx-sentiment-timeout',
             '33',
+            '--okx-simulated-trading',
+            '--okx-base-url',
+            'https://www.okx.com',
         ],
     )
 
@@ -1999,9 +2422,12 @@ def test_parse_args_accepts_okx_auto_flags(monkeypatch):
     assert args.okx_sentiment_command == 'python okx_feed.py'
     assert args.okx_mcp_command == '/tmp/okx-trade-mcp'
     assert args.okx_sentiment_timeout == 33
+    assert args.okx_simulated_trading is True
+    assert args.okx_base_url == 'https://www.okx.com'
     assert 'okx_sentiment_command' in args._explicit_cli_dests
     assert 'okx_mcp_command' in args._explicit_cli_dests
     assert 'okx_sentiment_timeout' in args._explicit_cli_dests
+    assert 'okx_simulated_trading' in args._explicit_cli_dests
 
 
 def test_compute_sentiment_resonance_bonus_rewards_early_turn_and_penalizes_overheated_sentiment():
@@ -2032,6 +2458,36 @@ def test_compute_sentiment_resonance_bonus_rewards_early_turn_and_penalizes_over
     assert 'sentiment_overheated' in overheated['reasons']
 
 
+def test_compute_sentiment_resonance_bonus_is_side_aware_for_shorts():
+    payload = mod.compute_sentiment_resonance_bonus(
+        okx_sentiment_score=-0.34,
+        okx_sentiment_acceleration=-0.42,
+        sector_resonance_score=0.68,
+        smart_money_flow_score=-0.18,
+        side=mod.TRADE_SIDE_SHORT,
+    )
+
+    assert payload['bonus'] > payload['penalty']
+    assert payload['net'] > 6.0
+    assert 'okx_sentiment_bearish_supportive' in payload['reasons']
+    assert 'okx_sentiment_bearish_accelerating' in payload['reasons']
+    assert 'sector_resonance_positive' in payload['reasons']
+    assert 'sentiment_early_turn_short' in payload['reasons']
+    assert 'sector_alignment_confirmed' in payload['reasons']
+
+    overheated = mod.compute_sentiment_resonance_bonus(
+        okx_sentiment_score=-0.91,
+        okx_sentiment_acceleration=-0.58,
+        sector_resonance_score=0.41,
+        smart_money_flow_score=-0.05,
+        side=mod.TRADE_SIDE_SHORT,
+    )
+
+    assert overheated['penalty'] > 4.0
+    assert overheated['net'] < payload['net']
+    assert 'sentiment_overheated_short' in overheated['reasons']
+
+
 def test_compute_market_regime_filter_labels_dual_breakdown_as_risk_off():
     btc = [make_kline(100 - i, 101 - i, 99 - i, 99 - i) for i in range(30)]
     sol = [make_kline(200 - (i * 2), 201 - (i * 2), 199 - (i * 2), 198 - (i * 2)) for i in range(30)]
@@ -2043,3 +2499,238 @@ def test_compute_market_regime_filter_labels_dual_breakdown_as_risk_off():
     assert regime['score_multiplier'] <= 0.55
     assert 'btc_trend_down' in regime['reasons']
     assert 'sol_trend_down' in regime['reasons']
+
+
+def test_derive_regime_entry_thresholds_bias_by_regime_and_side():
+    assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_LONG, 'risk_on', 2.0) == {
+        'min_5m_change_pct': 1.7,
+        'acceleration_ratio': 1.35,
+    }
+    assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_LONG, 'risk_off', 2.0) == {
+        'min_5m_change_pct': 2.5,
+        'acceleration_ratio': 1.85,
+    }
+    assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_SHORT, 'risk_off', 2.0) == {
+        'min_5m_change_pct': 1.7,
+        'acceleration_ratio': 1.35,
+    }
+    assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_SHORT, 'risk_on', 2.0) == {
+        'min_5m_change_pct': 2.5,
+        'acceleration_ratio': 1.85,
+    }
+
+
+def test_compute_market_regime_filter_labels_dual_strength_as_risk_on():
+    btc = [make_kline(100 + i, 101 + i, 99 + i, 100 + i) for i in range(30)]
+    sol = [make_kline(50 + (i * 2), 51 + (i * 2), 49 + (i * 2), 50 + (i * 2)) for i in range(30)]
+
+    regime = mod.compute_market_regime_filter(btc_klines=btc, sol_klines=sol)
+
+    assert regime['label'] == 'risk_on'
+    assert regime['risk_on'] is True
+    assert regime['score_multiplier'] >= 1.1
+    assert 'btc_above_ema20' in regime['reasons']
+    assert 'btc_momentum_breakout' in regime['reasons']
+    assert 'sol_above_ema20' in regime['reasons']
+    assert 'sol_momentum_breakout' in regime['reasons']
+
+
+def test_merged_candidate_symbols_includes_top_losers_for_short_side_scan():
+    merged, hot_rank_map, gainer_rank_map, loser_rank_map = mod.merged_candidate_symbols(
+        square_symbols=['DOGEUSDT'],
+        tickers=[
+            {'symbol': 'DOGEUSDT', 'priceChangePercent': '4.0'},
+            {'symbol': 'SUIUSDT', 'priceChangePercent': '15.0'},
+            {'symbol': 'XRPUSDT', 'priceChangePercent': '-9.0'},
+        ],
+        top_gainers=1,
+        top_losers=1,
+    )
+
+    assert merged == ['DOGEUSDT', 'SUIUSDT', 'XRPUSDT']
+    assert hot_rank_map == {'DOGEUSDT': 1}
+    assert gainer_rank_map == {'SUIUSDT': 1}
+    assert loser_rank_map == {'XRPUSDT': 1}
+
+
+def test_normalize_external_signal_map_preserves_portfolio_bucket_aliases():
+    payload = {
+        'signal_map': {
+            'doge': {
+                'external_signal_score': 88.0,
+                'narrative_bucket': 'meme',
+                'correlation_group': 'dog-family',
+            }
+        }
+    }
+
+    normalized = mod.normalize_external_signal_map(payload)
+
+    assert normalized['DOGEUSDT']['portfolio_narrative_bucket'] == 'meme'
+    assert normalized['DOGEUSDT']['portfolio_correlation_group'] == 'dog-family'
+
+
+def test_normalize_external_signal_map_reads_nested_metadata_bucket_aliases():
+    payload = {
+        'signal_map': {
+            'sui': {
+                'external_signal_score': 83.0,
+                'metadata': {
+                    'theme_bucket': 'l1-beta',
+                    'correlation_bucket': 'move-family',
+                },
+            },
+            'bnb': {
+                'external_signal_score': 77.0,
+                'signal_metadata': {
+                    'portfolio_theme': 'exchange-token',
+                    'correlation_group': 'cex-beta',
+                },
+            },
+        }
+    }
+
+    normalized = mod.normalize_external_signal_map(payload)
+
+    assert normalized['SUIUSDT']['portfolio_narrative_bucket'] == 'l1-beta'
+    assert normalized['SUIUSDT']['portfolio_correlation_group'] == 'move-family'
+    assert normalized['BNBUSDT']['portfolio_narrative_bucket'] == 'exchange-token'
+    assert normalized['BNBUSDT']['portfolio_correlation_group'] == 'cex-beta'
+
+
+def test_infer_portfolio_buckets_falls_back_from_symbol_family():
+    assert mod.infer_portfolio_buckets('DOGEUSDT') == {
+        'portfolio_narrative_bucket': 'meme',
+        'portfolio_correlation_group': 'dog-family',
+    }
+    assert mod.infer_portfolio_buckets('pepe') == {
+        'portfolio_narrative_bucket': 'meme',
+        'portfolio_correlation_group': 'frog-family',
+    }
+    assert mod.infer_portfolio_buckets('SUI_USDT') == {
+        'portfolio_narrative_bucket': 'l1-beta',
+        'portfolio_correlation_group': 'l1-beta',
+    }
+    assert mod.infer_portfolio_buckets('BNB-USDT') == {
+        'portfolio_narrative_bucket': 'exchange-token',
+        'portfolio_correlation_group': 'exchange-token',
+    }
+
+
+def test_apply_external_signal_to_candidate_sets_explicit_or_inferred_portfolio_buckets():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+    )
+
+    mod.apply_external_signal_to_candidate(candidate, {'portfolio_narrative_bucket': 'meme', 'portfolio_correlation_group': 'dog-family'})
+    assert candidate.portfolio_narrative_bucket == 'meme'
+    assert candidate.portfolio_correlation_group == 'dog-family'
+
+    candidate2 = mod.Candidate(
+        symbol='PEPEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+    )
+
+    mod.apply_external_signal_to_candidate(candidate2, None)
+    assert candidate2.portfolio_narrative_bucket == 'meme'
+    assert candidate2.portfolio_correlation_group == 'frog-family'
+
+
+def test_build_candidate_short_records_loser_rank_and_directional_intersection():
+    klines_5m, klines_15m, klines_1h, klines_4h = make_breakdown_klines()
+    ticker = make_bearish_ticker()
+    meta = make_meta()
+
+    candidate = mod.build_candidate(
+        symbol='TESTUSDT',
+        ticker=ticker,
+        klines_5m=klines_5m,
+        klines_15m=klines_15m,
+        klines_1h=klines_1h,
+        klines_4h=klines_4h,
+        meta=meta,
+        hot_rank=1,
+        gainer_rank=None,
+        loser_rank=1,
+        risk_usdt=10.0,
+        lookback_bars=12,
+        swing_bars=6,
+        min_5m_change_pct=0.5,
+        min_quote_volume=1000.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=85.0,
+        min_volume_multiple=1.0,
+        max_distance_from_ema_pct=12.0,
+        funding_rate=0.0002,
+        funding_rate_threshold=0.0005,
+        funding_rate_avg=0.0001,
+        funding_rate_avg_threshold=0.0003,
+        max_distance_from_vwap_pct=12.0,
+        max_leverage=5,
+        side=mod.TRADE_SIDE_SHORT,
+        short_bias=0.62,
+        oi_now=900000.0,
+        oi_5m_ago=1000000.0,
+        oi_15m_ago=1200000.0,
+        cvd_delta=-240000.0,
+        cvd_samples=[-80000.0, -75000.0, -70000.0, -85000.0, -90000.0],
+        taker_buy_ratio=0.35,
+        market_regime={'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'},
+    )
+
+    assert candidate is not None
+    assert candidate.side == mod.TRADE_SIDE_SHORT
+    assert candidate.loser_rank == 1
+    assert 'loser_rank=1' in candidate.reasons
+    assert 'hot_directional_mover_intersection' in candidate.reasons

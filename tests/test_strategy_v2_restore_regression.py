@@ -3,7 +3,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-SCRIPT_PATH = Path('/root/.hermes/skills/binance/binance-futures-momentum-long/scripts/binance_futures_momentum_long.py')
+import pytest
+
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
 spec = importlib.util.spec_from_file_location('binance_futures_momentum_long', SCRIPT_PATH)
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
@@ -72,6 +74,17 @@ def test_compute_leading_sentiment_signal_rewards_early_turn_and_penalizes_overh
     assert 'sentiment_too_hot' in overheated['reasons']
 
 
+def test_compute_leading_sentiment_signal_is_side_aware_for_shorts():
+    payload = mod.compute_leading_sentiment_signal(okx_sentiment_score=-0.2, okx_sentiment_acceleration=-0.4, side=mod.TRADE_SIDE_SHORT)
+    assert payload['score'] > 8
+    assert 'sentiment_early_turn_zone_short' in payload['reasons']
+    assert 'sentiment_acceleration_turn_short' in payload['reasons']
+
+    overheated = mod.compute_leading_sentiment_signal(okx_sentiment_score=-0.82, okx_sentiment_acceleration=-0.1, side=mod.TRADE_SIDE_SHORT)
+    assert overheated['score'] < 0
+    assert 'sentiment_too_hot_short' in overheated['reasons']
+
+
 def test_compute_squeeze_and_control_risk_scores_capture_short_squeeze_and_distribution_risk():
     squeeze = mod.compute_squeeze_signal(
         funding_rate=-0.0014,
@@ -99,11 +112,49 @@ def test_compute_squeeze_and_control_risk_scores_capture_short_squeeze_and_distr
     assert 'smart_money_distribution_risk' in risk['reasons']
 
 
+def test_compute_squeeze_and_control_risk_scores_are_side_aware_for_shorts():
+    squeeze = mod.compute_squeeze_signal(
+        funding_rate=0.0016,
+        funding_rate_avg=0.0008,
+        short_bias=0.12,
+        oi_zscore_5m=4.0,
+        cvd_delta=-260000.0,
+        cvd_zscore=-3.5,
+        recent_5m_change_pct=2.2,
+        side=mod.TRADE_SIDE_SHORT,
+    )
+    assert squeeze['score'] >= 25
+    assert 'positive_funding_crowded_longs' in squeeze['reasons']
+    assert 'retail_long_bias' in squeeze['reasons']
+    assert 'negative_cvd_confirmation' in squeeze['reasons']
+
+    risk = mod.compute_control_risk_score(
+        short_bias=0.76,
+        oi_notional_percentile=0.985,
+        smart_money_flow_score=0.45,
+        side=mod.TRADE_SIDE_SHORT,
+    )
+    assert risk['score'] >= 20
+    assert risk['veto'] is True
+    assert risk['veto_reason'] == 'smart_money_long_pressure_veto'
+    assert 'oi_at_extreme_percentile' in risk['reasons']
+    assert 'crowded_short_side' in risk['reasons']
+    assert 'smart_money_long_pressure_risk' in risk['reasons']
+
+
 def test_merge_smart_money_scores_triggers_veto_for_persistent_outflow():
     payload = mod.merge_smart_money_scores(exchange_score=-0.4, onchain_score=-0.7)
     assert round(payload['score'], 2) == -0.55
     assert payload['veto'] is True
     assert payload['veto_reason'] == 'smart_money_outflow_veto'
+    assert payload['sources'] == ['exchange', 'onchain']
+
+
+def test_merge_smart_money_scores_triggers_veto_for_persistent_long_pressure_on_shorts():
+    payload = mod.merge_smart_money_scores(exchange_score=0.55, onchain_score=0.42, side=mod.TRADE_SIDE_SHORT)
+    assert abs(payload['score'] - 0.485) < 1e-9
+    assert payload['veto'] is True
+    assert payload['veto_reason'] == 'smart_money_long_pressure_veto'
     assert payload['sources'] == ['exchange', 'onchain']
 
 
@@ -289,9 +340,16 @@ def test_build_candidate_sets_staged_entry_and_slippage_fields():
     )
 
     assert candidate is not None
-    assert candidate.setup_ready is True
-    assert candidate.trigger_fired is True
+    assert candidate.setup_ready is False
+    assert candidate.trigger_fired is False
+    assert candidate.trigger_confirmation_count >= 2
+    assert candidate.trigger_confirmation_flags['breakout_close_confirmed'] is True
+    assert candidate.trigger_confirmation_flags['high_elastic_long_pullback_confirmed'] is False
+    assert candidate.trigger_confirmation_flags['long_crowding_ok'] is True
     assert candidate.overextension_flag is False
+    assert candidate.stop_model in {'structure', 'atr', 'blended'}
+    assert candidate.stop_distance_pct > 0
+    assert candidate.stop_too_tight_flag is False
     assert candidate.entry_distance_from_breakout_pct > 0
     assert candidate.expected_slippage_pct == round(candidate.entry_distance_from_breakout_pct * 0.35, 4)
     assert 0.0 <= candidate.book_depth_fill_ratio <= 1.0
@@ -349,8 +407,9 @@ def test_build_candidate_blocks_when_expected_slippage_and_overextension_stay_hi
 
     assert candidate is not None
     assert candidate.overextension_flag is False
-    assert candidate.setup_ready is True
-    assert candidate.trigger_fired is True
+    assert candidate.setup_ready is False
+    assert candidate.trigger_fired is False
+    assert candidate.trigger_confirmation_flags['high_elastic_long_pullback_confirmed'] is False
     assert candidate.expected_slippage_pct > 3.0
 
 
@@ -486,6 +545,10 @@ def test_build_standardized_alert_exposes_entry_distance_and_overheat_fields():
         alert_tier='critical',
         position_size_pct=2.5,
         atr_stop_distance=6.0,
+        stop_model='blended',
+        stop_distance_pct=6.44,
+        stop_too_tight_flag=False,
+        stop_too_wide_flag=True,
     )
     candidate.entry_distance_from_breakout_pct = round((candidate.last_price - candidate.breakout_level) / candidate.breakout_level * 100, 4)
     candidate.entry_distance_from_vwap_pct = candidate.distance_from_vwap_15m_pct
@@ -499,6 +562,10 @@ def test_build_standardized_alert_exposes_entry_distance_and_overheat_fields():
     assert alert['entry_distance_from_breakout_pct'] == candidate.entry_distance_from_breakout_pct
     assert alert['entry_distance_from_vwap_pct'] == candidate.entry_distance_from_vwap_pct
     assert alert['overextension_flag'] is True
+    assert alert['stop_model'] == 'blended'
+    assert alert['stop_distance_pct'] == 6.44
+    assert alert['stop_too_tight_flag'] is False
+    assert alert['stop_too_wide_flag'] is True
 
 
 def test_build_standardized_alert_exposes_candidate_three_layer_fields():
@@ -753,11 +820,24 @@ def test_monitor_live_trade_persists_exit_reason_and_trade_invalidated(monkeypat
             'status': 'monitoring',
             'quantity': 1.0,
             'remaining_quantity': 1.0,
-            '_debug_current_price': 111.0,
-            '_debug_ema5m': 110.0,
-            '_debug_trailing_reference': 112.0,
-        }
-    })
+            'opened_at': '2026-04-29T00:00:00Z',
+            'selected_score': 82.6,
+            'selected_state': 'launch',
+            'selected_alert_tier': 'critical',
+            'candidate_stage': 'launch',
+            'trigger_class': 'breakout',
+                'score_decile': '80-89',
+                'market_regime_label': 'risk_on',
+                'market_regime_multiplier': 1.1,
+                'setup_ready': True,
+                'trigger_fired': True,
+                'highest_price_seen': 111.0,
+                'lowest_price_seen': 100.0,
+                '_debug_current_price': 111.0,
+                '_debug_ema5m': 110.0,
+                '_debug_trailing_reference': 112.0,
+            }
+        })
     args = argparse.Namespace(
         profile='test',
         max_monitor_cycles=1,
@@ -792,12 +872,14 @@ def test_monitor_live_trade_persists_exit_reason_and_trade_invalidated(monkeypat
     monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
     monkeypatch.setattr(mod, 'place_reduce_only_market', lambda *a, **k: {'orderId': 888})
+    monkeypatch.setattr(mod, '_utc_now', lambda: mod.datetime.datetime(2026, 4, 29, 0, 5, tzinfo=mod.datetime.timezone.utc))
+    monkeypatch.setattr(mod, 'evaluate_management_actions', lambda *a, **k: [{'type': 'take_profit_1', 'close_qty': 1.0, 'exit_reason': 'tp1'}])
 
     def fake_apply(client, symbol, meta, state, action, active_stop_order):
         action['exit_reason'] = 'tp1'
         state.remaining_quantity = 0.0
         state.tp1_hit = True
-        return state, None, {'reduce_order': {'orderId': 888}}
+        return state, None, {'reduce_order': {'orderId': 888, 'avgPrice': '111.0'}}
 
     monkeypatch.setattr(mod, 'apply_management_action', fake_apply)
 
@@ -807,8 +889,16 @@ def test_monitor_live_trade_persists_exit_reason_and_trade_invalidated(monkeypat
 
     assert result['status'] == 'closed'
     assert result['exit_reason'] == 'tp1'
+    assert result['realized_r'] == 2.2
     assert rows[-1]['event_type'] == 'trade_invalidated'
     assert rows[-1]['exit_reason'] == 'tp1'
+    assert rows[-1]['realized_r'] == 2.2
+    assert rows[-1]['mfe_r'] == 2.2
+    assert rows[-1]['mae_r'] == 0.0
+    assert rows[-1]['time_to_1r'] == 5.0
+    assert rows[-1]['time_in_trade_minutes'] == 5.0
+    assert rows[-1]['trigger_class'] == 'breakout'
+    assert rows[-1]['score_decile'] == '80-89'
     assert symbol not in positions
 
 
@@ -1034,6 +1124,51 @@ def test_sync_tracked_positions_with_exchange_uses_side_aware_position_keys(tmp_
     assert positions['DOGEUSDT:SHORT']['protection_status'] == 'flat'
 
 
+def test_sync_tracked_positions_with_exchange_persists_realtime_exchange_fields(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'APEUSDT:LONG': {
+            'symbol': 'APEUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 100.0,
+            'remaining_quantity': 100.0,
+            'entry_price': 0.1386,
+            'leverage': 5,
+            'protection_status': 'protected',
+        },
+    })
+
+    mod.sync_tracked_positions_with_exchange(
+        store,
+        exchange_positions=[{
+            'symbol': 'APEUSDT',
+            'positionSide': 'LONG',
+            'positionAmt': '1000',
+            'entryPrice': '0.138600',
+            'markPrice': '0.190300',
+            'notional': '190.300000',
+            'unRealizedProfit': '51.700000',
+            'isolatedMargin': '38.060000',
+            'leverage': '5',
+        }],
+        protected_symbols=['APEUSDT:LONG'],
+    )
+
+    positions = store.load_json('positions', {})
+    tracked = positions['APEUSDT:LONG']
+    assert tracked['quantity'] == 1000.0
+    assert tracked['remaining_quantity'] == 1000.0
+    assert tracked['entry_price'] == 0.1386
+    assert tracked['mark_price'] == 0.1903
+    assert tracked['current_price'] == 0.1903
+    assert tracked['position_notional'] == 190.3
+    assert tracked['unrealized_pnl_usdt'] == 51.7
+    assert tracked['position_margin_usdt'] == 38.06
+    assert tracked['unrealized_pnl_pct'] == pytest.approx(135.8381503)
+    assert tracked['leverage'] == 5
+
+
 def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unknown(monkeypatch):
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1085,6 +1220,8 @@ def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unkno
 
         def signed_post(self, path, params):
             self.calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             if path == '/fapi/v1/order':
@@ -1175,6 +1312,8 @@ def test_place_live_trade_raises_when_timeout_unknown_cannot_be_confirmed(monkey
 
     class FakeClient:
         def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             if path == '/fapi/v1/order':
@@ -1241,6 +1380,8 @@ def test_place_live_trade_hard_gates_when_existing_position_is_open(monkeypatch)
 
     class FakeClient:
         def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             raise AssertionError(f'unexpected signed_post: {path}')
@@ -1301,6 +1442,8 @@ def test_place_live_trade_hard_gates_when_existing_open_order_present(monkeypatc
 
     class FakeClient:
         def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
             if path == '/fapi/v1/leverage':
                 return {'leverage': params['leverage']}
             raise AssertionError(f'unexpected signed_post: {path}')
@@ -1514,4 +1657,5 @@ def test_monitor_live_trade_reads_and_persists_short_side_aware_position_key(mon
     assert rows[-1]['side'] == 'SHORT'
     assert rows[-1]['position_key'] == position_key
     assert debug_state['actions'][0]['type'] == 'take_profit_1'
-    assert debug_state['current_price'] == 101.0
+    assert debug_state['current_price'] == 89.0
+    assert debug_state['current_price_source'] == 'kline_close_fallback'

@@ -16,6 +16,59 @@
     16|
     17|# Binance Futures Momentum LS
     18|
+    19|## Surf Skill distilled rules from 424.pdf
+    20|
+    21|Use these rules first when modifying, running, or reviewing this Binance USDT-M futures strategy. They are distilled from `424.pdf` and the follow-up production fixes.
+    22|
+    23|1. **Live entry must verify exchange execution settings before any market order**
+    24|   - Set margin mode before entry; default to `ISOLATED`.
+    25|   - Set leverage before entry and hard-fail if the exchange response does not match requested leverage.
+    26|   - Persist `margin_type`, `margin_type_check`, `leverage`, and `leverage_check` into entry events, live execution payloads, and `positions.json`.
+    27|   - Treat leverage mismatch as a preflight hard gate, not a warning.
+    28|
+    29|2. **Small-account live profiles must cap notional exposure**
+    30|   - For `10u-active` and `10u-aggressive`, keep `max_notional_usdt` around `500.0` unless the user explicitly overrides it.
+    31|   - Keep sizing risk-first: quantity comes from `risk_usdt / risk_per_unit`, then cap by `max_notional_usdt`, then round by exchange step size.
+    32|   - Do not increase trade frequency by raising risk; improve diagnostics and entry quality first.
+    33|
+    34|3. **High-elastic long entries need pullback and crowding checks**
+    35|   - If a long candidate has strong 24h move, sharp 5m move, or obvious chase characteristics, do not let breakout alone mark it executable.
+    36|   - Require pullback/retest quality: price should remain above VWAP while not being too far from VWAP/EMA.
+    37|   - Reject or keep as non-triggered when taker buy pressure, long/short ratio, or funding show crowded long conditions.
+    38|   - Keep the candidate visible for diagnostics, but set `setup_ready=False` / `trigger_fired=False` until the extra gates pass.
+    39|
+    40|4. **Keep the profitable protection structure**
+    41|   - Preserve initial stop placement immediately after entry.
+    42|   - Preserve staged take-profit planning (`TP1`, `TP2`, runner) and breakeven logic.
+    43|   - Do not weaken protection checks to force more trades; missing protection remains a hard halt or repair path.
+    44|
+    45|5. **Make every no-trade decision observable**
+    46|   - Maintain `early_rejected_stats` for early `build_candidate()` filters such as `long_breakout_not_confirmed`, `short_breakdown_not_confirmed`, `recent_5m_change_below_gate`, and `quote_volume_below_gate`.
+    47|   - Keep hard veto reasons structured through `candidate_rejected` and `rejected_stats`.
+    48|   - The dashboard should make no-trade reasons visible in Chinese so an operator can tell whether the system is waiting for structure, blocked by risk, or failing exchange preflight.
+    49|
+    50|6. **Before live runs, follow the safe sequence**
+    51|   - Run tests after code changes: `python -m pytest`.
+    52|   - Run reconcile before live: `python main.py --reconcile-only --halt-on-orphan-position --no-repair-missing-protection --output-format json`.
+    53|   - Use one-position small-account live mode first: `python main.py --live --auto-loop --profile 10u-active --margin-type ISOLATED --max-open-positions 1 --max-long-positions 1 --max-short-positions 1 --poll-interval-sec 60 --output-format json`.
+    54|   - Do not bypass API/IP/timestamp/preflight failures to start live trading.
+    55|
+    56|7. **Review priorities from the 424 replay**
+    57|   - Fix execution drift before optimizing signal frequency.
+    58|   - Concentrate risk on complete structures with clear stop and protection, not merely the hottest mover.
+    59|   - For PEPE/DOGE-like high-beta longs, prefer secondary confirmation and pullback quality over direct chase entries.
+    60|   - Keep XAU-like full protection and staged exit behavior as the model for acceptable execution quality.
+    61|
+    62|8. **OKX Agent Trade Kit signals should be upgraded before live signal fusion**
+    63|   - OpenClaw users can ask the agent to update OKX trade-kit and focus on the `okx-market-filter` and `okx-sentiment-tracker` skills.
+    64|   - CLI/MCP users should run `npm update -g okx-trade-mcp okx-trade-cli`; if the packages are not installed yet, install them with `npm install -g okx-trade-mcp okx-trade-cli`.
+    65|   - The bridge also requires `mcporter`; install or update it before using `--okx-auto`.
+    66|   - Prefer a read-only MCP command for Binance live signal fusion, for example `okx-trade-mcp --modules market,skills --read-only --no-log`.
+    67|   - `--okx-auto` only works when paired with `--okx-mcp-command`; otherwise it returns no OKX payload.
+    68|   - `okx-market-filter` should feed symbol selection, liquidity/volume, OI, funding, and sector resonance into `okx_sentiment_score`, `sector_resonance_score`, and `smart_money_flow_score`.
+    69|   - `okx-sentiment-tracker` should feed sentiment direction and acceleration into `okx_sentiment_score` and `okx_sentiment_acceleration`.
+    70|   - If OKX skills require credentials or are unavailable, keep Binance scanning alive and degrade to market-only or zero OKX scores instead of blocking the strategy.
+    18|
 ## 当前已落地更新
 
 ## V1.6.0 双向升级文档（最新21条）

@@ -69,13 +69,13 @@
 3. breakeven 结构确认当前已有 `breakeven_confirmation_mode`，下一步适合把 CVD、抬高低点、最小利润缓冲做成可配置多条件组合。
 4. 组合暴露控制仍适合补 `narrative_bucket / correlation_group / portfolio_exposure_pct_by_theme`，把同主题仓位合并限额。
 5. 单 symbol replay / backtest 框架仍值得落地，用同一事件契约回放 `candidate_selected -> entry_filled -> exit_reason` 全链路。
-6. user data stream 已接入订单生命周期事件，listen key 续期/失败/断线基础监控已落地；下一步适合把 monitor cycle 真正挂进 auto-loop 主循环或独立 watcher，并补 listen key 续期失败告警、断线重连指标、以及 REST / WebSocket 成交差异对账。
+6. user data stream 已接入订单生命周期事件，listen key 续期/失败/断线基础监控已落地；auto-loop 主循环现已在已有 listen key 时每轮执行 monitor cycle，并把续期/失败/断线状态同步到本轮输出与本地持仓，失败状态会触发 `user_data_stream_alert`。
 
 ## 2026-04-20 本轮验证结果
 - 核对文件：`scripts/binance_futures_momentum_long.py`、`tests/test_strategy_v2.py`、`tests/test_strategy_v2_restore_regression.py`、`tests/test_run_loop_smoke.py`、`FULL_UPGRADE_TASKS_2026-04-16.md`。
 - 重点验证：执行质量缩仓与 veto、事件契约扩展字段、成交回执持久化、user data stream 生命周期 smoke tests。
 - 当前编译状态：`python -m py_compile scripts/binance_futures_momentum_long.py tests/test_run_loop_smoke.py tests/test_strategy_v2_restore_regression.py tests/test_strategy_v2.py` 已通过。
-- 当前回归测试状态：`pytest -q tests/test_rejected_analysis.py tests/test_strategy_v2.py tests/test_strategy_v2_restore_regression.py tests/test_run_loop_smoke.py` 结果为 `64 passed`。
+- 当前回归测试状态：`python -m pytest -q` 结果为 `152 passed`。
 - 本轮已新增 rejected-analysis 聚合脚本 `scripts/rejected_analysis.py`，可直接读取 `runtime-state/events.jsonl`，输出 JSON 与 Markdown 报告，并按 `reject_reason / reject_reason_label / execution_liquidity_grade / overextension_flag / symbol` 聚合。
 - 本轮已新增 `tests/test_rejected_analysis.py`，覆盖聚合逻辑与文件落盘链路。
 - 风险守卫验证结果：`grade=C 且 depth<0.5` 时可追加 `candidate_execution_liquidity_poor`；纯滑点 veto 场景维持 `candidate_execution_slippage_risk` 单理由断言。

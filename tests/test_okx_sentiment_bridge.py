@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-SCRIPT_PATH = Path('/root/.hermes/okx_sentiment_bridge.py')
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'okx_sentiment_bridge.py'
 spec = importlib.util.spec_from_file_location('okx_sentiment_bridge', SCRIPT_PATH)
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
@@ -147,6 +147,33 @@ def test_build_bridge_payload_combines_market_and_news_data(monkeypatch):
     assert payload['DOGEUSDT']['okx_sentiment_acceleration'] > 0
     assert payload['DOGEUSDT']['smart_money_flow_score'] > 0
     assert payload['SUIUSDT']['smart_money_flow_score'] < 0
+
+
+def test_run_mcporter_uses_current_stdio_call_syntax(monkeypatch):
+    captured = {}
+
+    class Completed:
+        stdout = json.dumps({'ok': True, 'data': {'data': []}})
+        stderr = ''
+
+    def fake_run(command, capture_output, text, check):
+        captured['command'] = command
+        captured['capture_output'] = capture_output
+        captured['text'] = text
+        captured['check'] = check
+        return Completed()
+
+    monkeypatch.setattr(mod.subprocess, 'run', fake_run)
+    monkeypatch.setattr(mod, '_mcporter_executable', lambda: 'mcporter')
+
+    payload = mod._run_mcporter('okx-trade-mcp --modules market,skills --read-only --no-log', 'okx_bridge', 'market_filter', {'symbols': 'DOGEUSDT'})
+
+    assert payload['ok'] is True
+    assert captured['command'][:4] == ['mcporter', 'call', '--stdio', 'okx-trade-mcp --modules market,skills --read-only --no-log']
+    assert '--tool' in captured['command']
+    assert 'market_filter' in captured['command']
+    assert '--args' in captured['command']
+    assert '--output' in captured['command']
 
 
 def test_build_bridge_payload_falls_back_to_market_only_when_news_unavailable(monkeypatch):

@@ -2,7 +2,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-SKILL_SCRIPTS_DIR = Path('/root/.hermes/skills/binance/binance-futures-momentum-long/scripts')
+SKILL_SCRIPTS_DIR = Path(__file__).resolve().parent
 MODULE_PATH = SKILL_SCRIPTS_DIR / 'yaobiradar_v2_scorer.py'
 
 
@@ -88,6 +88,8 @@ def test_run_writes_payload_files(tmp_path):
             'liquidity_score': 15,
             'breakout_score': 15,
             'reasons': ['oi_surge'],
+            'portfolio_narrative_bucket': 'accumulation',
+            'portfolio_correlation_group': 'accumulation',
         }
     ], symbols_path=symbols_path, external_json_path=external_json_path)
 
@@ -96,3 +98,4 @@ def test_run_writes_payload_files(tmp_path):
     written = external_json_path.read_text(encoding='utf-8')
     assert 'DOGEUSDT' in written
     assert 'yaobiradar_v2' in written
+    assert 'portfolio_narrative_bucket' in written

@@ -8,8 +8,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-SYMBOLS_PATH = Path('/root/.hermes/binance_square_symbols.txt')
-EXTERNAL_JSON_PATH = Path('/root/.hermes/binance_external_signal.json')
+DEFAULT_HERMES_HOME = Path(os.path.expanduser(os.getenv('HERMES_HOME', str(Path.home() / '.hermes'))))
+SYMBOLS_PATH = DEFAULT_HERMES_HOME / 'binance_square_symbols.txt'
+EXTERNAL_JSON_PATH = DEFAULT_HERMES_HOME / 'binance_external_signal.json'
 
 
 def normalize_symbol(raw: Any) -> str:
@@ -106,6 +107,12 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if veto_reason is not None:
         veto_reason = str(veto_reason).strip() or None
     reasons = _to_reason_list(_coalesce(row, 'external_reasons', 'reasons', 'signals', 'tags', 'flags'))
+    narrative_bucket = _coalesce(row, 'portfolio_narrative_bucket', 'narrative_bucket', 'theme_bucket', 'portfolio_theme')
+    if narrative_bucket is not None:
+        narrative_bucket = str(narrative_bucket).strip() or None
+    correlation_group = _coalesce(row, 'portfolio_correlation_group', 'correlation_group', 'correlation_bucket')
+    if correlation_group is not None:
+        correlation_group = str(correlation_group).strip() or None
 
     normalized: Dict[str, Any] = {'symbol': symbol}
     if score is not None:
@@ -120,6 +127,10 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         normalized['external_veto_reason'] = veto_reason
     if reasons:
         normalized['external_reasons'] = reasons
+    if narrative_bucket:
+        normalized['portfolio_narrative_bucket'] = narrative_bucket
+    if correlation_group:
+        normalized['portfolio_correlation_group'] = correlation_group
     return normalized
 
 
@@ -158,6 +169,8 @@ def build_payload(rows: Iterable[Dict[str, Any]], engine: str = 'yaobiradar_v2')
             'external_veto',
             'external_veto_reason',
             'external_reasons',
+            'portfolio_narrative_bucket',
+            'portfolio_correlation_group',
         ):
             if key in row and row[key] is not None:
                 entry[key] = row[key]
