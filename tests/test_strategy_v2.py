@@ -238,6 +238,27 @@ def test_collect_book_ticker_samples_prefers_fresh_runtime_cache(tmp_path):
     assert events[-1]['symbol'] == 'TESTUSDT'
 
 
+def test_collect_book_ticker_samples_rate_limits_cache_miss_per_symbol(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = []
+
+    class StubClient:
+        def get(self, path, params=None, timeout=15):
+            calls.append({'path': path, 'params': params, 'timeout': timeout})
+            return {'symbol': params['symbol'], 'bidPrice': '100.0', 'askPrice': '100.1'}
+
+    first = mod.collect_book_ticker_samples(StubClient(), 'TESTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=5.0)
+    second = mod.collect_book_ticker_samples(StubClient(), 'TESTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=5.0)
+    third = mod.collect_book_ticker_samples(StubClient(), 'ETHUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=5.0)
+
+    assert first == [{'symbol': 'TESTUSDT', 'bidPrice': '100.0', 'askPrice': '100.1'}]
+    assert second == [{'symbol': 'TESTUSDT', 'bidPrice': '100.0', 'askPrice': '100.1'}]
+    assert third == [{'symbol': 'ETHUSDT', 'bidPrice': '100.0', 'askPrice': '100.1'}]
+    miss_events = [row for row in store.read_events(limit=20) if row['event_type'] == 'book_ticker_cache_miss']
+    assert [row['symbol'] for row in miss_events] == ['TESTUSDT', 'ETHUSDT']
+    assert len(calls) == 3
+
+
 def test_append_book_ticker_cache_sample_keeps_recent_ring_buffer(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
 
@@ -684,7 +705,32 @@ def test_collect_book_ticker_samples_rate_limits_repeated_cache_miss_events(tmp_
     assert len(miss_events) == 1
     assert len(calls) == 2
     state = store.load_json('event_rate_limit_state', {})
-    assert state['book_ticker_cache_miss']['global']['suppressed_since_last'] == 1
+    assert state['book_ticker_cache_miss']['TESTUSDT']['suppressed_since_last'] == 1
+
+
+def test_collect_book_ticker_samples_rate_limits_cache_miss_per_symbol(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = []
+
+    class StubClient:
+        def get(self, path, params=None, timeout=15):
+            calls.append({'path': path, 'params': params, 'timeout': timeout})
+            return {'bidPrice': '100.0', 'askPrice': '100.1', 'bidQty': '7', 'askQty': '5'}
+
+    mod.collect_book_ticker_samples(StubClient(), 'TESTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=3.0)
+    mod.collect_book_ticker_samples(StubClient(), 'ALTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=3.0)
+    mod.collect_book_ticker_samples(StubClient(), 'TESTUSDT', sample_count=1, interval_ms=0, store=store, cache_max_age_seconds=3.0)
+
+    events = store.read_events(limit=10)
+    miss_events = [row for row in events if row.get('event_type') == 'book_ticker_cache_miss']
+
+    assert len(miss_events) == 2
+    assert [row['symbol'] for row in miss_events] == ['TESTUSDT', 'ALTUSDT']
+    assert len(calls) == 3
+
+    state = store.load_json('event_rate_limit_state', {})
+    assert state['book_ticker_cache_miss']['TESTUSDT']['suppressed_since_last'] == 1
+    assert state['book_ticker_cache_miss']['ALTUSDT']['suppressed_since_last'] == 0
 
 
 def test_resolve_monitor_current_price_uses_side_aware_book_ticker_cache(tmp_path):
@@ -1584,9 +1630,9 @@ def test_compute_positions_heat_snapshot_tracks_remaining_risk_in_r_units(tmp_pa
     snapshot = mod.compute_positions_heat_snapshot(store.load_json('positions', {}))
 
     assert snapshot['tracked_positions'] == 1
-    assert snapshot['open_heat_r'] == 0.25
-    assert snapshot['heat_r_by_theme'] == {'meme': 0.25}
-    assert snapshot['heat_r_by_correlation'] == {'dog-family': 0.25}
+    assert snapshot['open_heat_r'] == 0.5
+    assert snapshot['heat_r_by_theme'] == {'meme': 0.5}
+    assert snapshot['heat_r_by_correlation'] == {'dog-family': 0.5}
 
 
 def test_evaluate_risk_guards_blocks_candidate_when_trigger_not_fired():
@@ -1891,6 +1937,273 @@ def test_run_scan_once_applies_caution_execution_quality_position_sizing(monkeyp
     assert payload['selected']['execution_quality_size_bucket'] == 'caution'
 
 
+def test_run_scan_once_prefers_trigger_fired_candidate_over_higher_score_watch_candidate(monkeypatch, tmp_path):
+    args = argparse.Namespace(
+        symbol='',
+        square_symbols='',
+        square_symbols_file='',
+        use_square_page=False,
+        top_gainers=5,
+        top_losers=5,
+        max_candidates=5,
+        lookback_bars=12,
+        swing_bars=6,
+        risk_usdt=10.0,
+        max_notional_usdt=0.0,
+        min_5m_change_pct=0.0,
+        min_quote_volume=0.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=100.0,
+        min_volume_multiple=0.0,
+        max_distance_from_ema_pct=100.0,
+        max_distance_from_vwap_pct=100.0,
+        leverage=5,
+        max_funding_rate=1.0,
+        max_funding_rate_avg=1.0,
+        okx_sentiment_inline='',
+        okx_sentiment_file='',
+        okx_sentiment_command='',
+        okx_auto=False,
+        okx_mcp_command='',
+        okx_sentiment_timeout=5,
+        external_signal_json='',
+        smart_money_inline='',
+        smart_money_file='',
+        runtime_state_dir=str(tmp_path),
+    )
+
+    meta = make_meta(symbol='TESTUSDT')
+    watch_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=12.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=101.0,
+        recent_swing_low=98.0,
+        stop_price=97.0,
+        quantity=10.0,
+        risk_per_unit=3.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=90.0,
+        reasons=['seed_watch'],
+        state='launch',
+        state_reasons=['watch_only'],
+        alert_tier='critical',
+        liquidity_grade='A',
+        setup_ready=False,
+        trigger_fired=False,
+        candidate_stage='watch_candidate',
+    )
+    trigger_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.0,
+        acceleration_ratio_5m_vs_15m=1.0,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=96.0,
+        quantity=10.0,
+        risk_per_unit=4.0,
+        recommended_leverage=3,
+        rsi_5m=64.0,
+        volume_multiple=1.5,
+        distance_from_ema20_5m_pct=0.6,
+        distance_from_vwap_15m_pct=0.5,
+        higher_tf_summary='aligned',
+        score=70.0,
+        reasons=['seed_trigger'],
+        state='launch',
+        state_reasons=['trigger_ready'],
+        alert_tier='high',
+        liquidity_grade='A',
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='trade_candidate',
+    )
+    built = [watch_candidate, trigger_candidate]
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'TESTUSDT': meta})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['TESTUSDT'], {'TESTUSDT': 1}, {'TESTUSDT': 1}))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda _client, symbol, interval, limit: [make_kline(100, 101, 99, 100, volume=1000, quote_volume=100000)] * max(limit, 30))
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, _symbol, limit=3: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {})
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+    monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: built.pop(0))
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert best is trigger_candidate
+    assert payload['selected']['trigger_fired'] is True
+    assert payload['selected']['candidate_stage'] == 'trade_candidate'
+    assert payload['candidates'][0]['symbol'] == 'TESTUSDT'
+
+
+def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_path):
+    args = argparse.Namespace(
+        symbol='',
+        square_symbols='',
+        square_symbols_file='',
+        use_square_page=False,
+        top_gainers=5,
+        top_losers=5,
+        max_candidates=5,
+        lookback_bars=12,
+        swing_bars=6,
+        risk_usdt=10.0,
+        max_notional_usdt=0.0,
+        min_5m_change_pct=0.0,
+        min_quote_volume=0.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=100.0,
+        min_volume_multiple=0.0,
+        max_distance_from_ema_pct=100.0,
+        max_distance_from_vwap_pct=100.0,
+        leverage=5,
+        max_funding_rate=1.0,
+        max_funding_rate_avg=1.0,
+        okx_sentiment_inline='',
+        okx_sentiment_file='',
+        okx_sentiment_command='',
+        okx_auto=False,
+        okx_mcp_command='',
+        okx_sentiment_timeout=5,
+        external_signal_json='',
+        smart_money_inline='',
+        smart_money_file='',
+        runtime_state_dir=str(tmp_path),
+    )
+
+    meta = make_meta(symbol='TESTUSDT')
+    watch_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=11.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.1,
+        acceleration_ratio_5m_vs_15m=1.0,
+        breakout_level=101.0,
+        recent_swing_low=98.0,
+        stop_price=97.0,
+        quantity=10.0,
+        risk_per_unit=3.0,
+        recommended_leverage=3,
+        rsi_5m=66.0,
+        volume_multiple=1.5,
+        distance_from_ema20_5m_pct=0.9,
+        distance_from_vwap_15m_pct=0.8,
+        higher_tf_summary='aligned',
+        score=82.0,
+        reasons=['seed_watch'],
+        state='launch',
+        state_reasons=['waiting_breakout'],
+        alert_tier='high',
+        liquidity_grade='A',
+        setup_ready=True,
+        trigger_fired=False,
+        candidate_stage='setup_candidate',
+        trigger_confirmation_count=0,
+        trigger_min_confirmations=1,
+    )
+    rejected_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=13.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.3,
+        acceleration_ratio_5m_vs_15m=1.2,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=96.0,
+        quantity=10.0,
+        risk_per_unit=4.0,
+        recommended_leverage=3,
+        rsi_5m=64.0,
+        volume_multiple=1.5,
+        distance_from_ema20_5m_pct=0.6,
+        distance_from_vwap_15m_pct=0.5,
+        higher_tf_summary='aligned',
+        score=74.0,
+        reasons=['seed_rejected'],
+        state='launch',
+        state_reasons=['trigger_ready'],
+        alert_tier='high',
+        liquidity_grade='D',
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='trade_candidate',
+        expected_slippage_pct=3.0,
+        book_depth_fill_ratio=0.2,
+        trigger_confirmation_count=2,
+        trigger_min_confirmations=2,
+    )
+    built = [watch_candidate, rejected_candidate]
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'TESTUSDT': meta})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['TESTUSDT'], {'TESTUSDT': 1}, {'TESTUSDT': 1}))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda _client, symbol, interval, limit: [make_kline(100, 101, 99, 100, volume=1000, quote_volume=100000)] * max(limit, 30))
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, _symbol, limit=3: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {})
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+    monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: built.pop(0))
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert best is watch_candidate
+    assert payload['funnel']['raw_scan_symbol_count'] == 1
+    assert payload['funnel']['evaluated_symbol_count'] == 1
+    assert payload['funnel']['evaluated_side_count'] == 2
+    assert payload['funnel']['candidate_pool_count'] == 1
+    assert payload['funnel']['setup_ready_count'] == 2
+    assert payload['funnel']['trigger_fired_count'] == 1
+    assert payload['funnel']['hard_rejected_count'] == 1
+    assert payload['funnel']['stage_counts']['setup_candidate'] == 1
+    assert payload['funnel']['stage_counts']['trade_candidate'] == 1
+    assert payload['funnel']['top_trigger_missing']['confirmation_count_below_minimum'] == 1
+    assert payload['funnel']['top_trade_missing']['candidate_trigger_not_fired'] == 1
+    assert payload['rejected_stats']['total'] == 1
+    assert payload['rejected_stats']['by_reason']['execution_slippage_veto'] == 1
+    assert payload['rejected_stats']['by_reject_label']['execution_slippage'] == 1
+    assert payload['rejected_stats']['by_execution_liquidity_grade']['D'] == 1
+    triggered = payload['rejected_stats']['triggered_but_risk_rejected']
+    assert len(triggered) == 1
+    assert triggered[0]['symbol'] == 'TESTUSDT'
+    assert triggered[0]['trigger_fired'] is True
+    assert triggered[0]['reject_reason'] == 'execution_slippage_veto'
+
+
 def test_apply_hard_veto_filters_rejects_extreme_execution_quality_before_live_trade():
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -2086,6 +2399,75 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
     assert result['filled_quantity'] == 6.5
     assert result['trade_management_plan']['quantity'] == 6.5
     assert result['entry_order_feedback']['status'] == 'FILLED'
+
+
+def test_place_live_trade_scales_quantity_down_to_zero_and_skips_entry_order(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=0.12,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='C',
+        expected_slippage_pct=0.38,
+        book_depth_fill_ratio=0.19,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    meta = mod.SymbolMeta(
+        symbol='TESTUSDT',
+        price_precision=2,
+        quantity_precision=1,
+        tick_size=0.01,
+        step_size=0.1,
+        min_qty=0.1,
+        quote_asset='USDT',
+        status='TRADING',
+        contract_type='PERPETUAL',
+    )
+    args = argparse.Namespace(tp1_r=1.5, tp1_close_pct=0.3, tp2_r=2.0, tp2_close_pct=0.4, breakeven_r=1.0, profile='test-profile')
+    calls = []
+
+    class Client:
+        def signed_post(self, path, params):
+            calls.append((path, params))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            raise AssertionError('entry order must be skipped when scaled quantity floors below min_qty')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    with pytest.raises(mod.BinanceAPIError, match='quantity_below_min_qty'):
+        mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert calls == [
+        ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
+        ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
+    ]
 
 
 def test_place_live_trade_blocks_when_exchange_leverage_mismatches(monkeypatch):
@@ -2410,9 +2792,6 @@ def test_parse_args_accepts_okx_auto_flags(monkeypatch):
             '/tmp/okx-trade-mcp',
             '--okx-sentiment-timeout',
             '33',
-            '--okx-simulated-trading',
-            '--okx-base-url',
-            'https://www.okx.com',
         ],
     )
 
@@ -2422,12 +2801,9 @@ def test_parse_args_accepts_okx_auto_flags(monkeypatch):
     assert args.okx_sentiment_command == 'python okx_feed.py'
     assert args.okx_mcp_command == '/tmp/okx-trade-mcp'
     assert args.okx_sentiment_timeout == 33
-    assert args.okx_simulated_trading is True
-    assert args.okx_base_url == 'https://www.okx.com'
     assert 'okx_sentiment_command' in args._explicit_cli_dests
     assert 'okx_mcp_command' in args._explicit_cli_dests
     assert 'okx_sentiment_timeout' in args._explicit_cli_dests
-    assert 'okx_simulated_trading' in args._explicit_cli_dests
 
 
 def test_compute_sentiment_resonance_bonus_rewards_early_turn_and_penalizes_overheated_sentiment():

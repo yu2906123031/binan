@@ -20,6 +20,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_live_trade as execution_place_live_trade
+
 try:
     import websocket
 except ImportError:  # pragma: no cover - optional dependency in some test environments
@@ -6372,604 +6374,90 @@ def recover_unknown_entry_order(client: Any, candidate: Candidate, quantity: flo
     return confirmed
 
 
-def ensure_symbol_margin_type(client: Any, symbol: str, margin_type: str = 'ISOLATED') -> Dict[str, Any]:
-    normalized_margin_type = str(margin_type or 'ISOLATED').strip().upper()
-    if normalized_margin_type not in {'ISOLATED', 'CROSSED'}:
-        normalized_margin_type = 'ISOLATED'
-    try:
-        response = client.signed_post('/fapi/v1/marginType', {
-            'symbol': str(symbol or '').upper(),
-            'marginType': normalized_margin_type,
-        })
-        return {
-            'ok': True,
-            'requested': normalized_margin_type,
-            'actual': normalized_margin_type,
-            'response': response if isinstance(response, dict) else {},
-            'already_set': False,
-        }
-    except BinanceAPIError as exc:
-        message = str(exc)
-        if '-4046' in message or 'No need to change margin type' in message:
-            return {
-                'ok': True,
-                'requested': normalized_margin_type,
-                'actual': normalized_margin_type,
-                'response': {'message': message},
-                'already_set': True,
-            }
-        raise
-
-
-def place_live_trade(client: Any, candidate: Candidate, leverage: int, meta: SymbolMeta, args: argparse.Namespace) -> Dict[str, Any]:
-    position_side = normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG))
-    position_key = build_position_key(candidate.symbol, position_side)
-    profile = getattr(args, 'profile', 'default')
-    requested_margin_type = str(getattr(args, 'margin_type', 'ISOLATED') or 'ISOLATED').strip().upper()
-    requested_leverage = int(leverage)
-
-    open_positions = fetch_open_positions(client)
-    has_existing_position = any(
-        isinstance(row, dict)
-        and position_row_matches_symbol_side(row, candidate.symbol, position_side)
-        for row in list(open_positions or [])
-    )
-    if has_existing_position:
-        error_payload = {
-            'symbol': candidate.symbol,
-            'side': position_side,
-            'position_key': position_key,
-            'profile': profile,
-            'preflight_reason': 'existing_position_open',
-            'message': 'preflight hard gate: existing_position_open',
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise BinanceAPIError('preflight hard gate: existing_position_open')
-
-    open_orders = fetch_open_orders(client, candidate.symbol)
-    open_algo_orders = fetch_open_algo_orders(client, candidate.symbol)
-    has_existing_open_orders = any(
-        isinstance(row, dict)
-        and str(row.get('symbol', '')).upper() == candidate.symbol.upper()
-        for row in list(open_orders or []) + list(open_algo_orders or [])
-    )
-    if has_existing_open_orders:
-        error_payload = {
-            'symbol': candidate.symbol,
-            'side': position_side,
-            'position_key': position_key,
-            'profile': profile,
-            'preflight_reason': 'existing_open_orders',
-            'message': 'preflight hard gate: existing_open_orders',
-            'open_order_ids': [row.get('orderId') for row in list(open_orders or []) if isinstance(row, dict)],
-            'open_algo_order_ids': [row.get('algoId') or row.get('clientAlgoId') for row in list(open_algo_orders or []) if isinstance(row, dict)],
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise BinanceAPIError('preflight hard gate: existing_open_orders')
-
-    margin_type_check = ensure_symbol_margin_type(client, candidate.symbol, requested_margin_type)
-    leverage_response = client.signed_post('/fapi/v1/leverage', {'symbol': candidate.symbol, 'leverage': requested_leverage})
-    actual_leverage = int(_to_float(leverage_response.get('leverage'), default=requested_leverage)) if isinstance(leverage_response, dict) else requested_leverage
-    if actual_leverage != requested_leverage:
-        error_payload = {
-            'symbol': candidate.symbol,
-            'side': position_side,
-            'position_key': position_key,
-            'profile': profile,
-            'preflight_reason': 'leverage_mismatch',
-            'requested_leverage': requested_leverage,
-            'actual_leverage': actual_leverage,
-            'message': f'preflight hard gate: leverage_mismatch requested={requested_leverage} actual={actual_leverage}',
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise BinanceAPIError(error_payload['message'])
-
-    execution_quality = compute_execution_quality_size_adjustment(candidate)
-    step_size = float(getattr(meta, 'step_size', 0.0) or 0.0)
-    quantity_precision = int(getattr(meta, 'quantity_precision', 0) or 0)
-    min_qty = float(getattr(meta, 'min_qty', 0.0) or 0.0)
-    base_quantity = round_step(candidate.quantity, step_size, quantity_precision)
-    scaled_quantity = round_step(base_quantity * float(execution_quality['size_multiplier']), step_size, quantity_precision)
-    quantity = scaled_quantity if scaled_quantity >= min_qty else scaled_quantity
-    entry_order_error: Optional[Exception] = None
-    entry_position_mode = 'HEDGE' if should_send_position_side(client) else 'ONE_WAY'
-    entry_params = {
-        'symbol': candidate.symbol,
-        'side': 'SELL' if position_side == POSITION_SIDE_SHORT else 'BUY',
-        'type': 'MARKET',
-        'quantity': format_decimal(quantity, quantity_precision),
-        'newOrderRespType': 'RESULT',
-    }
-    if should_send_position_side(client):
-        entry_params['positionSide'] = position_side
-    try:
-        entry_order = client.signed_post('/fapi/v1/order', entry_params)
-    except Exception as exc:
-        entry_order_error = exc
-        error_message = str(exc)
-        if is_position_side_mode_error(exc) and should_send_position_side(client):
-            mark_one_way_position_mode(client)
-            entry_params.pop('positionSide', None)
-            entry_order = client.signed_post('/fapi/v1/order', entry_params)
-            entry_position_mode = 'ONE_WAY'
-        elif '-1007' in error_message and 'unknown' in error_message.lower():
-            try:
-                entry_order = recover_unknown_entry_order(client, candidate, quantity, quantity_precision)
-            except Exception as recovery_exc:
-                message = str(recovery_exc)
-                error_payload = {
-                    'symbol': candidate.symbol,
-                    'message': message,
-                    'profile': profile,
-                }
-                log_runtime_event('error', error_payload)
-                emit_notification(args, 'error', error_payload)
-                raise BinanceAPIError(message) from recovery_exc
-        else:
-            raise
-    entry_price = _to_float(entry_order.get('avgPrice')) or float(candidate.last_price)
-    filled_quantity = _to_float(entry_order.get('executedQty'), default=0.0)
-    if filled_quantity <= 0 or str(entry_order.get('status') or '').upper() not in {'FILLED', 'PARTIALLY_FILLED'}:
-        order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else None
-        client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None
-        for _ in range(3):
-            if order_id is None and not client_order_id:
-                break
-            time.sleep(0.4)
-            try:
-                confirmed_entry = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id)
-            except Exception:
-                continue
-            confirmed_qty = _to_float(confirmed_entry.get('executedQty'), default=0.0)
-            if confirmed_qty > 0:
-                entry_order = confirmed_entry
-                entry_price = _to_float(entry_order.get('avgPrice')) or _to_float(entry_order.get('price')) or entry_price
-                filled_quantity = confirmed_qty
-                break
-        if filled_quantity <= 0:
-            active_position = next((row for row in fetch_open_positions(client) if position_row_matches_symbol_side(row, candidate.symbol, position_side)), None)
-            if isinstance(active_position, dict):
-                filled_quantity = abs(_to_float(active_position.get('positionAmt')))
-                entry_price = _to_float(active_position.get('entryPrice')) or entry_price
-    if filled_quantity <= 0:
-        raise BinanceAPIError(f'entry order not filled yet; stop placement skipped for {candidate.symbol}')
-    entry_order_feedback = {
-        'order_id': entry_order.get('orderId'),
-        'client_order_id': entry_order.get('clientOrderId'),
-        'status': entry_order.get('status'),
-        'avg_price': entry_price,
-        'executed_qty': filled_quantity,
-        'cum_quote': _to_float(entry_order.get('cumQuote')),
-        'update_time': entry_order.get('updateTime'),
-        'position_mode': entry_position_mode,
-        'recovered_from_unknown_timeout': bool(entry_order_error is not None and '-1007' in str(entry_order_error)),
-    }
-    plan = build_trade_management_plan(
-        entry_price=entry_price,
-        stop_price=float(candidate.stop_price),
-        quantity=filled_quantity,
-        tp1_r=float(getattr(args, 'tp1_r', 1.5)),
-        tp1_close_pct=float(getattr(args, 'tp1_close_pct', 0.3)),
-        tp2_r=float(getattr(args, 'tp2_r', 2.0)),
-        tp2_close_pct=float(getattr(args, 'tp2_close_pct', 0.4)),
-        breakeven_r=float(getattr(args, 'breakeven_r', 1.0)),
-        atr_stop_distance=float(getattr(candidate, 'atr_stop_distance', 0.0) or 0.0),
-        side=normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
-        breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
-    )
-    payload = {
-        'symbol': candidate.symbol,
-        'side': normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'position_key': build_position_key(candidate.symbol, getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'entry_price': entry_price,
-        'filled_quantity': filled_quantity,
-        'stop_price': float(candidate.stop_price),
-        'quantity': filled_quantity,
-        'entry_order_id': entry_order_feedback['order_id'],
-        'entry_client_order_id': entry_order_feedback['client_order_id'],
-        'entry_order_status': entry_order_feedback['status'],
-        'entry_cum_quote': entry_order_feedback['cum_quote'],
-        'entry_update_time': entry_order_feedback['update_time'],
-        'profile': getattr(args, 'profile', 'default'),
-        'margin_type': requested_margin_type,
-        'margin_type_check': margin_type_check,
-        'leverage': requested_leverage,
-        'leverage_check': {
-            'requested': requested_leverage,
-            'actual': actual_leverage,
-            'response': leverage_response if isinstance(leverage_response, dict) else {},
-        },
-        'position_mode': entry_position_mode,
-    }
-    log_runtime_event('entry_filled', payload)
-    emit_notification(args, 'entry_filled', payload)
-    try:
-        stop_order = place_stop_market_order(client, candidate.symbol, float(candidate.stop_price), filled_quantity, meta, side=normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)))
-    except Exception as exc:
-        error_payload = {
-            'symbol': candidate.symbol,
-            'message': f'开仓成功，但挂止损失败: {exc}',
-            'profile': getattr(args, 'profile', 'default'),
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise
-    protection = resolve_position_protection_status(
+def ensure_symbol_margin_type(client: BinanceFuturesClient, symbol: str, margin_type: str = 'ISOLATED') -> Dict[str, Any]:
+    return execution_ensure_symbol_margin_type(
         client,
-        candidate.symbol,
-        expected_stop_order=stop_order,
-        allow_missing_when_flat=True,
-        side=normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)),
+        symbol,
+        binance_api_error=BinanceAPIError,
+        margin_type=margin_type,
     )
-    if protection.get('status') == 'missing':
-        error_payload = {
-            'symbol': candidate.symbol,
-            'message': '开仓成功，但止损单未被交易所开放订单确认 (not confirmed by exchange open orders)',
-            'expected_stop_order_id': protection.get('expected_order_id'),
-            'profile': getattr(args, 'profile', 'default'),
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise BinanceAPIError('stop order not confirmed by exchange open orders')
-    stop_payload = {
-        'symbol': candidate.symbol,
-        'side': normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'position_key': build_position_key(candidate.symbol, getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'stop_price': float(candidate.stop_price),
-        'quantity': filled_quantity,
-        'stop_order_id': stop_order.get('orderId'),
-        'protection_status': protection.get('status'),
-        'profile': getattr(args, 'profile', 'default'),
-        'position_mode': 'ONE_WAY' if not should_send_position_side(client) else entry_position_mode,
-    }
-    log_runtime_event('initial_stop_placed', stop_payload)
-    emit_notification(args, 'initial_stop_placed', stop_payload)
-    return {
-        'symbol': candidate.symbol,
-        'side': normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'position_key': build_position_key(candidate.symbol, getattr(candidate, 'side', POSITION_SIDE_LONG)),
-        'entry_order': entry_order,
-        'entry_price': entry_price,
-        'filled_quantity': filled_quantity,
-        'entry_order_feedback': entry_order_feedback,
-        'position_mode': 'ONE_WAY' if not should_send_position_side(client) else entry_position_mode,
-        'margin_type': requested_margin_type,
-        'margin_type_check': margin_type_check,
-        'leverage': requested_leverage,
-        'leverage_check': {
-            'requested': requested_leverage,
-            'actual': actual_leverage,
-            'response': leverage_response if isinstance(leverage_response, dict) else {},
-        },
-        'stop_order': stop_order,
-        'protection_check': protection,
-        'trade_management_plan': asdict(plan),
-    }
+
+
+def place_live_trade(client: BinanceFuturesClient, candidate: Candidate, leverage: int, meta: SymbolMeta, args: argparse.Namespace) -> Dict[str, Any]:
+    return execution_place_live_trade(
+        client,
+        candidate,
+        leverage=leverage,
+        meta=meta,
+        args=args,
+        binance_api_error=BinanceAPIError,
+        ensure_symbol_margin_type_fn=ensure_symbol_margin_type,
+        round_step=round_step,
+        format_decimal=format_decimal,
+        should_send_position_side=should_send_position_side,
+        is_position_side_mode_error=is_position_side_mode_error,
+        mark_one_way_position_mode=mark_one_way_position_mode,
+        build_trade_management_plan=build_trade_management_plan,
+        fetch_open_positions=fetch_open_positions,
+        fetch_open_orders=fetch_open_orders,
+        fetch_open_algo_orders=fetch_open_algo_orders,
+        place_stop_market_order=place_stop_market_order,
+        resolve_position_protection_status=resolve_position_protection_status,
+        recover_unknown_entry_order=recover_unknown_entry_order,
+        query_order=query_order,
+        log_runtime_event=log_runtime_event,
+        emit_notification=emit_notification,
+        normalize_position_side=normalize_position_side,
+        build_position_key=build_position_key,
+        position_row_matches_symbol_side=position_row_matches_symbol_side,
+        _to_float=_to_float,
+        compute_execution_quality_size_adjustment=compute_execution_quality_size_adjustment,
+        asdict=asdict,
+        position_side_long=POSITION_SIDE_LONG,
+        time_module=time,
+    )
 
 
 def monitor_live_trade(client: Any, symbol: str, meta: SymbolMeta, args: argparse.Namespace, trade: Dict[str, Any], store: RuntimeStateStore) -> Dict[str, Any]:
-    entry_price = _to_float(trade.get('entry_price'))
-    stop_order = trade.get('stop_order') if isinstance(trade.get('stop_order'), dict) else None
-    protection_check = trade.get('protection_check') if isinstance(trade.get('protection_check'), dict) else {}
-    plan_payload = trade.get('trade_management_plan') if isinstance(trade.get('trade_management_plan'), dict) else {}
-    trade_side = normalize_position_side(trade.get('side') or plan_payload.get('side'))
-    plan_payload.setdefault('side', trade_side)
-    plan_payload.setdefault('position_side', trade_side)
-    plan = TradeManagementPlan(**plan_payload)
-    positions = store.load_json('positions', {})
-    if not isinstance(positions, dict):
-        positions = {}
-    position_key, tracked = get_position_by_symbol_side(positions, symbol, trade_side)
-    state = TradeManagementState(
-        symbol=symbol,
-        side=position_side_to_trade_side(trade_side),
-        position_side=trade_side,
-        position_key=position_key,
-        initial_quantity=_to_float(tracked.get('quantity') or plan.quantity or trade.get('quantity')),
-        remaining_quantity=_to_float(tracked.get('remaining_quantity') or tracked.get('quantity') or plan.quantity),
-        current_stop_price=_to_float(tracked.get('stop_price') or tracked.get('current_stop_price') or plan.stop_price, default=plan.stop_price),
-        moved_to_breakeven=bool(tracked.get('moved_to_breakeven', False)),
-        tp1_hit=bool(tracked.get('tp1_hit', False)),
-        tp2_hit=bool(tracked.get('tp2_hit', False)),
-        highest_price_seen=_to_float(tracked.get('highest_price_seen') or entry_price, default=entry_price),
-        lowest_price_seen=_to_float(tracked.get('lowest_price_seen') or entry_price, default=entry_price),
-        opened_at=str(tracked.get('opened_at') or _isoformat_utc(_utc_now())),
-        first_1r_at=str(tracked.get('first_1r_at') or '') or None,
-        realized_r=_to_float(tracked.get('realized_r'), default=0.0),
+    return execution_monitor_live_trade(
+        client,
+        symbol,
+        meta,
+        args,
+        trade,
+        store,
+        trade_management_plan_type=TradeManagementPlan,
+        trade_management_state_type=TradeManagementState,
+        position_side_long=POSITION_SIDE_LONG,
+        position_side_short=POSITION_SIDE_SHORT,
+        binance_api_error=BinanceAPIError,
+        _to_float=_to_float,
+        normalize_position_side=normalize_position_side,
+        position_side_to_trade_side=position_side_to_trade_side,
+        build_position_key=build_position_key,
+        get_position_by_symbol_side=get_position_by_symbol_side,
+        build_trade_analytics_snapshot=build_trade_analytics_snapshot,
+        upsert_position_record=upsert_position_record,
+        materialize_positions_state=materialize_positions_state,
+        asdict=asdict,
+        log_runtime_event=log_runtime_event,
+        emit_notification=emit_notification,
+        fetch_klines=fetch_klines,
+        extract_closes=extract_closes,
+        extract_highs=extract_highs,
+        extract_lows=extract_lows,
+        resolve_monitor_current_price=resolve_monitor_current_price,
+        evaluate_management_actions=evaluate_management_actions,
+        update_trade_progress_metrics=update_trade_progress_metrics,
+        apply_management_action=apply_management_action,
+        resolve_reduce_order_exit_price=resolve_reduce_order_exit_price,
+        compute_trade_realized_r_increment=compute_trade_realized_r_increment,
+        score_to_decile_label=score_to_decile_label,
+        resolve_trigger_class=resolve_trigger_class,
+        utc_now=_utc_now,
+        isoformat_utc=_isoformat_utc,
+        time_module=time,
     )
-    selection_context = dict(tracked)
-
-    def persist_position(
-        status: str,
-        protection_status: Optional[str],
-        active_stop_order: Optional[Dict[str, Any]],
-        exit_reason: Optional[str] = None,
-        closed_at: Optional[datetime.datetime] = None,
-    ) -> Dict[str, Any]:
-        position_payload = dict(tracked)
-        analytics_snapshot = build_trade_analytics_snapshot(state, plan, closed_at=closed_at)
-        position_payload.update({
-            'symbol': symbol,
-            'side': state.side,
-            'position_key': build_position_key(symbol, state.side),
-            'status': status,
-            'quantity': round(state.initial_quantity, 10),
-            'remaining_quantity': round(state.remaining_quantity, 10),
-            'entry_price': round(entry_price, 10),
-            'stop_price': round(state.current_stop_price, 10) if state.current_stop_price is not None else None,
-            'current_stop_price': round(state.current_stop_price, 10) if state.current_stop_price is not None else None,
-            'stop_order_id': active_stop_order.get('orderId') if isinstance(active_stop_order, dict) else None,
-            'protection_status': protection_status,
-            'moved_to_breakeven': state.moved_to_breakeven,
-            'tp1_hit': state.tp1_hit,
-            'tp2_hit': state.tp2_hit,
-            'highest_price_seen': round(state.highest_price_seen, 10) if state.highest_price_seen is not None else None,
-            'lowest_price_seen': round(state.lowest_price_seen, 10) if state.lowest_price_seen is not None else None,
-            'opened_at': state.opened_at,
-            'first_1r_at': state.first_1r_at,
-            'realized_r': analytics_snapshot['realized_r'],
-            'mfe_r': analytics_snapshot['mfe_r'],
-            'mae_r': analytics_snapshot['mae_r'],
-            'time_to_1r': analytics_snapshot['time_to_1r'],
-            'time_to_1r_minutes': analytics_snapshot['time_to_1r_minutes'],
-            'time_in_trade_minutes': analytics_snapshot['time_in_trade_minutes'],
-            'trade_management_plan': asdict(plan),
-            'profile': getattr(args, 'profile', 'default'),
-            'exit_reason': exit_reason or position_payload.get('exit_reason'),
-        })
-        storage_key_hint = str(state.position_key or tracked.get('position_key') or tracked.get('symbol') or build_position_key(symbol, state.side)).upper()
-        updated_positions, resolved_key = upsert_position_record(positions, position_payload, key=storage_key_hint)
-        positions.clear()
-        positions.update(updated_positions)
-        state.position_key = resolved_key
-        position_payload['position_key'] = resolved_key
-        persisted_payload = dict(positions.get(resolved_key, position_payload))
-        store.save_json('positions', materialize_positions_state(
-            positions,
-            {resolved_key: str(tracked.get('position_key') or tracked.get('symbol') or resolved_key).upper()},
-            include_legacy_alias=True,
-        ))
-        tracked.clear()
-        tracked.update(persisted_payload)
-        selection_context.update(persisted_payload)
-        return persisted_payload
-
-    def record_event(event_type: str, payload: Dict[str, Any], notify: bool = True) -> Dict[str, Any]:
-        event_payload = {
-            'symbol': symbol,
-            'side': state.side,
-            'position_key': state.position_key or build_position_key(symbol, state.side),
-            'profile': getattr(args, 'profile', 'default'),
-            **payload,
-        }
-        log_runtime_event(event_type, event_payload)
-        row = store.append_event(event_type, event_payload)
-        if notify:
-            emit_notification(args, event_type, event_payload)
-        return row
-
-    persist_position(status='monitoring', protection_status=protection_check.get('status'), active_stop_order=stop_order)
-    record_event('entry_filled', {
-        'entry_price': round(entry_price, 10),
-        'stop_price': round(plan.stop_price, 10),
-        'quantity': round(state.initial_quantity, 10),
-    })
-    record_event('protection_confirmed', {
-        'protection_status': protection_check.get('status'),
-        'stop_order_id': stop_order.get('orderId') if isinstance(stop_order, dict) else None,
-    })
-
-    active_stop_order = stop_order
-    protection_status = protection_check.get('status')
-    max_cycles = max(int(getattr(args, 'max_monitor_cycles', 20) or 20), 1)
-    if getattr(args, 'monitor_poll_interval_sec', None) in (None, 0, 0.0, '0', '0.0') and getattr(args, 'max_monitor_cycles', None) is None:
-        max_cycles = max(max_cycles, 50)
-    trailing_buffer_pct = float(getattr(args, 'trailing_buffer_pct', 0.02) or 0.02)
-    book_ticker_cache_max_age_seconds = max(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2), 3.0)
-    for _ in range(max_cycles):
-        if state.remaining_quantity <= 0:
-            break
-        klines = fetch_klines(client, symbol, '5m', 21)
-        positions = store.load_json('positions', {})
-        if not isinstance(positions, dict):
-            positions = {}
-        loop_position_key, tracked = get_position_by_symbol_side(positions, symbol, state.side)
-        state.position_key = loop_position_key
-        closes = extract_closes(klines)
-        highs = extract_highs(klines)
-        lows = extract_lows(klines)
-        current_price = tracked.get('_debug_current_price')
-        current_price_source = 'debug_override' if current_price is not None else ''
-        current_price_snapshot = None
-        if current_price is None:
-            fallback_price = closes[-1] if closes else entry_price
-            price_resolution = resolve_monitor_current_price(
-                store,
-                symbol,
-                state.position_side,
-                fallback_price=fallback_price,
-                cache_max_age_seconds=book_ticker_cache_max_age_seconds,
-            )
-            current_price = price_resolution['price']
-            current_price_source = str(price_resolution.get('source') or 'kline_close_fallback')
-            current_price_snapshot = price_resolution.get('snapshot')
-        ema5m = tracked.get('_debug_ema5m')
-        if ema5m is None:
-            ema5m = closes[-1] if closes else current_price
-        trailing_reference = tracked.get('_debug_trailing_reference')
-        if trailing_reference is None:
-            if state.position_side == POSITION_SIDE_SHORT:
-                trailing_reference = min(lows) if lows else min(state.lowest_price_seen or current_price, current_price)
-            else:
-                trailing_reference = max(highs) if highs else max(state.highest_price_seen or current_price, current_price)
-        actions = evaluate_management_actions(
-            state,
-            plan,
-            current_price=current_price,
-            ema5m=ema5m,
-            trailing_reference=trailing_reference,
-            trailing_buffer_pct=trailing_buffer_pct,
-            allow_runner_exit=True,
-        )
-        update_trade_progress_metrics(state, plan, current_price=current_price, observed_at=_utc_now())
-        debug_payload = {
-            'symbol': symbol,
-            'position_side': state.position_side,
-            'current_price': current_price,
-            'current_price_source': current_price_source or 'kline_close_fallback',
-            'current_price_cache_max_age_seconds': book_ticker_cache_max_age_seconds,
-            'book_ticker_snapshot': current_price_snapshot,
-            'ema5m': ema5m,
-            'trailing_reference': trailing_reference,
-            'actions': actions,
-            'remaining_quantity': state.remaining_quantity,
-            'tracked': tracked,
-            'max_cycles': max_cycles,
-        }
-        store.save_json('monitor_debug', debug_payload)
-        if not actions:
-            persist_position(status='monitoring', protection_status=protection_status, active_stop_order=active_stop_order)
-            time.sleep(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2))
-            continue
-        for action in actions:
-            try:
-                state, active_stop_order, action_result = apply_management_action(client, symbol, meta, state, action, active_stop_order)
-            except BinanceAPIError as exc:
-                message = str(exc)
-                record_event('management_action_failed', {
-                    'action': action.get('type'),
-                    'message': message,
-                    'current_price': round(float(current_price), 10),
-                    'requested_stop_price': action.get('new_stop_price'),
-                    'remaining_quantity': round(state.remaining_quantity, 10),
-                    'kept_existing_stop': True,
-                })
-                persist_position(status='monitoring', protection_status=protection_status, active_stop_order=active_stop_order)
-                continue
-            action_exit_price = None
-            if action.get('type') in {'take_profit_1', 'take_profit_2', 'runner_exit'}:
-                action_exit_price = resolve_reduce_order_exit_price(action_result.get('reduce_order', {}), current_price)
-                state.realized_r += compute_trade_realized_r_increment(
-                    entry_price=plan.entry_price,
-                    exit_price=action_exit_price,
-                    initial_risk_per_unit=plan.initial_risk_per_unit,
-                    close_qty=action.get('close_qty'),
-                    initial_quantity=state.initial_quantity,
-                    side=state.position_side,
-                )
-            if state.remaining_quantity <= 0:
-                protection_status = 'flat'
-            elif action['type'] == 'runner_exit':
-                protection_status = 'flat'
-            else:
-                protection_status = 'protected'
-            if action['type'] == 'move_stop_to_breakeven':
-                record_event('breakeven_moved', {
-                    'new_stop_price': round(action['new_stop_price'], 10),
-                    'stop_order_id': active_stop_order.get('orderId') if isinstance(active_stop_order, dict) else None,
-                    'confirmation_mode': action.get('confirmation_mode', plan.breakeven_confirmation_mode),
-                })
-            elif action['type'] == 'take_profit_1':
-                action.setdefault('exit_reason', 'tp1')
-                record_event('tp1_hit', {
-                    'close_qty': round(action['close_qty'], 10),
-                    'remaining_quantity': round(state.remaining_quantity, 10),
-                    'new_stop_price': round(action.get('new_stop_price'), 10) if action.get('new_stop_price') is not None else None,
-                    'stop_order_id': active_stop_order.get('orderId') if isinstance(active_stop_order, dict) else None,
-                    'exit_reason': action.get('exit_reason', 'tp1'),
-                    'exit_price': round(action_exit_price, 10) if action_exit_price is not None else None,
-                    'realized_r_after_action': round(state.realized_r, 4),
-                })
-            elif action['type'] == 'take_profit_2':
-                action.setdefault('exit_reason', 'tp2')
-                record_event('tp2_hit', {
-                    'close_qty': round(action['close_qty'], 10),
-                    'remaining_quantity': round(state.remaining_quantity, 10),
-                    'new_stop_price': round(action.get('new_stop_price'), 10) if action.get('new_stop_price') is not None else None,
-                    'stop_order_id': active_stop_order.get('orderId') if isinstance(active_stop_order, dict) else None,
-                    'exit_reason': action.get('exit_reason', 'tp2'),
-                    'exit_price': round(action_exit_price, 10) if action_exit_price is not None else None,
-                    'realized_r_after_action': round(state.realized_r, 4),
-                })
-            elif action['type'] == 'runner_exit':
-                action.setdefault('exit_reason', 'runner')
-                record_event('runner_exited', {
-                    'close_qty': round(action['close_qty'], 10),
-                    'remaining_quantity': round(state.remaining_quantity, 10),
-                    'trailing_floor': round(action.get('trailing_floor'), 10) if action.get('trailing_floor') is not None else None,
-                    'exit_reason': action.get('exit_reason', 'runner'),
-                    'exit_price': round(action_exit_price, 10) if action_exit_price is not None else None,
-                    'realized_r_after_action': round(state.realized_r, 4),
-                })
-            if protection_status == 'flat':
-                final_exit_reason = action.get('exit_reason', 'flat')
-                closed_at = _utc_now()
-                analytics_snapshot = build_trade_analytics_snapshot(state, plan, closed_at=closed_at)
-                selected_score = _to_float(
-                    tracked.get('selected_score', tracked.get('score', selection_context.get('selected_score', selection_context.get('score')))),
-                    default=0.0,
-                )
-                record_event('trade_invalidated', {
-                    'exit_reason': final_exit_reason,
-                    'remaining_quantity': round(state.remaining_quantity, 10),
-                    'protection_status': protection_status,
-                    'exit_price': round(action_exit_price, 10) if action_exit_price is not None else None,
-                    'score': round(selected_score, 4),
-                    'score_decile': str(tracked.get('score_decile') or selection_context.get('score_decile') or score_to_decile_label(selected_score)),
-                    'state': str(tracked.get('selected_state') or tracked.get('state') or selection_context.get('selected_state') or selection_context.get('state') or ''),
-                    'alert_tier': str(tracked.get('selected_alert_tier') or tracked.get('alert_tier') or selection_context.get('selected_alert_tier') or selection_context.get('alert_tier') or ''),
-                    'candidate_stage': str(tracked.get('candidate_stage') or selection_context.get('candidate_stage') or ''),
-                    'trigger_class': str(tracked.get('trigger_class') or selection_context.get('trigger_class') or resolve_trigger_class(selection_context)),
-                    'market_regime_label': str(tracked.get('market_regime_label') or selection_context.get('market_regime_label') or ''),
-                    'market_regime_multiplier': round(_to_float(tracked.get('market_regime_multiplier', selection_context.get('market_regime_multiplier')), default=0.0), 4),
-                    'setup_ready': bool(tracked.get('setup_ready', selection_context.get('setup_ready', False))),
-                    'trigger_fired': bool(tracked.get('trigger_fired', selection_context.get('trigger_fired', False))),
-                    **analytics_snapshot,
-                }, notify=False)
-            persist_position(
-                status='closed' if protection_status == 'flat' else 'monitoring',
-                protection_status=protection_status,
-                active_stop_order=active_stop_order,
-                exit_reason=action.get('exit_reason') if protection_status == 'flat' else None,
-                closed_at=closed_at if protection_status == 'flat' else None,
-            )
-            tracked['exit_reason'] = action.get('exit_reason') if protection_status == 'flat' else tracked.get('exit_reason')
-            if protection_status == 'flat':
-                break
-        if protection_status == 'flat':
-            break
-        time.sleep(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2))
-
-    final_status = 'closed' if state.remaining_quantity <= 0 or protection_status == 'flat' else 'monitoring'
-    final_exit_reason = tracked.get('exit_reason')
-    persist_position(
-        status=final_status,
-        protection_status='flat' if final_status == 'closed' else protection_status,
-        active_stop_order=active_stop_order if final_status != 'closed' else None,
-        exit_reason=final_exit_reason if final_status == 'closed' else None,
-        closed_at=_utc_now() if final_status == 'closed' else None,
-    )
-    return {
-        'ok': True,
-        'mode': 'foreground',
-        'symbol': symbol,
-        'status': final_status,
-        'remaining_quantity': round(state.remaining_quantity, 10),
-        'stop_order_id': active_stop_order.get('orderId') if isinstance(active_stop_order, dict) and final_status != 'closed' else None,
-        'protection_status': 'flat' if final_status == 'closed' else protection_status,
-        'exit_reason': final_exit_reason if final_status == 'closed' else None,
-        'realized_r': round(state.realized_r, 4),
-    }
-
-
-def start_trade_monitor_thread(*args, **kwargs):
-    thread = threading.Thread(target=monitor_live_trade, kwargs=kwargs, daemon=True, name=f"trade-monitor-{kwargs.get('symbol') or (args[1] if len(args) > 1 else 'unknown')}")
-    thread.start()
-    return thread
 
 
 def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: argparse.Namespace) -> List[str]:

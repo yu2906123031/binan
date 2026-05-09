@@ -84,6 +84,36 @@ def test_parse_args_exposes_runtime_and_execution_flags():
     assert args.runtime_state_dir == '/tmp/runtime'
 
 
+def test_parse_args_accepts_supervisor_live_flags():
+    mod = load_module()
+    args = mod.parse_args([
+        '--profile', '10u-aggressive',
+        '--live',
+        '--auto-loop',
+        '--max-scan-cycles', '0',
+        '--poll-interval-sec', '60',
+        '--monitor-poll-interval-sec', '15',
+        '--risk-usdt', '5',
+        '--max-notional-usdt', '20',
+        '--leverage', '5',
+        '--max-open-positions', '1',
+        '--square-symbols-file', '/tmp/symbols.txt',
+        '--notify-target', 'telegram:-5125444265,weixin:chatid',
+    ])
+    assert args.profile == '10u-aggressive'
+    assert args.live is True
+    assert args.auto_loop is True
+    assert args.max_scan_cycles == 0
+    assert args.poll_interval_sec == 60
+    assert args.monitor_poll_interval_sec == 15
+    assert abs(args.risk_usdt - 5.0) < 1e-9
+    assert abs(args.max_notional_usdt - 20.0) < 1e-9
+    assert args.leverage == 5
+    assert args.max_open_positions == 1
+    assert args.square_symbols_file == '/tmp/symbols.txt'
+    assert args.notify_target == 'telegram:-5125444265,weixin:chatid'
+
+
 def test_parse_args_defaults_cover_run_loop_dependencies():
     mod = load_module()
     args = mod.apply_runtime_profile(mod.parse_args([]))
@@ -121,15 +151,55 @@ def test_active_profile_relaxes_small_account_entry_thresholds():
     args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-active']))
     assert args.risk_usdt == 1.0
     assert args.max_notional_usdt == 500.0
-    assert args.lookback_bars == 6
-    assert args.min_5m_change_pct == 0.8
-    assert args.min_volume_multiple == 1.25
-    assert args.min_quote_volume == 10_000_000
+    assert args.lookback_bars == 4
+    assert args.swing_bars == 4
+    assert args.min_5m_change_pct == 0.5
+    assert args.min_volume_multiple == 0.9
+    assert args.min_quote_volume == 5_000_000
+    assert args.top_gainers == 35
+    assert args.top_losers == 35
+    assert args.max_candidates == 12
+    assert args.watch_breakout_tolerance_pct == 0.8
+    assert args.setup_breakout_tolerance_pct == 0.35
+    assert args.max_distance_from_ema_pct == 8.0
+    assert args.max_distance_from_vwap_pct == 7.0
+    assert args.oi_hard_reversal_threshold_pct == 1.0
+    assert args.execution_slippage_hard_veto_r == 0.4
+    assert args.execution_slippage_risk_threshold_r == 0.25
 
 
-def test_okx_sim_active_profile_uses_exploratory_simulation_thresholds():
+def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     mod = load_module()
-    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'okx-sim-active']))
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-aggressive']))
+    assert args.risk_usdt == 1.2
+    assert args.max_notional_usdt == 500.0
+    assert args.leverage == 5
+    assert args.lookback_bars == 4
+    assert args.swing_bars == 4
+    assert args.tp1_r == 5.0
+    assert args.tp1_close_pct == 0.5
+    assert args.tp2_r == 10.0
+    assert args.tp2_close_pct == 0.5
+    assert args.entry_tp1_offset_abs == 5.0
+    assert args.entry_tp2_offset_abs == 10.0
+    assert args.min_5m_change_pct == 0.35
+    assert args.min_volume_multiple == 0.8
+    assert args.min_quote_volume == 5_000_000
+    assert args.top_gainers == 45
+    assert args.top_losers == 45
+    assert args.max_candidates == 16
+    assert args.max_open_positions == 3
+    assert args.max_long_positions == 3
+    assert args.max_short_positions == 3
+    assert args.watch_breakout_tolerance_pct == 0.75
+    assert args.setup_breakout_tolerance_pct == 0.4
+    assert args.max_distance_from_ema_pct == 9.0
+    assert args.max_distance_from_vwap_pct == 8.0
+
+
+def test_binance_sim_active_profile_uses_exploratory_simulation_thresholds():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'binance-sim-active']))
     assert args.risk_usdt == 1.0
     assert args.max_notional_usdt == 300.0
     assert args.leverage == 3
@@ -146,6 +216,8 @@ def test_okx_sim_active_profile_uses_exploratory_simulation_thresholds():
     assert args.sim_probe_entry_enabled is True
     assert args.sim_probe_size_ratio == 0.2
     assert args.sim_probe_min_score == 62.0
+    assert args.binance_simulated_trading is True
+    assert args.base_url == 'https://testnet.binancefuture.com'
 
 
 def test_load_dotenv_loads_values_without_overriding_existing_env(tmp_path, monkeypatch):

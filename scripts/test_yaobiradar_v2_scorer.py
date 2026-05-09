@@ -1,21 +1,24 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
-SKILL_SCRIPTS_DIR = Path(__file__).resolve().parent
-MODULE_PATH = SKILL_SCRIPTS_DIR / 'yaobiradar_v2_scorer.py'
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / 'scripts'
+MODULE_PATH = SCRIPTS_DIR / 'yaobiradar_v2_scorer.py'
 
 
 def load_module():
-    sys.path.insert(0, str(SKILL_SCRIPTS_DIR))
+    sys.path.insert(0, str(SCRIPTS_DIR))
     try:
         spec = importlib.util.spec_from_file_location('yaobiradar_v2_scorer', MODULE_PATH)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
     finally:
-        if sys.path and sys.path[0] == str(SKILL_SCRIPTS_DIR):
+        if sys.path and sys.path[0] == str(SCRIPTS_DIR):
             sys.path.pop(0)
 
 
@@ -73,6 +76,49 @@ def test_build_rows_marks_blocked_entries_with_veto_reason():
         'external_veto_reason': 'manual_blacklist',
         'external_reasons': ['manual_blacklist', 'composite_rank=1'],
     }]
+
+
+def test_build_candidates_from_symbols_file_creates_10_symbol_rows_without_comment_lines(tmp_path):
+    mod = load_module()
+    square_symbols_path = tmp_path / 'binance_square_symbols.txt'
+    square_symbols_path.write_text(
+        '# Auto-generated from Binance Square Most Searched (6H)\n'
+        '# Updated by Hermes cron\n'
+        'PEPEUSDT\nACHUSDT\nMOVRUSDT\nTONUSDT\nHYPERUSDT\nHOLOUSDT\nSOLUSDT\nNILUSDT\nARKMUSDT\nUNIUSDT\n',
+        encoding='utf-8',
+    )
+
+    candidates = mod.build_candidates_from_symbols_file(square_symbols_path)
+
+    assert [row['symbol'] for row in candidates] == [
+        'PEPEUSDT',
+        'ACHUSDT',
+        'MOVRUSDT',
+        'TONUSDT',
+        'HYPERUSDT',
+        'HOLOUSDT',
+        'SOLUSDT',
+        'NILUSDT',
+        'ARKMUSDT',
+        'UNIUSDT',
+    ]
+    assert all(row['hot_score'] == 0.0 for row in candidates)
+    assert all(row['momentum_score'] == 0.0 for row in candidates)
+    assert all(row['liquidity_score'] == 0.0 for row in candidates)
+    assert all(row['breakout_score'] == 0.0 for row in candidates)
+    assert all(row['reasons'] == ['square_symbols_fallback'] for row in candidates)
+
+
+def test_refresh_candidates_from_square_symbols_writes_json_payload(tmp_path):
+    mod = load_module()
+    square_symbols_path = tmp_path / 'binance_square_symbols.txt'
+    candidates_path = tmp_path / 'yaobiradar_v2_candidates.json'
+    square_symbols_path.write_text('DOGEUSDT\nSUIUSDT\n', encoding='utf-8')
+
+    rows = mod.refresh_candidates_from_square_symbols(square_symbols_path, candidates_path)
+
+    assert [row['symbol'] for row in rows] == ['DOGEUSDT', 'SUIUSDT']
+    assert json.loads(candidates_path.read_text(encoding='utf-8')) == rows
 
 
 def test_run_writes_payload_files(tmp_path):

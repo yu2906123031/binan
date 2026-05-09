@@ -192,6 +192,9 @@ def write_outputs(payload: Dict[str, Any], symbols_path: Path = SYMBOLS_PATH, ex
         symbol = normalize_symbol(raw_symbol)
         if symbol and isinstance(raw_entry, dict):
             normalized_signal_map[symbol] = raw_entry
+    for symbol in normalized_signal_map:
+        if symbol not in symbols:
+            symbols.append(symbol)
     full_payload = {
         'engine': str(payload.get('engine') or 'yaobiradar_v2'),
         'generated_at': int(payload.get('generated_at') or time.time()),

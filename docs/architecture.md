@@ -44,9 +44,10 @@
 
 ## 迁移顺序
 
-1. 先抽 runtime 纯函数和 `RuntimeStateStore`，保留旧脚本 re-export，确保现有测试不改导入路径。
-2. 再抽 domain dataclass 与 side/key 归一化函数。
-3. 抽 risk guard 与 portfolio heat，保持 reject reason 字符串不变。
+1. 先抽 runtime 纯函数和 `RuntimeStateStore`，保留旧脚本 re-export，确保现有测试不改导入路径。已完成：`scripts/runtime_store.py` 已承接 `RuntimeStateStore`、positions migration/materialize、runtime event normalization，主脚本通过 `from runtime_store import ...` 回接旧名称，`tests/test_strategy_v2_restore_regression.py` 保持原导入路径并已回归通过。
+2. 再抽 execution 开仓入口，延续主脚本 import/re-export 模式。已完成首批：`scripts/execution_engine.py` 已承接 `ensure_symbol_margin_type` 与 `place_live_trade`，主脚本通过 `from execution_engine import ...` 回接旧名称，`tests/test_execution_module_regression.py` 已回归通过。
+3. 再抽 domain dataclass 与 side/key 归一化函数。
+4. 抽 risk guard 与 portfolio heat，保持 reject reason 字符串不变。
 4. 抽 execution 下单与成交反馈标准化，`run_loop()` 只接收标准 `live_execution` payload。
 5. 最后拆 scan/signals/market data，保持 CLI 参数和 JSON 输出兼容。
 

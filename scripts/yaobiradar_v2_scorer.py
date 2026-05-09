@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -38,6 +39,18 @@ def _reason_list(value: Any) -> List[str]:
     return [text] if text else []
 
 
+def _load_symbol_lines(path: Path) -> List[str]:
+    rows: List[str] = []
+    for line in path.read_text(encoding='utf-8').splitlines():
+        text = line.strip()
+        if not text or text.startswith('#'):
+            continue
+        symbol = writer.normalize_symbol(text)
+        if symbol:
+            rows.append(symbol)
+    return list(dict.fromkeys(rows))
+
+
 def classify_tier(score: float, blocked: bool) -> str:
     if blocked:
         return 'blocked'
@@ -65,6 +78,29 @@ def compute_score(candidate: Dict[str, Any]) -> float:
         + _to_float(candidate.get('breakout_score')),
         4,
     )
+
+
+def build_candidates_from_symbols_file(path: Path) -> List[Dict[str, Any]]:
+    return [
+        {
+            'symbol': symbol,
+            'hot_score': 0.0,
+            'momentum_score': 0.0,
+            'liquidity_score': 0.0,
+            'breakout_score': 0.0,
+            'reasons': ['square_symbols_fallback'],
+        }
+        for symbol in _load_symbol_lines(path)
+    ]
+
+
+def refresh_candidates_from_square_symbols(
+    square_symbols_path: Path = writer.SYMBOLS_PATH,
+    candidates_path: Path = DEFAULT_INPUT_PATH,
+) -> List[Dict[str, Any]]:
+    rows = build_candidates_from_symbols_file(square_symbols_path)
+    candidates_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return rows
 
 
 def build_rows(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -147,10 +183,32 @@ def run(
     return write_from_candidates(candidates, engine=engine, symbols_path=symbols_path, external_json_path=external_json_path)
 
 
-def main() -> int:
-    candidates = load_candidates(DEFAULT_INPUT_PATH)
-    payload = write_from_candidates(candidates)
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Generate yaobiradar external signal payloads from candidate rows or square-symbol fallback input.')
+    parser.add_argument('--refresh-from-square-symbols', action='store_true')
+    parser.add_argument('--square-symbols-path', default=str(writer.SYMBOLS_PATH))
+    parser.add_argument('--input-path', default=str(DEFAULT_INPUT_PATH))
+    parser.add_argument('--symbols-output', default=str(writer.SYMBOLS_PATH))
+    parser.add_argument('--external-json-output', default=str(writer.EXTERNAL_JSON_PATH))
+    parser.add_argument('--print-json', action='store_true')
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    input_path = Path(args.input_path)
+    if args.refresh_from_square_symbols:
+        refresh_candidates_from_square_symbols(Path(args.square_symbols_path), input_path)
+    candidates = load_candidates(input_path)
+    payload = write_from_candidates(
+        candidates,
+        symbols_path=Path(args.symbols_output),
+        external_json_path=Path(args.external_json_output),
+    )
+    if args.print_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
