@@ -15,12 +15,17 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlencode
 
 import requests
 
-from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_live_trade as execution_place_live_trade
+from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
+from candidate_builder import build_candidate as build_candidate_impl
+from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
+from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
+from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl
+from runtime_store import RuntimeStateStore as RuntimeStateStoreImpl, restore_position_lifecycle_fields as restore_position_lifecycle_fields_impl, save_positions_state as save_positions_state_impl
 
 try:
     import websocket
@@ -775,22 +780,30 @@ def get_position_storage_aliases(position_key: str, symbol: Any, side: Any, pref
     return unique_aliases
 
 
-def materialize_positions_state(positions_state: Dict[str, Any], original_keys: Optional[Dict[str, str]] = None, include_legacy_alias: bool = True) -> Dict[str, Any]:
+def materialize_positions_state(positions_state: Dict[str, Any], original_keys: Optional[Dict[str, str]] = None, include_legacy_alias: bool = False) -> Dict[str, Any]:
     materialized: Dict[str, Any] = {}
     key_hints = dict(original_keys or {})
     for position_key, tracked in list((positions_state or {}).items()):
         if not isinstance(tracked, dict):
             continue
         symbol = str(tracked.get('symbol') or split_position_key(position_key)[0]).upper()
-        side = normalize_position_side(tracked.get('side') or split_position_key(position_key)[1])
+        side = normalize_position_side(tracked.get('position_side') or tracked.get('side') or split_position_key(position_key)[1])
         canonical_key = build_position_key(symbol, side)
         normalized = dict(tracked)
         normalized['symbol'] = symbol
-        normalized['side'] = side
+        normalized['side'] = position_side_to_trade_side(side)
+        normalized['position_side'] = side
         normalized['position_key'] = canonical_key
+        plan_payload = normalized.get('trade_management_plan')
+        if isinstance(plan_payload, dict) and plan_payload:
+            plan_payload = dict(plan_payload)
+            plan_payload['position_side'] = side
+            plan_payload['side'] = position_side_to_trade_side(side)
+            normalized['trade_management_plan'] = plan_payload
         materialized[canonical_key] = normalized
+        should_emit_alias = include_legacy_alias and side == POSITION_SIDE_LONG
         prefer_legacy = is_legacy_position_key(key_hints.get(canonical_key))
-        if include_legacy_alias:
+        if should_emit_alias:
             for alias in get_position_storage_aliases(canonical_key, symbol, side, prefer_legacy=prefer_legacy, include_legacy_alias=True):
                 if alias != canonical_key:
                     materialized[alias] = normalized
@@ -838,6 +851,32 @@ class SymbolMeta:
     quote_asset: str
     status: str
     contract_type: str
+
+
+@dataclass
+class BuildCandidateRequest:
+    symbol: str
+    ticker: Dict[str, Any]
+    klines_5m: Sequence[List[Any]]
+    klines_15m: Sequence[List[Any]]
+    klines_1h: Sequence[List[Any]]
+    klines_4h: Sequence[List[Any]]
+    meta: Any
+    hot_rank: Optional[int]
+    gainer_rank: Optional[int]
+    funding_rate: Optional[float]
+    funding_rate_avg: Optional[float] = None
+    open_interest_rows: Optional[Sequence[Dict[str, Any]]] = None
+    taker_long_short_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None
+    top_long_short_position_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None
+    top_long_short_account_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None
+    symbol_open_interest_rows_5m: Optional[Sequence[Dict[str, Any]]] = None
+    symbol_open_interest_rows_15m: Optional[Sequence[Dict[str, Any]]] = None
+    market_regime: Optional[Dict[str, Any]] = None
+    current_timestamp_ms: Optional[int] = None
+    okx_sentiment: Optional[Dict[str, Any]] = None
+    smart_money_context: Optional[Dict[str, Any]] = None
+    legacy_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -996,91 +1035,31 @@ class TradeManagementState:
 
 
 @dataclass
-class RuntimeStateStore:
-    runtime_state_dir: str
+class RuntimeStateStore(RuntimeStateStoreImpl):
+    pass
 
-    def _dir(self) -> Path:
-        return Path(self.runtime_state_dir).expanduser()
 
-    def _path(self) -> Path:
-        return self._dir() / 'runtime_state.json'
+def restore_position_lifecycle_fields(
+    position: Dict[str, Any],
+    args: Any = None,
+    rebuild_trade_management_plan_from_position: Optional[Callable[[Dict[str, Any], Any], Any]] = None,
+) -> Dict[str, Any]:
+    return restore_position_lifecycle_fields_impl(
+        position,
+        args=args,
+        rebuild_trade_management_plan_from_position=(
+            rebuild_trade_management_plan_from_position or build_trade_management_plan_from_position
+        ),
+    )
 
-    def _json_path(self, name: str) -> Path:
-        return self._dir() / f'{name}.json'
 
-    def _events_path(self) -> Path:
-        return self._dir() / 'events.jsonl'
+def load_positions_state(store: RuntimeStateStore) -> Dict[str, Any]:
+    positions_state = store.load_json('positions', {})
+    return positions_state if isinstance(positions_state, dict) else {}
 
-    def load(self) -> Dict[str, Any]:
-        path = self._path()
-        if not path.exists():
-            return {}
-        try:
-            return json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            return {}
 
-    def save(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        path = self._path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        return payload
-
-    def load_json(self, name: str, default: Any = None) -> Any:
-        path = self._json_path(name)
-        if not path.exists():
-            return default
-        try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            return default
-        if name == 'positions':
-            migrated = migrate_positions_state(payload)
-            materialized = materialize_positions_state(migrated, include_legacy_alias=True)
-            if materialized != payload:
-                path.write_text(json.dumps(materialized, ensure_ascii=False, indent=2), encoding='utf-8')
-            return materialized
-        return payload
-
-    def save_json(self, name: str, payload: Any) -> Any:
-        path = self._json_path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        normalized_payload = materialize_positions_state(migrate_positions_state(payload), include_legacy_alias=True) if name == 'positions' else payload
-        path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        return normalized_payload
-
-    def append_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        path = self._events_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        row = {'event_type': event_type, 'recorded_at': _isoformat_utc(_utc_now()), **normalize_runtime_event_payload(payload or {})}
-        with path.open('a', encoding='utf-8') as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + '\n')
-        return row
-
-    def read_events(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        path = self._events_path()
-        if not path.exists():
-            return []
-        rows: List[Dict[str, Any]] = []
-        max_rows = max(int(limit or 0), 1)
-        try:
-            with path.open('r', encoding='utf-8') as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(row, dict):
-                        rows.append(row)
-        except Exception:
-            return []
-        if len(rows) <= max_rows:
-            return rows
-        return rows[-max_rows:]
-
+def save_positions_state(store: RuntimeStateStore, positions_state: Any) -> Dict[str, Any]:
+    return save_positions_state_impl(store, positions_state)
 
 def append_runtime_event(store: Optional[RuntimeStateStore], event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     row = {'event_type': event_type, **(payload or {})}
@@ -1257,6 +1236,29 @@ def close_user_data_stream_listen_key(client: Any, listen_key: str) -> Dict[str,
     return client.signed_delete('/fapi/v1/listenKey', params={'listenKey': listen_key})
 
 
+def is_missing_listen_key_error(exc: Any) -> bool:
+    message = str(exc).lower()
+    return '-1125' in message or 'listenkey does not exist' in message
+
+
+def _restart_user_data_stream_after_missing_listen_key(client: Any, store: RuntimeStateStore, active_symbol: Optional[str], previous_listen_key: str, exc: Any, now_dt: datetime.datetime) -> Dict[str, Any]:
+    restarted = start_user_data_stream_monitor(client, store, symbol=active_symbol, now=now_dt)
+    cycle_result = dict(restarted)
+    cycle_result['action'] = 'restarted_after_missing_listen_key'
+    cycle_result['previous_listen_key'] = previous_listen_key
+    cycle_result['recovery_reason'] = 'listen_key_missing'
+    cycle_result['recovery_error'] = str(exc)
+    cycle_result['now_utc'] = _isoformat_utc(now_dt)
+    health = cycle_result.get('health') if isinstance(cycle_result.get('health'), dict) else {}
+    if health:
+        health['previous_listen_key'] = previous_listen_key
+        health['recovery_reason'] = 'listen_key_missing'
+        health['recovery_error'] = str(exc)
+        cycle_result['health'] = health
+        store.save_json('user_data_stream', dict(health))
+    return cycle_result
+
+
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -1323,6 +1325,15 @@ def run_user_data_stream_monitor_cycle(
             refreshed_health['refresh_response'] = refresh_response
             action = 'refreshed'
         except Exception as exc:
+            if is_missing_listen_key_error(exc):
+                return _restart_user_data_stream_after_missing_listen_key(
+                    client,
+                    store,
+                    active_symbol,
+                    listen_key,
+                    exc,
+                    now_dt,
+                )
             failed_health = record_user_data_stream_health_event(
                 store,
                 active_symbol,
@@ -2155,7 +2166,8 @@ def build_trade_management_plan(entry_price: float, stop_price: float, quantity:
     tp2_close_qty = round(quantity * tp2_close_pct, 10)
     runner_qty = round(max(quantity - tp1_close_qty - tp2_close_qty, 0.0), 10)
     return TradeManagementPlan(
-        side=side_normalized,
+        side=position_side_to_trade_side(side_normalized),
+        position_side=side_normalized,
         entry_price=entry_price,
         stop_price=stop_price,
         quantity=quantity,
@@ -2182,15 +2194,16 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
         breakeven_confirmed = current_price <= plan.breakeven_trigger_price and current_price <= breakeven_buffer_price
         if plan.breakeven_confirmation_mode == 'ema_support':
             breakeven_confirmed = breakeven_confirmed and current_price <= ema5m and ema5m <= plan.entry_price
+        tp1_will_hit = (not state.tp1_hit) and current_price <= plan.tp1_trigger_price and plan.tp1_close_qty > 0
         if not state.moved_to_breakeven and breakeven_confirmed:
             actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(plan.entry_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
-        if not state.tp1_hit and current_price <= plan.tp1_trigger_price and plan.tp1_close_qty > 0:
+        if tp1_will_hit:
             actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(min(plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
-        if state.tp1_hit and not state.tp2_hit and current_price <= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
+        if (state.tp1_hit or tp1_will_hit) and not state.tp2_hit and current_price <= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
             actions.append({'type': 'take_profit_2', 'close_qty': plan.tp2_close_qty, 'new_stop_price': round(min(plan.entry_price - plan.initial_risk_per_unit, ema5m), 10), 'exit_reason': 'tp2'})
         ceiling_ref = min(trailing_reference, state.lowest_price_seen or trailing_reference)
         trailing_ceiling = round(ceiling_ref * (1 + trailing_buffer_pct), 10)
-        if allow_runner_exit and state.tp1_hit and current_price > trailing_ceiling and state.remaining_quantity > 0:
+        if allow_runner_exit and (state.tp1_hit or tp1_will_hit) and current_price > trailing_ceiling and state.remaining_quantity > 0:
             actions.append({'type': 'runner_exit', 'close_qty': state.remaining_quantity, 'trailing_floor': round(trailing_ceiling, 2), 'exit_reason': 'runner'})
         return actions
 
@@ -2199,15 +2212,16 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
     breakeven_confirmed = current_price >= plan.breakeven_trigger_price and current_price >= breakeven_buffer_price
     if plan.breakeven_confirmation_mode == 'ema_support':
         breakeven_confirmed = breakeven_confirmed and current_price >= ema5m and ema5m >= plan.entry_price
+    tp1_will_hit = (not state.tp1_hit) and current_price >= plan.tp1_trigger_price and plan.tp1_close_qty > 0
     if not state.moved_to_breakeven and breakeven_confirmed:
         actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(plan.entry_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
-    if not state.tp1_hit and current_price >= plan.tp1_trigger_price and plan.tp1_close_qty > 0:
-        actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(max(plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
-    if state.tp1_hit and not state.tp2_hit and current_price >= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
-        actions.append({'type': 'take_profit_2', 'close_qty': plan.tp2_close_qty, 'new_stop_price': round(max(plan.entry_price + plan.initial_risk_per_unit, ema5m), 10), 'exit_reason': 'tp2'})
+    if tp1_will_hit:
+        actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(max(state.current_stop_price or plan.entry_price, plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
+    if (state.tp1_hit or tp1_will_hit) and not state.tp2_hit and current_price >= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
+        actions.append({'type': 'take_profit_2', 'close_qty': plan.tp2_close_qty, 'new_stop_price': round(max(state.current_stop_price or (plan.entry_price + plan.initial_risk_per_unit), plan.entry_price + plan.initial_risk_per_unit, ema5m), 10), 'exit_reason': 'tp2'})
     floor_ref = max(trailing_reference, state.highest_price_seen or trailing_reference)
     trailing_floor = round(floor_ref * (1 - trailing_buffer_pct), 10)
-    if allow_runner_exit and state.tp1_hit and current_price < trailing_floor and state.remaining_quantity > 0:
+    if allow_runner_exit and (state.tp1_hit or tp1_will_hit) and current_price < trailing_floor and state.remaining_quantity > 0:
         actions.append({'type': 'runner_exit', 'close_qty': state.remaining_quantity, 'trailing_floor': round(trailing_floor, 2), 'exit_reason': 'runner'})
     return actions
 
@@ -2308,14 +2322,14 @@ def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeM
         state.current_stop_price = action['new_stop_price']
         state.moved_to_breakeven = True
         return state, new_stop_order, {**log_payload, 'new_stop_order': new_stop_order}
-    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit'}:
+    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit', 'stop_exit'}:
         reduce_result = place_reduce_only_market(client, symbol, action['close_qty'], meta, side=side)
         state.remaining_quantity = round(max(state.remaining_quantity - action['close_qty'], 0.0), 10)
         if action['type'] == 'take_profit_1':
             state.tp1_hit = True
         elif action['type'] == 'take_profit_2':
             state.tp2_hit = True
-        if action['type'] != 'runner_exit' and state.remaining_quantity > 0 and action.get('new_stop_price') is not None:
+        if action['type'] in {'take_profit_1', 'take_profit_2'} and state.remaining_quantity > 0 and action.get('new_stop_price') is not None:
             if active_stop_order and active_stop_order.get('orderId'):
                 cancel_order(client, symbol, order_id=active_stop_order['orderId'])
             active_stop_order = place_stop_market_order(client, symbol, action['new_stop_price'], state.remaining_quantity, meta, side=side)
@@ -2338,34 +2352,52 @@ def iter_canonical_open_positions(positions_state: Any) -> List[Tuple[str, Dict[
     return rows
 
 
+def _should_emit_runtime_state_degraded(store: RuntimeStateStore, state_key: str, cooldown_seconds: int = 300) -> bool:
+    now = _utc_now()
+    stamps = getattr(store, '_runtime_state_degraded_emitted_at', None)
+    if not isinstance(stamps, dict):
+        stamps = {}
+        setattr(store, '_runtime_state_degraded_emitted_at', stamps)
+    last_emitted_at = stamps.get(state_key)
+    if isinstance(last_emitted_at, datetime.datetime) and (now - last_emitted_at).total_seconds() < max(int(cooldown_seconds or 0), 0):
+        return False
+    stamps[state_key] = now
+    return True
+
+
 def build_local_open_positions_for_risk(store: RuntimeStateStore) -> List[Dict[str, Any]]:
-    positions_state = store.load_json('positions', {})
-    rows: List[Dict[str, Any]] = []
-    for _key, position in iter_canonical_open_positions(positions_state):
-        side = normalize_position_side(position.get('side') or position.get('position_side'))
-        quantity = abs(_to_float(position.get('remaining_quantity') or position.get('quantity') or position.get('filled_quantity')))
-        entry_price = abs(_to_float(position.get('entry_price')))
-        rows.append({
-            'symbol': str(position.get('symbol') or '').upper(),
-            'side': side,
-            'positionSide': side,
-            'quantity': quantity,
-            'positionAmt': quantity if side == POSITION_SIDE_LONG else -quantity,
-            'entryPrice': entry_price,
-            'notional': abs(_to_float(position.get('notional'))) or quantity * entry_price,
-        })
-    return rows
+    positions_state, error = store.load_json_with_error('positions', {})
+    if error:
+        if _should_emit_runtime_state_degraded(store, 'positions'):
+            store.append_event('runtime_state_degraded', {
+                **error,
+                'fallback_used': 'empty_positions',
+                'consumer': 'build_local_open_positions_for_risk',
+            })
+    return build_local_open_positions_from_state_impl(
+        positions_state,
+        error=error,
+        normalize_position_side=normalize_position_side,
+        to_float=_to_float,
+        iter_canonical_open_positions=iter_canonical_open_positions,
+    )
 
 
 def build_trade_management_plan_from_position(position: Dict[str, Any], args: argparse.Namespace) -> TradeManagementPlan:
+    position_side = normalize_position_side(position.get('position_side') or position.get('positionSide') or position.get('side'))
+    trade_side = position_side_to_trade_side(position_side)
+    position_key = build_position_key(str(position.get('symbol') or ''), position_side)
     plan_payload = position.get('trade_management_plan')
     if isinstance(plan_payload, dict) and plan_payload:
         payload = dict(plan_payload)
-        payload.setdefault('side', normalize_position_side(position.get('side') or position.get('position_side')))
+        payload['position_side'] = position_side
+        payload['side'] = trade_side
         return TradeManagementPlan(**payload)
     entry_price = _to_float(position.get('entry_price'))
-    stop_price = _to_float(position.get('stop_price') or position.get('current_stop_price'))
+    stop_price = _to_float(position.get('current_stop_price') or position.get('stop_price'))
     quantity = _to_float(position.get('quantity') or position.get('filled_quantity') or position.get('remaining_quantity'))
+    if entry_price <= 0 or stop_price <= 0 or abs(entry_price - stop_price) <= 1e-12:
+        raise ValueError(f'missing valid stop distance for {position_key}')
     return build_trade_management_plan(
         entry_price=entry_price,
         stop_price=stop_price,
@@ -2376,7 +2408,7 @@ def build_trade_management_plan_from_position(position: Dict[str, Any], args: ar
         tp2_close_pct=float(getattr(args, 'tp2_close_pct', 0.4)),
         breakeven_r=float(getattr(args, 'breakeven_r', 1.0)),
         atr_stop_distance=float(position.get('atr_stop_distance') or 0.0),
-        side=normalize_position_side(position.get('side') or position.get('position_side')),
+        side=trade_side,
         breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
         breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
     )
@@ -3286,578 +3318,138 @@ def classify_candidate_state(
     return {'state': state, 'state_reasons': state_reasons, 'setup_score': setup_score, 'exhaustion_score': exhaustion_score}
 
 
+def _build_candidate_from_request(request: BuildCandidateRequest) -> Optional[Candidate]:
+    microstructure_inputs = dict(request.legacy_kwargs.pop('microstructure_inputs', {}) or {})
+    for key in ('short_bias', 'oi_now', 'oi_5m_ago', 'oi_15m_ago', 'cvd_delta', 'cvd_zscore'):
+        if key in request.legacy_kwargs and key not in microstructure_inputs:
+            microstructure_inputs[key] = request.legacy_kwargs[key]
+
+    legacy_okx_sentiment = {
+        'okx_sentiment_score': request.legacy_kwargs.pop('okx_sentiment_score', 0.0),
+        'okx_sentiment_acceleration': request.legacy_kwargs.pop('okx_sentiment_acceleration', 0.0),
+        'sector_resonance_score': request.legacy_kwargs.pop('sector_resonance_score', 0.0),
+    }
+    okx_sentiment = request.okx_sentiment
+    if okx_sentiment is None and any(value for value in legacy_okx_sentiment.values()):
+        okx_sentiment = legacy_okx_sentiment
+
+    legacy_smart_money_flow_score = request.legacy_kwargs.pop('smart_money_flow_score', 0.0)
+    smart_money_context = request.smart_money_context
+    if smart_money_context is None and legacy_smart_money_flow_score:
+        smart_money_context = {'smart_money_flow_score': legacy_smart_money_flow_score}
+
+    return build_candidate_impl(
+        symbol=request.symbol,
+        ticker=request.ticker,
+        klines_5m=list(request.klines_5m or []),
+        klines_15m=list(request.klines_15m or []),
+        klines_1h=list(request.klines_1h or []),
+        klines_4h=list(request.klines_4h or []),
+        meta=request.meta,
+        hot_rank=request.hot_rank,
+        gainer_rank=request.gainer_rank,
+        funding_rate=request.funding_rate,
+        funding_rate_avg=request.funding_rate_avg,
+        open_interest_rows=list(request.open_interest_rows or []),
+        taker_long_short_ratio_rows=list(request.taker_long_short_ratio_rows or []),
+        top_long_short_position_ratio_rows=list(request.top_long_short_position_ratio_rows or []),
+        top_long_short_account_ratio_rows=list(request.top_long_short_account_ratio_rows or []),
+        symbol_open_interest_rows_5m=list(request.symbol_open_interest_rows_5m or []),
+        symbol_open_interest_rows_15m=list(request.symbol_open_interest_rows_15m or []),
+        market_regime=request.market_regime,
+        current_timestamp_ms=request.current_timestamp_ms,
+        okx_sentiment=okx_sentiment,
+        smart_money_context=smart_money_context,
+        microstructure_inputs=microstructure_inputs,
+        Candidate=Candidate,
+        TRADE_SIDE_LONG=TRADE_SIDE_LONG,
+        TRADE_SIDE_SHORT=TRADE_SIDE_SHORT,
+        normalize_trade_side=normalize_trade_side,
+        trade_side_to_position_side=trade_side_to_position_side,
+        derive_regime_entry_thresholds=derive_regime_entry_thresholds,
+        _to_float=_to_float,
+        derive_external_setup_params=derive_external_setup_params,
+        extract_closes=extract_closes,
+        extract_highs=extract_highs,
+        extract_lows=extract_lows,
+        extract_volumes=extract_volumes,
+        round_price=round_price,
+        round_step=round_step,
+        compute_rsi=compute_rsi,
+        compute_ema=compute_ema,
+        compute_vwap=compute_vwap,
+        compute_atr=compute_atr,
+        compute_zscore=compute_zscore,
+        compute_bollinger_bandwidth_pct=compute_bollinger_bandwidth_pct,
+        evaluate_higher_timeframe_trend=evaluate_higher_timeframe_trend,
+        compute_macd=compute_macd,
+        compute_sentiment_resonance_bonus=compute_sentiment_resonance_bonus,
+        compute_leading_sentiment_signal=compute_leading_sentiment_signal,
+        merge_smart_money_scores=merge_smart_money_scores,
+        compute_relative_oi_features=compute_relative_oi_features,
+        compute_squeeze_signal=compute_squeeze_signal,
+        compute_control_risk_score=compute_control_risk_score,
+        classify_candidate_state=classify_candidate_state,
+        recommend_leverage=recommend_leverage,
+        evaluate_trigger_confirmation=evaluate_trigger_confirmation,
+        clamp=clamp,
+        classify_alert_tier=classify_alert_tier,
+        recommended_position_size_pct=recommended_position_size_pct,
+        build_trade_management_plan=build_trade_management_plan,
+        **request.legacy_kwargs,
+    )
+
+
 def build_candidate(
     symbol: str,
     ticker: Dict[str, Any],
-    klines_5m: List[List[Any]],
-    klines_15m: List[List[Any]],
-    klines_1h: List[List[Any]],
-    klines_4h: List[List[Any]],
-    meta: SymbolMeta,
+    klines_5m: Sequence[List[Any]],
+    klines_15m: Sequence[List[Any]],
+    klines_1h: Sequence[List[Any]],
+    klines_4h: Sequence[List[Any]],
+    meta,
     hot_rank: Optional[int],
     gainer_rank: Optional[int],
-    risk_usdt: float,
-    lookback_bars: int,
-    swing_bars: int,
-    min_5m_change_pct: float,
-    min_quote_volume: float,
-    stop_buffer_pct: float,
-    max_rsi_5m: float,
-    min_volume_multiple: float,
-    max_distance_from_ema_pct: float,
     funding_rate: Optional[float],
-    funding_rate_threshold: float,
     funding_rate_avg: Optional[float] = None,
-    funding_rate_avg_threshold: float = 0.0003,
-    max_distance_from_vwap_pct: float = 10.0,
-    max_leverage: int = 5,
-    loser_rank: Optional[int] = None,
-    okx_sentiment_score: float = 0.0,
-    okx_sentiment_acceleration: float = 0.0,
-    sector_resonance_score: float = 0.0,
-    smart_money_flow_score: float = 0.0,
-    microstructure_inputs: Optional[Dict[str, Any]] = None,
-    max_notional_usdt: float = 0.0,
-    side: str = TRADE_SIDE_LONG,
+    open_interest_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    taker_long_short_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    top_long_short_position_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    top_long_short_account_ratio_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    symbol_open_interest_rows_5m: Optional[Sequence[Dict[str, Any]]] = None,
+    symbol_open_interest_rows_15m: Optional[Sequence[Dict[str, Any]]] = None,
+    market_regime: Optional[Dict[str, Any]] = None,
+    current_timestamp_ms: Optional[int] = None,
+    okx_sentiment: Optional[Dict[str, Any]] = None,
+    smart_money_context: Optional[Dict[str, Any]] = None,
     **legacy_kwargs: Any,
 ) -> Optional[Candidate]:
-    early_reject_stats = legacy_kwargs.get('early_reject_stats')
-
-    def early_reject(reason: str) -> None:
-        if not isinstance(early_reject_stats, dict):
-            return
-        by_reason = early_reject_stats.setdefault('by_reason', {})
-        by_side = early_reject_stats.setdefault('by_side', {})
-        reason_text = str(reason or 'unknown')
-        by_reason[reason_text] = int(by_reason.get(reason_text, 0) or 0) + 1
-        side_text = normalize_trade_side(side)
-        side_bucket = by_side.setdefault(side_text, {})
-        side_bucket[reason_text] = int(side_bucket.get(reason_text, 0) or 0) + 1
-        early_reject_stats['total'] = int(early_reject_stats.get('total', 0) or 0) + 1
-
-    if len(klines_5m) < max(lookback_bars + 2, swing_bars + 20, 30):
-        early_reject('insufficient_5m_klines')
-        return None
-    if len(klines_15m) < 20 or len(klines_1h) < 25 or len(klines_4h) < 25:
-        early_reject('insufficient_higher_tf_klines')
-        return None
-
-    trade_side = normalize_trade_side(side)
-    position_side = trade_side_to_position_side(trade_side)
-    higher_timeframe_bias = trade_side
-    regime_payload = legacy_kwargs.get('market_regime') or {}
-    regime_label = str(regime_payload.get('label', 'neutral') or 'neutral')
-    entry_thresholds = derive_regime_entry_thresholds(trade_side, regime_label, min_5m_change_pct, base_acceleration_ratio=1.5)
-    effective_min_5m_change_pct = float(entry_thresholds.get('min_5m_change_pct', min_5m_change_pct) or 0.0)
-    effective_acceleration_threshold = float(entry_thresholds.get('acceleration_ratio', 1.5) or 1.5)
-    setup_breakout_tolerance_pct = max(_to_float(legacy_kwargs.get('setup_breakout_tolerance_pct'), default=0.0), 0.0)
-    watch_breakout_tolerance_pct = max(
-        _to_float(legacy_kwargs.get('watch_breakout_tolerance_pct'), default=setup_breakout_tolerance_pct),
-        0.0,
-    )
-    external_setup = derive_external_setup_params(
-        legacy_kwargs.get('external_signal'),
-        enabled=bool(legacy_kwargs.get('use_external_setup_relaxation')),
-    )
-    if external_setup.get('enabled'):
-        effective_min_5m_change_pct *= float(external_setup.get('min_5m_change_pct_multiplier', 1.0) or 1.0)
-        min_volume_multiple *= float(external_setup.get('min_volume_multiple_multiplier', 1.0) or 1.0)
-        min_quote_volume = min(float(min_quote_volume or 0.0), float(external_setup.get('min_quote_volume', min_quote_volume) or min_quote_volume))
-
-    closes_5m = extract_closes(klines_5m)
-    highs_5m = extract_highs(klines_5m)
-    lows_5m = extract_lows(klines_5m)
-    volumes_5m = extract_volumes(klines_5m)
-    closes_15m = extract_closes(klines_15m)
-
-    last_price = closes_5m[-1]
-    prev_close = closes_5m[-2]
-    recent_5m_change_pct_raw = ((last_price / prev_close) - 1.0) * 100 if prev_close else 0.0
-    recent_5m_change_pct = recent_5m_change_pct_raw if trade_side == TRADE_SIDE_LONG else -recent_5m_change_pct_raw
-    if trade_side == TRADE_SIDE_SHORT:
-        breakout_level = min(lows_5m[-(lookback_bars + 1):-1])
-        recent_swing_low = max(highs_5m[-(swing_bars + 1):-1])
-        stop_price_raw = recent_swing_low * (1.0 + stop_buffer_pct)
-    else:
-        breakout_level = max(prior_highs := highs_5m[-(lookback_bars + 1):-1])
-        recent_swing_low = min(lows_5m[-(swing_bars + 1):-1])
-        stop_price_raw = recent_swing_low * (1.0 - stop_buffer_pct)
-    if breakout_level:
-        entry_distance_from_breakout_pct = (((last_price / breakout_level) - 1.0) * 100) if trade_side == TRADE_SIDE_LONG else (((breakout_level / last_price) - 1.0) * 100)
-    else:
-        entry_distance_from_breakout_pct = 0.0
-    near_external_breakout_setup = bool(
-        external_setup.get('enabled')
-        and entry_distance_from_breakout_pct >= -float(external_setup.get('max_breakout_distance_pct', 0.0) or 0.0)
-    )
-    near_configured_watch_setup = bool(
-        watch_breakout_tolerance_pct > 0.0
-        and entry_distance_from_breakout_pct >= -watch_breakout_tolerance_pct
-    )
-    near_configured_setup = bool(
-        setup_breakout_tolerance_pct > 0.0
-        and entry_distance_from_breakout_pct >= -setup_breakout_tolerance_pct
-    )
-    near_breakout_setup = near_external_breakout_setup or near_configured_watch_setup
-    stop_price = round_price(stop_price_raw, meta.tick_size, meta.price_precision)
-    structure_stop_price = stop_price
-    stop_model = 'structure'
-    if stop_price <= 0:
-        early_reject('invalid_stop_price')
-        return None
-    if trade_side == TRADE_SIDE_SHORT and stop_price <= last_price:
-        early_reject('invalid_short_stop_distance')
-        return None
-    if trade_side == TRADE_SIDE_LONG and stop_price >= last_price:
-        early_reject('invalid_long_stop_distance')
-        return None
-    risk_per_unit = abs(last_price - stop_price)
-    if risk_per_unit <= 0:
-        early_reject('invalid_risk_per_unit')
-        return None
-    quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
-    if max_notional_usdt > 0:
-        max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
-        quantity = min(quantity, max_qty_by_notional)
-    if quantity < meta.min_qty or quantity <= 0:
-        early_reject('quantity_below_min_qty')
-        return None
-
-    rsi_5m = compute_rsi(closes_5m, period=14)
-    avg_volume_20 = sum(volumes_5m[-21:-1]) / 20
-    volume_multiple = (volumes_5m[-1] / avg_volume_20) if avg_volume_20 > 0 else 0.0
-    ema20_5m = compute_ema(closes_5m, 20)
-    distance_from_ema20_5m_pct_raw = ((last_price / ema20_5m) - 1.0) * 100 if ema20_5m else 0.0
-    distance_from_ema20_5m_pct = distance_from_ema20_5m_pct_raw if trade_side == TRADE_SIDE_LONG else -distance_from_ema20_5m_pct_raw
-    vwap_15m = compute_vwap(klines_15m[-20:])
-    distance_from_vwap_15m_pct_raw = ((last_price / vwap_15m) - 1.0) * 100 if vwap_15m else 0.0
-    distance_from_vwap_15m_pct = distance_from_vwap_15m_pct_raw if trade_side == TRADE_SIDE_LONG else -distance_from_vwap_15m_pct_raw
-    atr_stop_distance = compute_atr(klines_5m, period=14) * 1.5
-    oi_change_samples_5m = []
-    if len(closes_5m) >= 22:
-        for idx in range(1, min(len(closes_5m), 22)):
-            prev_close_i = closes_5m[-(idx + 1)]
-            curr_close_i = closes_5m[-idx]
-            if prev_close_i:
-                oi_change_samples_5m.append(((curr_close_i / prev_close_i) - 1.0) * 100)
-    volume_samples_5m = volumes_5m[-21:-1] if len(volumes_5m) >= 21 else volumes_5m[:-1]
-    oi_zscore_price_proxy = compute_zscore(recent_5m_change_pct, oi_change_samples_5m)
-    volume_zscore_price_proxy = compute_zscore(volumes_5m[-1], volume_samples_5m)
-    bollinger_bandwidth_pct = compute_bollinger_bandwidth_pct(closes_5m, period=20)
-    price_above_vwap = bool(vwap_15m and (last_price >= vwap_15m if trade_side == TRADE_SIDE_LONG else last_price <= vwap_15m))
-
-    if atr_stop_distance > 0:
-        atr_stop_price_raw = last_price - atr_stop_distance if trade_side == TRADE_SIDE_LONG else last_price + atr_stop_distance
-        atr_stop_price = round_price(atr_stop_price_raw, meta.tick_size, meta.price_precision)
-        atr_stop_valid = 0 < atr_stop_price < last_price if trade_side == TRADE_SIDE_LONG else atr_stop_price > last_price
-        if atr_stop_valid:
-            prior_stop_price = stop_price
-            stop_price = max(stop_price, atr_stop_price) if trade_side == TRADE_SIDE_LONG else min(stop_price, atr_stop_price)
-            if abs(stop_price - atr_stop_price) <= max(float(meta.tick_size or 0.0), 1e-12) and abs(prior_stop_price - atr_stop_price) > max(float(meta.tick_size or 0.0), 1e-12):
-                stop_model = 'atr'
-            elif abs(stop_price - structure_stop_price) > max(float(meta.tick_size or 0.0), 1e-12):
-                stop_model = 'blended'
-            risk_per_unit = abs(last_price - stop_price)
-            if risk_per_unit <= 0:
-                early_reject('invalid_atr_risk_per_unit')
-                return None
-            quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
-            if max_notional_usdt > 0:
-                max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
-                quantity = min(quantity, max_qty_by_notional)
-            if quantity < meta.min_qty or quantity <= 0:
-                early_reject('atr_quantity_below_min_qty')
-                return None
-    stop_distance_pct = (risk_per_unit / last_price) * 100 if last_price else 0.0
-    stop_too_tight_flag = bool(stop_distance_pct > 0 and stop_distance_pct < 0.08)
-    stop_too_wide_flag = bool(stop_distance_pct > max(8.0, min(float(max_distance_from_vwap_pct or 0.0) * 1.5, 12.0)))
-
-    trend_1h = evaluate_higher_timeframe_trend(klines_1h, side=trade_side)
-    trend_4h = evaluate_higher_timeframe_trend(klines_4h, side=trade_side)
-    higher_tf_allowed = trend_1h['allowed'] or trend_4h['allowed']
-    macd_5m = compute_macd(closes_5m)
-    structure_break = last_price > max(closes_5m[-6:-1]) if trade_side == TRADE_SIDE_LONG else last_price < min(closes_5m[-6:-1])
-    avg_15m_change_pct = 0.0
-    if len(closes_15m) >= 5:
-        pct_changes_15m = []
-        for prev, curr in zip(closes_15m[-5:-1], closes_15m[-4:]):
-            if prev:
-                pct_changes_15m.append(((curr / prev) - 1.0) * 100)
-        avg_15m_change_pct = sum(pct_changes_15m) / len(pct_changes_15m) if pct_changes_15m else 0.0
-    if trade_side == TRADE_SIDE_SHORT:
-        avg_15m_signal = -avg_15m_change_pct
-        acceleration_ratio = recent_5m_change_pct / avg_15m_signal if avg_15m_signal > 0 else (99.0 if recent_5m_change_pct > 0 else 0.0)
-    else:
-        acceleration_ratio = recent_5m_change_pct / avg_15m_change_pct if avg_15m_change_pct > 0 else (99.0 if recent_5m_change_pct > 0 else 0.0)
-    quote_volume_24h = _to_float(ticker.get('quoteVolume', 0.0))
-    price_change_pct_24h = _to_float(ticker.get('priceChangePercent', 0.0))
-
-    if trade_side == TRADE_SIDE_LONG and last_price <= breakout_level and not near_breakout_setup:
-        early_reject('long_breakout_not_confirmed')
-        return None
-    if trade_side == TRADE_SIDE_SHORT and last_price >= breakout_level and not near_breakout_setup:
-        early_reject('short_breakdown_not_confirmed')
-        return None
-    if recent_5m_change_pct < effective_min_5m_change_pct and not near_breakout_setup:
-        early_reject('recent_5m_change_below_gate')
-        return None
-    if quote_volume_24h < min_quote_volume:
-        early_reject('quote_volume_below_gate')
-        return None
-    if not higher_tf_allowed and not near_breakout_setup:
-        early_reject('higher_timeframe_not_allowed')
-        return None
-    if volume_multiple < min_volume_multiple and not near_breakout_setup:
-        early_reject('volume_multiple_below_gate')
-        return None
-    if trade_side == TRADE_SIDE_LONG:
-        if funding_rate is not None and funding_rate > funding_rate_threshold:
-            early_reject('long_funding_rate_above_gate')
-            return None
-        if funding_rate_avg is not None and funding_rate_avg > funding_rate_avg_threshold:
-            early_reject('long_funding_rate_avg_above_gate')
-            return None
-    else:
-        if funding_rate is not None and funding_rate < (-funding_rate_threshold):
-            early_reject('short_funding_rate_below_gate')
-            return None
-        if funding_rate_avg is not None and funding_rate_avg < (-funding_rate_avg_threshold):
-            early_reject('short_funding_rate_avg_below_gate')
-            return None
-    if not structure_break and not near_breakout_setup:
-        early_reject('micro_structure_break_not_confirmed')
-        return None
-    if trade_side == TRADE_SIDE_LONG and macd_5m['hist'] <= macd_5m['prev_hist'] and not near_breakout_setup:
-        early_reject('long_macd_hist_not_accelerating')
-        return None
-    if trade_side == TRADE_SIDE_SHORT and macd_5m['hist'] >= macd_5m['prev_hist'] and not near_breakout_setup:
-        early_reject('short_macd_hist_not_accelerating')
-        return None
-    if acceleration_ratio < effective_acceleration_threshold and not near_breakout_setup:
-        early_reject('acceleration_ratio_below_gate')
-        return None
-
-    reasons: List[str] = []
-    score = 0.0
-    reasons.append(f'min_5m_change_gate={effective_min_5m_change_pct:.2f}')
-    reasons.append(f'acceleration_ratio_gate={effective_acceleration_threshold:.2f}')
-    if external_setup.get('enabled'):
-        reasons.append('external_accumulation_setup_relaxed')
-        reasons.append(f"external_setup_score={float(external_setup.get('score', 0.0) or 0.0):.1f}")
-        reasons.append(f"external_max_breakout_distance_pct={float(external_setup.get('max_breakout_distance_pct', 0.0) or 0.0):.2f}")
-    if near_configured_watch_setup:
-        reasons.append('configured_near_breakout_watch')
-        reasons.append(f'watch_breakout_tolerance_pct={watch_breakout_tolerance_pct:.2f}')
-    if near_configured_setup:
-        reasons.append('configured_near_breakout_setup')
-        reasons.append(f'setup_breakout_tolerance_pct={setup_breakout_tolerance_pct:.2f}')
-    if hot_rank is not None:
-        score += max(0.0, 1 - ((hot_rank - 1) / 10)) * 40
-        reasons.append(f'square_hot_rank={hot_rank}')
-    directional_rank = loser_rank if trade_side == TRADE_SIDE_SHORT else gainer_rank
-    directional_rank_label = 'loser_rank' if trade_side == TRADE_SIDE_SHORT else 'gainer_rank'
-    if directional_rank is not None:
-        score += max(0.0, 1 - ((directional_rank - 1) / 20)) * 60
-        reasons.append(f'{directional_rank_label}={directional_rank}')
-    if hot_rank is not None and directional_rank is not None:
-        score += 20
-        reasons.append('hot_directional_mover_intersection')
-    score += min(recent_5m_change_pct * 6, 20)
-    reasons.append(f'recent_5m_change_pct={recent_5m_change_pct:.2f}')
-    score += min(volume_multiple * 8, 20)
-    reasons.append(f'volume_multiple={volume_multiple:.2f}')
-    score += min(acceleration_ratio * 5, 15)
-    reasons.append(f'acceleration_ratio={acceleration_ratio:.2f}')
-    price_change_signal_24h = price_change_pct_24h if trade_side == TRADE_SIDE_LONG else -price_change_pct_24h
-    score += min(max(price_change_signal_24h, 0.0), 15)
-    reasons.append(f'price_change_24h={price_change_pct_24h:.2f}')
-    reasons.extend([f'{trade_side}_breakout_confirmed', f'rsi_5m={rsi_5m:.2f}', f'distance_from_ema20_5m_pct={distance_from_ema20_5m_pct:.2f}', f'distance_from_vwap_15m_pct={distance_from_vwap_15m_pct:.2f}'])
-    if funding_rate is not None:
-        reasons.append(f'funding_rate={funding_rate:.5f}')
-        funding_headroom = (funding_rate_threshold - funding_rate) if trade_side == TRADE_SIDE_LONG else (funding_rate + funding_rate_threshold)
-        score += max(0.0, funding_headroom * 10000)
-    if funding_rate_avg is not None:
-        reasons.append(f'funding_rate_avg={funding_rate_avg:.5f}')
-        funding_avg_headroom = (funding_rate_avg_threshold - funding_rate_avg) if trade_side == TRADE_SIDE_LONG else (funding_rate_avg + funding_rate_avg_threshold)
-        score += max(0.0, funding_avg_headroom * 10000)
-    reasons.append(f'stop_model={stop_model}')
-    reasons.append(f'stop_distance_pct={stop_distance_pct:.2f}')
-    if stop_too_tight_flag:
-        score -= 8.0
-        reasons.append('stop_too_tight_flag')
-    if stop_too_wide_flag:
-        score -= 10.0
-        reasons.append('stop_too_wide_flag')
-
-    sentiment_bonus_payload = compute_sentiment_resonance_bonus(okx_sentiment_score, okx_sentiment_acceleration, sector_resonance_score, smart_money_flow_score, side=trade_side)
-    score += sentiment_bonus_payload['net']
-    reasons.extend(sentiment_bonus_payload['reasons'])
-    if okx_sentiment_score:
-        reasons.append(f'okx_sentiment_score={okx_sentiment_score:.2f}')
-    if okx_sentiment_acceleration:
-        reasons.append(f'okx_sentiment_acceleration={okx_sentiment_acceleration:.2f}')
-    if sector_resonance_score:
-        reasons.append(f'sector_resonance_score={sector_resonance_score:.2f}')
-    if smart_money_flow_score:
-        reasons.append(f'smart_money_flow_score={smart_money_flow_score:.2f}')
-    leading_payload = compute_leading_sentiment_signal(okx_sentiment_score, okx_sentiment_acceleration, side=trade_side)
-    score += leading_payload['score']
-    reasons.extend(leading_payload['reasons'])
-
-    microstructure_inputs = dict(microstructure_inputs or {})
-    if legacy_kwargs:
-        for key, value in legacy_kwargs.items():
-            if key == 'market_regime':
-                continue
-            microstructure_inputs.setdefault(key, value)
-    onchain_smart_money_score_raw = legacy_kwargs.get('onchain_smart_money_score')
-    onchain_smart_money_score = float(onchain_smart_money_score_raw or 0.0)
-    smart_money_merge = merge_smart_money_scores(
-        exchange_score=smart_money_flow_score,
-        onchain_score=onchain_smart_money_score_raw if onchain_smart_money_score_raw is not None else None,
-        side=trade_side,
-    )
-    smart_money_effective = float(smart_money_merge['score'])
-
-    if microstructure_inputs.get('long_short_ratio') is not None:
-        reasons.append(f"long_short_ratio={float(microstructure_inputs['long_short_ratio']):.2f}")
-    if microstructure_inputs.get('short_bias', 0.0) > 0:
-        reasons.append(f"short_bias={float(microstructure_inputs['short_bias']):.2f}")
-    if trend_1h['allowed']:
-        score += 12
-        reasons.append(f'trend_1h_{trade_side}')
-    if trend_4h['allowed']:
-        score += 12
-        reasons.append(f'trend_4h_{trade_side}')
-    if (trade_side == TRADE_SIDE_LONG and macd_5m['hist'] > 0) or (trade_side == TRADE_SIDE_SHORT and macd_5m['hist'] < 0):
-        score += 8
-        reasons.append(f'macd_hist_{trade_side}')
-    if structure_break:
-        score += 6
-        reasons.append(f'micro_structure_break_{trade_side}')
-
-    oi_features = compute_relative_oi_features(
-        oi_now=microstructure_inputs.get('oi_now'),
-        oi_5m_ago=microstructure_inputs.get('oi_5m_ago'),
-        oi_15m_ago=microstructure_inputs.get('oi_15m_ago'),
-        taker_buy_ratio=microstructure_inputs.get('taker_buy_ratio'),
-        funding_rate=funding_rate,
-        funding_rate_avg=funding_rate_avg,
-        oi_change_samples_5m=microstructure_inputs.get('oi_change_samples_5m'),
-        volume_samples_5m=microstructure_inputs.get('volume_samples_5m'),
-        latest_volume_5m=microstructure_inputs.get('latest_volume_5m'),
-        cvd_samples=microstructure_inputs.get('cvd_samples'),
-        cvd_delta=float(microstructure_inputs.get('cvd_delta', 0.0) or 0.0),
-        bollinger_bandwidth_pct=bollinger_bandwidth_pct,
-        price_above_vwap=price_above_vwap,
-        oi_notional_history=microstructure_inputs.get('oi_notional_history'),
-        short_bias=float(microstructure_inputs.get('short_bias', 0.0) or 0.0),
-    )
-    oi_features.update({
-        'oi_zscore_5m': max(float(oi_features.get('oi_zscore_5m', 0.0) or 0.0), oi_zscore_price_proxy),
-        'volume_zscore_5m': max(float(oi_features.get('volume_zscore_5m', 0.0) or 0.0), volume_zscore_price_proxy),
-        'bollinger_bandwidth_pct': bollinger_bandwidth_pct,
-        'price_above_vwap': price_above_vwap,
-    })
-
-    squeeze_payload = compute_squeeze_signal(
-        funding_rate=funding_rate,
-        funding_rate_avg=funding_rate_avg,
-        short_bias=float(oi_features.get('short_bias', 0.0) or 0.0),
-        oi_zscore_5m=float(oi_features.get('oi_zscore_5m', 0.0) or 0.0),
-        cvd_delta=float(oi_features.get('cvd_delta', 0.0) or 0.0),
-        cvd_zscore=float(oi_features.get('cvd_zscore', 0.0) or 0.0),
-        recent_5m_change_pct=recent_5m_change_pct,
-        side=trade_side,
-    )
-    score += squeeze_payload['score']
-    reasons.extend(squeeze_payload['reasons'])
-
-    control_risk_payload = compute_control_risk_score(
-        short_bias=float(oi_features.get('short_bias', 0.0) or 0.0),
-        oi_notional_percentile=float(oi_features.get('oi_notional_percentile', 0.0) or 0.0),
-        smart_money_flow_score=smart_money_effective,
-        side=trade_side,
-    )
-    score -= control_risk_payload['score']
-    reasons.extend(control_risk_payload['reasons'])
-
-    state_payload = classify_candidate_state(
-        recent_5m_change_pct=recent_5m_change_pct,
-        volume_multiple=volume_multiple,
-        acceleration_ratio=acceleration_ratio,
-        oi_features=oi_features,
-        rsi_5m=rsi_5m,
-        distance_from_ema20_5m_pct=distance_from_ema20_5m_pct,
-        distance_from_vwap_15m_pct=distance_from_vwap_15m_pct,
-        funding_rate=funding_rate,
-        funding_rate_avg=funding_rate_avg,
-        higher_tf_allowed=higher_tf_allowed,
-        price_change_pct_24h=price_change_pct_24h,
-        side=trade_side,
-    )
-    squeeze_reason = 'launch_short_squeeze' if trade_side == TRADE_SIDE_LONG else 'launch_long_squeeze'
-    if squeeze_payload['score'] >= 12 and state_payload['state'] in {'squeeze', 'overheated', 'momentum_extension'}:
-        state_payload = {
-            **state_payload,
-            'state': 'launch',
-            'state_reasons': list(state_payload.get('state_reasons', [])) + [squeeze_reason],
-            'exhaustion_score': min(float(state_payload.get('exhaustion_score', 0.0) or 0.0), max(float(state_payload.get('setup_score', 0.0) or 0.0) - 0.5, 0.0)),
-        }
-    score += state_payload['setup_score'] - (state_payload['exhaustion_score'] * 0.5)
-    reasons.extend(smart_money_merge['sources'])
-
-    regime_multiplier = float(regime_payload.get('score_multiplier', 1.0) or 1.0)
-    recommended_leverage = recommend_leverage(last_price, stop_price, max_leverage=max_leverage)
-    if breakout_level:
-        entry_distance_from_breakout_pct = (((last_price / breakout_level) - 1.0) * 100) if trade_side == TRADE_SIDE_LONG else (((breakout_level / last_price) - 1.0) * 100)
-    else:
-        entry_distance_from_breakout_pct = 0.0
-    entry_distance_from_vwap_pct = abs(distance_from_vwap_15m_pct)
-    short_squeeze_launch = squeeze_reason in state_payload.get('state_reasons', [])
-    overextension_flag = bool(
-        state_payload['state'] in {'overheated', 'momentum_extension'}
-        or (not short_squeeze_launch and entry_distance_from_breakout_pct >= max(min(max_distance_from_ema_pct * 0.5, 3.0), 0.75))
-        or (not short_squeeze_launch and entry_distance_from_vwap_pct >= max(min(max_distance_from_vwap_pct * 0.5, 3.0), 0.75))
-    )
-    trigger_confirmation = evaluate_trigger_confirmation(
-        structure_break=structure_break,
-        price_above_vwap=price_above_vwap,
-        distance_from_ema20_5m_pct=distance_from_ema20_5m_pct,
-        distance_from_vwap_15m_pct=distance_from_vwap_15m_pct,
-        taker_buy_ratio=oi_features.get('taker_buy_ratio'),
-        oi_change_pct_5m=oi_features.get('oi_change_pct_5m', 0.0),
-        oi_change_pct_15m=oi_features.get('oi_change_pct_15m', 0.0),
-        funding_rate=funding_rate,
-        funding_rate_threshold=funding_rate_threshold,
-        funding_rate_avg=funding_rate_avg,
-        funding_rate_avg_threshold=funding_rate_avg_threshold,
-        cvd_delta=oi_features.get('cvd_delta', 0.0),
-        cvd_zscore=oi_features.get('cvd_zscore', 0.0),
-        state=state_payload['state'],
-        overextension_flag=overextension_flag,
-        side=trade_side,
-        min_confirmations=2,
-        long_short_ratio=microstructure_inputs.get('long_short_ratio'),
-        price_change_pct_24h=price_change_pct_24h,
-        recent_5m_change_pct=recent_5m_change_pct,
-    )
-    setup_ready = bool(trigger_confirmation['setup_ready'])
-    trigger_fired = bool(trigger_confirmation['trigger_fired'])
-    waiting_breakout = bool(
-        near_breakout_setup
-        and (
-            (trade_side == TRADE_SIDE_LONG and last_price <= breakout_level)
-            or (trade_side == TRADE_SIDE_SHORT and last_price >= breakout_level)
-            or not structure_break
+    return _build_candidate_from_request(
+        BuildCandidateRequest(
+            symbol=symbol,
+            ticker=ticker,
+            klines_5m=klines_5m,
+            klines_15m=klines_15m,
+            klines_1h=klines_1h,
+            klines_4h=klines_4h,
+            meta=meta,
+            hot_rank=hot_rank,
+            gainer_rank=gainer_rank,
+            funding_rate=funding_rate,
+            funding_rate_avg=funding_rate_avg,
+            open_interest_rows=open_interest_rows,
+            taker_long_short_ratio_rows=taker_long_short_ratio_rows,
+            top_long_short_position_ratio_rows=top_long_short_position_ratio_rows,
+            top_long_short_account_ratio_rows=top_long_short_account_ratio_rows,
+            symbol_open_interest_rows_5m=symbol_open_interest_rows_5m,
+            symbol_open_interest_rows_15m=symbol_open_interest_rows_15m,
+            market_regime=market_regime,
+            current_timestamp_ms=current_timestamp_ms,
+            okx_sentiment=okx_sentiment,
+            smart_money_context=smart_money_context,
+            legacy_kwargs=dict(legacy_kwargs),
         )
     )
-    if waiting_breakout:
-        trigger_fired = False
-        trigger_confirmation['trigger_fired'] = False
-        trigger_confirmation['flags']['waiting_breakout'] = True
-        if not (near_external_breakout_setup or near_configured_setup):
-            setup_ready = False
-            trigger_confirmation['setup_ready'] = False
-            trigger_confirmation['flags']['watch_only_breakout_distance'] = True
-    expected_slippage_pct = round(max(entry_distance_from_breakout_pct, 0.0) * 0.35, 4)
-    book_depth_fill_ratio = round(clamp(1.0 - (expected_slippage_pct / 2.0), 0.0, 1.0), 4)
-    initial_alert_tier = classify_alert_tier(score, state_payload['state'], regime_label)
-    initial_position_size_pct = recommended_position_size_pct(score, initial_alert_tier, regime_multiplier)
-    candidate = Candidate(
-        symbol=symbol,
-        last_price=last_price,
-        price_change_pct_24h=price_change_pct_24h,
-        quote_volume_24h=quote_volume_24h,
-        hot_rank=hot_rank,
-        gainer_rank=gainer_rank,
-        funding_rate=funding_rate,
-        funding_rate_avg=funding_rate_avg,
-        recent_5m_change_pct=recent_5m_change_pct,
-        acceleration_ratio_5m_vs_15m=acceleration_ratio,
-        breakout_level=breakout_level,
-        recent_swing_low=recent_swing_low,
-        stop_price=stop_price,
-        quantity=quantity,
-        risk_per_unit=risk_per_unit,
-        recommended_leverage=recommended_leverage,
-        rsi_5m=rsi_5m,
-        volume_multiple=volume_multiple,
-        distance_from_ema20_5m_pct=distance_from_ema20_5m_pct,
-        distance_from_vwap_15m_pct=distance_from_vwap_15m_pct,
-        higher_tf_summary={'1h': trend_1h, '4h': trend_4h},
-        score=score,
-        reasons=reasons,
-        side=trade_side,
-        position_side=position_side,
-        trigger_type='breakout',
-        higher_timeframe_bias=higher_timeframe_bias,
-        oi_change_pct_5m=oi_features['oi_change_pct_5m'],
-        oi_change_pct_15m=oi_features['oi_change_pct_15m'],
-        oi_acceleration_ratio=oi_features['oi_acceleration_ratio'],
-        taker_buy_ratio=oi_features.get('taker_buy_ratio'),
-        long_short_ratio=microstructure_inputs.get('long_short_ratio'),
-        short_bias=float(microstructure_inputs.get('short_bias', 0.0) or 0.0),
-        oi_zscore_5m=oi_features.get('oi_zscore_5m', 0.0),
-        volume_zscore_5m=oi_features.get('volume_zscore_5m', 0.0),
-        bollinger_bandwidth_pct=oi_features.get('bollinger_bandwidth_pct', 0.0),
-        price_above_vwap=oi_features.get('price_above_vwap', False),
-        funding_rate_percentile_hint=oi_features.get('funding_rate_percentile_hint'),
-        cvd_delta=oi_features.get('cvd_delta', 0.0),
-        cvd_zscore=oi_features.get('cvd_zscore', 0.0),
-        atr_stop_distance=atr_stop_distance,
-        stop_model=stop_model,
-        stop_distance_pct=stop_distance_pct,
-        stop_too_tight_flag=stop_too_tight_flag,
-        stop_too_wide_flag=stop_too_wide_flag,
-        state=state_payload['state'],
-        state_reasons=state_payload['state_reasons'],
-        setup_score=state_payload['setup_score'],
-        exhaustion_score=state_payload['exhaustion_score'],
-        okx_sentiment_score=okx_sentiment_score,
-        okx_sentiment_acceleration=okx_sentiment_acceleration,
-        sector_resonance_score=sector_resonance_score,
-        smart_money_flow_score=smart_money_effective,
-        leading_sentiment_delta=leading_payload['score'],
-        squeeze_score=squeeze_payload['score'],
-        control_risk_score=control_risk_payload['score'],
-        alert_tier=initial_alert_tier,
-        position_size_pct=initial_position_size_pct,
-        regime_label=regime_label,
-        regime_multiplier=regime_multiplier,
-        onchain_smart_money_score=onchain_smart_money_score,
-        smart_money_veto=bool(smart_money_merge['veto'] or control_risk_payload['veto']),
-        smart_money_veto_reason=smart_money_merge['veto_reason'] or control_risk_payload['veto_reason'],
-        smart_money_sources=list(smart_money_merge['sources']),
-        entry_distance_from_breakout_pct=entry_distance_from_breakout_pct,
-        entry_distance_from_vwap_pct=entry_distance_from_vwap_pct,
-        overextension_flag=overextension_flag,
-        setup_ready=setup_ready,
-        trigger_fired=trigger_fired,
-        expected_slippage_pct=expected_slippage_pct,
-        book_depth_fill_ratio=book_depth_fill_ratio,
-        loser_rank=loser_rank,
-        trigger_confirmation_flags=dict(trigger_confirmation['flags']),
-        trigger_confirmation_count=int(trigger_confirmation['confirmation_count']),
-        trigger_min_confirmations=int(trigger_confirmation['min_confirmations']),
-        oi_hard_reversal_threshold_pct=float(legacy_kwargs.get('oi_hard_reversal_threshold_pct', 0.8) or 0.8),
-        portfolio_narrative_bucket='',
-        portfolio_correlation_group='',
-    )
-    candidate.must_pass_flags = {
-        **dict(candidate.must_pass_flags or {}),
-        **dict(trigger_confirmation['flags']),
-        'setup_ready': setup_ready,
-        'trigger_fired': trigger_fired,
-    }
-    candidate.reasons.append(f"trigger_confirmation_count={candidate.trigger_confirmation_count}")
-    candidate.reasons.append(f"trigger_min_confirmations={candidate.trigger_min_confirmations}")
-    if waiting_breakout:
-        candidate.reasons.append('waiting_breakout')
-    candidate.reasons.append(f'alert_tier={candidate.alert_tier}')
-    candidate.reasons.append(f'position_size_pct={candidate.position_size_pct}')
-    return candidate
-
 
 def parse_okx_sentiment_payload(raw_text: str) -> Dict[str, Dict[str, float]]:
     payload: Dict[str, Dict[str, float]] = {}
@@ -4727,7 +4319,7 @@ def collect_book_ticker_samples(
         'requested_sample_count': max(int(sample_count or 0), 0),
         'cache_max_age_seconds': float(cache_max_age_seconds),
         'fallback': 'rest_polling',
-    }, key='global', min_interval_seconds=60.0)
+    }, key=symbol, min_interval_seconds=60.0)
     samples: List[Dict[str, Any]] = []
     sample_total = max(int(sample_count or 0), 0)
     for idx in range(sample_total):
@@ -4934,8 +4526,6 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
         'trigger_confirmation_flags': dict(candidate.trigger_confirmation_flags or {}),
         'trigger_confirmation_count': int(candidate.trigger_confirmation_count or 0),
         'trigger_min_confirmations': int(candidate.trigger_min_confirmations or 0),
-        'portfolio_narrative_bucket': candidate.portfolio_narrative_bucket,
-        'portfolio_correlation_group': candidate.portfolio_correlation_group,
         'expected_slippage_pct': round(candidate.expected_slippage_pct, 4),
         'expected_slippage_r': execution_quality['expected_slippage_r'],
         'book_depth_fill_ratio': round(candidate.book_depth_fill_ratio, 4),
@@ -5474,21 +5064,30 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_notional_usdt': 500.0,
             'leverage': 5,
             'breakeven_r': 0.8,
-            'tp1_r': 1.2,
+            'tp1_r': 5.0,
             'tp1_close_pct': 0.5,
-            'tp2_r': 1.8,
-            'tp2_close_pct': 0.3,
-            'min_quote_volume': 20_000_000,
-            'top_gainers': 12,
-            'top_losers': 12,
-            'max_candidates': 5,
-            'max_rsi_5m': 76.0,
-            'min_volume_multiple': 2.4,
-            'min_5m_change_pct': 2.5,
-            'max_distance_from_ema_pct': 6.0,
-            'max_distance_from_vwap_pct': 5.0,
-            'max_funding_rate': 0.0004,
-            'max_funding_rate_avg': 0.00025,
+            'tp2_r': 10.0,
+            'tp2_close_pct': 0.5,
+            'entry_tp1_offset_abs': 5.0,
+            'entry_tp2_offset_abs': 10.0,
+            'lookback_bars': 4,
+            'swing_bars': 4,
+            'min_quote_volume': 5_000_000,
+            'top_gainers': 45,
+            'top_losers': 45,
+            'max_candidates': 16,
+            'max_open_positions': 3,
+            'max_long_positions': 3,
+            'max_short_positions': 3,
+            'max_rsi_5m': 84.0,
+            'min_volume_multiple': 0.8,
+            'min_5m_change_pct': 0.35,
+            'watch_breakout_tolerance_pct': 0.75,
+            'setup_breakout_tolerance_pct': 0.4,
+            'max_distance_from_ema_pct': 9.0,
+            'max_distance_from_vwap_pct': 8.0,
+            'max_funding_rate': 0.0008,
+            'max_funding_rate_avg': 0.0005,
         }
     elif profile == '10u-active':
         profile_overrides = {
@@ -5500,17 +5099,22 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'tp1_close_pct': 0.5,
             'tp2_r': 1.8,
             'tp2_close_pct': 0.3,
-            'lookback_bars': 6,
-            'swing_bars': 5,
-            'min_quote_volume': 10_000_000,
-            'top_gainers': 25,
-            'top_losers': 25,
-            'max_candidates': 10,
+            'lookback_bars': 4,
+            'swing_bars': 4,
+            'min_quote_volume': 5_000_000,
+            'top_gainers': 35,
+            'top_losers': 35,
+            'max_candidates': 12,
             'max_rsi_5m': 82.0,
-            'min_volume_multiple': 1.25,
-            'min_5m_change_pct': 0.8,
-            'max_distance_from_ema_pct': 7.0,
-            'max_distance_from_vwap_pct': 6.0,
+            'min_volume_multiple': 0.9,
+            'min_5m_change_pct': 0.5,
+            'watch_breakout_tolerance_pct': 0.8,
+            'setup_breakout_tolerance_pct': 0.35,
+            'oi_hard_reversal_threshold_pct': 1.0,
+            'execution_slippage_hard_veto_r': 0.4,
+            'execution_slippage_risk_threshold_r': 0.25,
+            'max_distance_from_ema_pct': 8.0,
+            'max_distance_from_vwap_pct': 7.0,
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
         }
@@ -5605,149 +5209,65 @@ def top_dict_items(d: Any, limit: int = 3) -> List[Tuple[str, Any]]:
     return sorted(d.items(), key=lambda item: item[1], reverse=True)[:limit]
 
 
+def mask_sensitive_token(token: Any, prefix: int = 4, suffix: int = 4) -> str:
+    text = str(token or '')
+    if not text:
+        return ''
+    prefix_len = max(int(prefix or 0), 0)
+    suffix_len = max(int(suffix or 0), 0)
+    if len(text) <= prefix_len + suffix_len:
+        return text
+    return text[:prefix_len] + '***' + text[-suffix_len:]
+
+
 def build_cn_scan_summary(result: Dict[str, Any]) -> Dict[str, Any]:
-    cycles = result.get('cycles') if isinstance(result, dict) else None
-    cycle = cycles[0] if isinstance(cycles, list) and cycles else {}
-    scan = cycle.get('scan', {}) if isinstance(cycle, dict) else {}
-    selected = scan.get('selected_alert') or scan.get('selected')
-    market_regime = scan.get('market_regime', {}) if isinstance(scan, dict) else {}
-    rejected_stats = scan.get('rejected_stats', {}) if isinstance(scan, dict) else {}
-    candidates = scan.get('candidate_alerts') or scan.get('candidates') or []
-    cycle_mode = 'dry-run'
-    if isinstance(cycle, dict):
-        if cycle.get('scan_only'):
-            cycle_mode = 'scan-only'
-        elif cycle.get('live_requested') or cycle.get('live_execution') or cycle.get('live_skipped_due_to_risk_guard') or cycle.get('live_skipped_due_to_existing_positions'):
-            cycle_mode = 'live'
+    from summary_render import build_cn_scan_summary_data
 
-    summary = {
-        'ok': result.get('ok', True) if isinstance(result, dict) else True,
-        '模式': cycle_mode,
-        '市场状态': {
-            '标签': market_regime.get('label', '-'),
-            '乘数': market_regime.get('score_multiplier', 1.0),
-            '原因': market_regime.get('reasons', []),
-        },
-        '扫描概览': {
-            '候选数': scan.get('candidate_count', 0),
-            '拒绝数': rejected_stats.get('total', 0),
-            '主要拒绝原因': [
-                {'原因': key, '数量': value}
-                for key, value in top_dict_items(rejected_stats.get('by_reject_label', {}), limit=4)
-            ],
-        },
-        '首选标的': None,
-        '候选列表': [],
-    }
-
-    if isinstance(selected, dict):
-        summary['首选标的'] = {
-            '交易对': selected.get('symbol', '-'),
-            '评级': selected.get('alert_tier', '-'),
-            '状态': selected.get('state', '-'),
-            '得分': selected.get('score'),
-            '建议仓位': selected.get('position_size_pct'),
-            '入场价': selected.get('entry_price', selected.get('last_price')),
-            '止损价': selected.get('stop_price'),
-            '预期滑点R': selected.get('expected_slippage_r'),
-            '流动性': selected.get('execution_liquidity_grade', selected.get('liquidity_grade')),
-            '理由': selected.get('reasons', [])[:6],
-        }
-
-    for item in list(candidates)[:5]:
-        if not isinstance(item, dict):
-            continue
-        summary['候选列表'].append({
-            '交易对': item.get('symbol', '-'),
-            '评级': item.get('alert_tier', '-'),
-            '状态': item.get('state', '-'),
-            '得分': item.get('score'),
-            '24h涨幅': item.get('price_change_pct_24h'),
-            '5m涨幅': item.get('recent_5m_change_pct'),
-            '建议仓位': item.get('position_size_pct'),
-            '流动性': item.get('execution_liquidity_grade', item.get('liquidity_grade')),
-        })
-    return summary
+    return build_cn_scan_summary_data(result, mask_sensitive_token)
 
 
 def render_cn_scan_summary(result: Dict[str, Any]) -> str:
+    from summary_render import render_cn_scan_summary_text
+
     summary = build_cn_scan_summary(result)
-    market = summary.get('市场状态', {})
-    overview = summary.get('扫描概览', {})
-    selected = summary.get('首选标的')
-    lines = [
-        f"扫描模式: {summary.get('模式', 'dry-run')}",
-        f"市场状态: {market.get('标签', '-')} ×{format_num(market.get('乘数', 1.0), 2)}",
-    ]
-    reasons = market.get('原因', []) or []
-    if reasons:
-        lines.append(f"状态原因: {', '.join(str(x) for x in reasons[:4])}")
-    lines.append(f"扫描结果: 候选 {overview.get('候选数', 0)} 个 | 拒绝 {overview.get('拒绝数', 0)} 个")
-    reject_items = overview.get('主要拒绝原因', []) or []
-    if reject_items:
-        reject_text = '，'.join(f"{item['原因']} {item['数量']}" for item in reject_items)
-        lines.append(f"主要拦截: {reject_text}")
-    if selected:
-        lines.extend([
-            '',
-            '首选标的',
-            f"- {selected.get('交易对')} | {selected.get('评级')} | {selected.get('状态')} | 得分 {format_num(selected.get('得分'), 1)}",
-            f"- 入场 {format_num(selected.get('入场价'), 6)} | 止损 {format_num(selected.get('止损价'), 6)} | 建议仓位 {format_pct(selected.get('建议仓位'), 1)}",
-            f"- 执行质量 {selected.get('流动性', '-')} | 预期滑点R {format_num(selected.get('预期滑点R'), 3)}",
-        ])
-        selected_reasons = selected.get('理由', []) or []
-        if selected_reasons:
-            lines.append(f"- 关键信号: {'，'.join(str(x) for x in selected_reasons[:5])}")
-    candidate_rows = summary.get('候选列表', []) or []
-    if candidate_rows:
-        lines.extend(['', '候选列表'])
-        for idx, item in enumerate(candidate_rows, start=1):
-            lines.append(
-                f"{idx}. {item.get('交易对')} | {item.get('评级')} | {item.get('状态')} | 得分 {format_num(item.get('得分'), 1)} | 24h {format_pct(item.get('24h涨幅'), 2)} | 5m {format_pct(item.get('5m涨幅'), 2)} | 仓位 {format_pct(item.get('建议仓位'), 1)} | 流动性 {item.get('流动性', '-')}"
-            )
-    return '\n'.join(lines)
+    return render_cn_scan_summary_text(summary, format_num, format_pct)
 
 
 def default_risk_state() -> Dict[str, Any]:
     return {
         'halted': False,
         'halt_reason': '',
-        'consecutive_losses': 0,
-        'daily_realized_pnl_usdt': 0.0,
+        'halted_at': None,
+        'daily_realized_pnl': 0.0,
+        'daily_loss_limit_hit': False,
         'symbol_cooldowns': {},
+        'last_reset_date': datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
+        'consecutive_losses': 0,
+        'last_loss_at': None,
         'portfolio_exposure_pct_by_theme': {},
         'portfolio_exposure_pct_by_correlation': {},
         'portfolio_heat_open_r': 0.0,
-        'portfolio_heat_pending_r': 0.0,
         'portfolio_heat_r_by_theme': {},
         'portfolio_heat_r_by_correlation': {},
     }
 
 
+def normalize_loaded_risk_state(state: Any) -> Dict[str, Any]:
+    return normalize_loaded_risk_state_impl(state, default_risk_state)
+
+
+def refresh_risk_state_heat_snapshot(risk_state: Dict[str, Any], positions_state: Any) -> Dict[str, Any]:
+    return refresh_risk_state_heat_snapshot_impl(risk_state, positions_state, compute_positions_heat_snapshot)
+
+
 def load_risk_state(store: RuntimeStateStore) -> Dict[str, Any]:
-    state = store.load_json('risk_state', default_risk_state())
-    if not isinstance(state, dict):
-        return default_risk_state()
-    merged = default_risk_state()
-    merged.update(state)
-    if not isinstance(merged.get('symbol_cooldowns'), dict):
-        merged['symbol_cooldowns'] = {}
-    if not isinstance(merged.get('portfolio_exposure_pct_by_theme'), dict):
-        merged['portfolio_exposure_pct_by_theme'] = {}
-    if not isinstance(merged.get('portfolio_exposure_pct_by_correlation'), dict):
-        merged['portfolio_exposure_pct_by_correlation'] = {}
-    if not isinstance(merged.get('portfolio_heat_r_by_theme'), dict):
-        merged['portfolio_heat_r_by_theme'] = {}
-    if not isinstance(merged.get('portfolio_heat_r_by_correlation'), dict):
-        merged['portfolio_heat_r_by_correlation'] = {}
-    heat_snapshot = compute_positions_heat_snapshot(store.load_json('positions', {}))
-    if int(heat_snapshot.get('tracked_positions', 0) or 0) > 0:
-        merged['portfolio_heat_open_r'] = heat_snapshot.get('open_heat_r', 0.0)
-        if heat_snapshot.get('heat_r_by_theme'):
-            merged['portfolio_heat_r_by_theme'] = heat_snapshot['heat_r_by_theme']
-        if heat_snapshot.get('heat_r_by_correlation'):
-            merged['portfolio_heat_r_by_correlation'] = heat_snapshot['heat_r_by_correlation']
-    return merged
+    state, error = store.load_json_with_error('risk_state', default_risk_state())
+    if error:
+        if _should_emit_runtime_state_degraded(store, 'risk_state'):
+            store.append_event('runtime_state_degraded', {**error, 'fallback_used': 'default_risk_state', 'consumer': 'load_risk_state'})
+        state = default_risk_state()
+    merged = normalize_loaded_risk_state(state)
+    return refresh_risk_state_heat_snapshot(merged, store.load_json('positions', {}))
 
 
 def log_runtime_event(event_type: str, payload: Dict[str, Any]) -> None:
@@ -5776,6 +5296,36 @@ def build_notification_message(event_type: str, payload: Dict[str, Any]) -> str:
     profile = payload.get('profile', '')
     if event_type == 'entry_filled':
         return f"开单 {symbol} entry={payload.get('entry_price')} stop={payload.get('stop_price')} qty={payload.get('quantity')} profile={profile}".strip()
+    if event_type == 'user_data_stream_alert':
+        status_labels = {
+            'refresh_failed': '续期失败',
+            'disconnected': '已断线',
+            'started': '已启动',
+            'refreshed': '已续期',
+        }
+        listen_key = str(payload.get('listen_key') or '')
+        masked_listen_key = listen_key[:4] + '***' + listen_key[-4:] if len(listen_key) > 8 else listen_key
+        parts = [
+            f"用户数据流告警 {symbol}",
+            f"状态={status_labels.get(str(payload.get('status') or ''), payload.get('status', '-'))}",
+            f"动作={payload.get('action', '-')}",
+        ]
+        error_text = payload.get('error') or payload.get('detail')
+        if error_text:
+            parts.append(f"错误={error_text}")
+        if payload.get('disconnect_count') is not None:
+            parts.append(f"断线次数={payload.get('disconnect_count')}")
+        if payload.get('refresh_failure_count') is not None:
+            parts.append(f"续期失败次数={payload.get('refresh_failure_count')}")
+        if payload.get('reconnect_count') is not None:
+            parts.append(f"重连次数={payload.get('reconnect_count')}")
+        if payload.get('last_refresh_at'):
+            parts.append(f"最近续期={payload.get('last_refresh_at')}")
+        if payload.get('updated_at'):
+            parts.append(f"更新时间={payload.get('updated_at')}")
+        if masked_listen_key:
+            parts.append(f"listenKey={masked_listen_key}")
+        return ' '.join(str(part) for part in parts if str(part).strip())
     return f"{event_type} {json.dumps(payload, ensure_ascii=False)}"
 
 
@@ -5888,62 +5438,33 @@ def exchange_position_runtime_fields(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_position_protection_status(client: Any, symbol: str, expected_stop_order: Optional[Dict[str, Any]] = None, allow_missing_when_flat: bool = True, side: Any = POSITION_SIDE_LONG) -> Dict[str, Any]:
-    position_side = normalize_position_side(side)
-    positions = fetch_open_positions(client)
-    active = next((row for row in positions if position_row_matches_symbol_side(row, symbol, position_side)), None)
-    expected_order_id = expected_stop_order.get('orderId') if isinstance(expected_stop_order, dict) else None
-    expected_client_algo_id = expected_stop_order.get('clientAlgoId') if isinstance(expected_stop_order, dict) else None
-    if active is None:
-        return {'status': 'flat', 'active_position': None, 'expected_order_id': expected_order_id, 'side': position_side}
-    open_orders = fetch_open_orders(client, symbol)
-    matched = next((row for row in open_orders if row.get('orderId') == expected_order_id), None) if expected_order_id is not None else (open_orders[0] if open_orders else None)
-    if matched is None:
-        open_algo_orders = fetch_open_algo_orders(client, symbol)
-        if expected_client_algo_id:
-            matched = next((row for row in open_algo_orders if row.get('clientAlgoId') == expected_client_algo_id), None)
-        elif open_algo_orders:
-            matched = next((row for row in open_algo_orders if str(row.get('orderType') or '').upper() == 'STOP_MARKET'), open_algo_orders[0])
-    if matched is None:
-        return {'status': 'missing', 'active_position': active, 'expected_order_id': expected_order_id, 'expected_client_algo_id': expected_client_algo_id, 'side': position_side}
-    return {'status': 'protected', 'active_position': active, 'expected_order_id': expected_order_id, 'expected_client_algo_id': expected_client_algo_id, 'stop_order': matched, 'side': position_side}
+    return execution_resolve_position_protection_status(
+        client,
+        symbol,
+        expected_stop_order=expected_stop_order,
+        allow_missing_when_flat=allow_missing_when_flat,
+        side=side,
+        position_side_long=POSITION_SIDE_LONG,
+        normalize_position_side=normalize_position_side,
+        fetch_open_positions=fetch_open_positions,
+        fetch_open_orders=fetch_open_orders,
+        fetch_open_algo_orders=fetch_open_algo_orders,
+        position_row_matches_symbol_side=position_row_matches_symbol_side,
+        _to_float=_to_float,
+    )
 
 def repair_missing_protection(client: Any, symbol: str, tracked: Optional[Dict[str, Any]], active_position: Optional[Dict[str, Any]], meta: Optional[SymbolMeta] = None) -> Dict[str, Any]:
-    tracked = tracked if isinstance(tracked, dict) else {}
-    active_position = active_position if isinstance(active_position, dict) else {}
-    quantity = abs(_to_float(active_position.get('positionAmt')))
-    stop_price = _to_float(tracked.get('stop_price'))
-    side = normalize_position_side(tracked.get('side') or active_position.get('positionSide'))
-    if quantity <= 0 or stop_price <= 0:
-        return {
-            'ok': False,
-            'symbol': symbol,
-            'side': side,
-            'status': 'repair_failed',
-            'message': 'missing stop_price or active quantity for repair',
-            'repair_attempted': False,
-        }
-    if meta is None:
-        meta = fetch_exchange_meta(client).get(symbol)
-    if meta is None:
-        return {
-            'ok': False,
-            'symbol': symbol,
-            'side': side,
-            'status': 'repair_failed',
-            'message': 'missing symbol meta for repair',
-            'repair_attempted': False,
-        }
-    stop_order = place_stop_market_order(client, symbol, stop_price, quantity, meta, side=side)
-    return {
-        'ok': True,
-        'symbol': symbol,
-        'side': side,
-        'status': 'protected',
-        'stop_order': stop_order,
-        'stop_price': stop_price,
-        'quantity': quantity,
-        'repair_attempted': True,
-    }
+    return execution_repair_missing_protection(
+        client,
+        symbol,
+        tracked=tracked,
+        active_position=active_position,
+        meta=meta,
+        normalize_position_side=normalize_position_side,
+        place_stop_market_order=place_stop_market_order,
+        fetch_exchange_meta=fetch_exchange_meta,
+        _to_float=_to_float,
+    )
 
 
 def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_positions: Sequence[Dict[str, Any]], protected_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
@@ -5963,7 +5484,6 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
     refreshed_symbols: List[str] = []
     orphan_symbols: List[str] = []
     normalized_positions: Dict[str, Any] = {}
-    saw_side_aware_keys = any(':' in str(key) for key in raw_positions_state.keys())
     for existing_key, tracked in list(positions_state.items()):
         if not isinstance(tracked, dict):
             continue
@@ -5979,11 +5499,20 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             report_key = symbol
         exchange_row = exchange_map.get(position_key)
         if exchange_row is None:
-            if tracked.get('status') not in {'closed', 'orphan'}:
-                tracked['status'] = 'closed'
-                tracked['remaining_quantity'] = 0.0
-                tracked['stop_order_id'] = None
-                tracked['protection_status'] = 'flat'
+            was_openish = tracked.get('status') not in {'closed', 'orphan'} or any(
+                abs(_to_float(tracked.get(field))) > 0
+                for field in ('quantity', 'remaining_quantity', 'exchange_position_amt', 'notional', 'unrealized_pnl', 'mark_price')
+            )
+            tracked['status'] = 'closed'
+            tracked['remaining_quantity'] = 0.0
+            tracked['quantity'] = 0.0
+            tracked['exchange_position_amt'] = 0.0
+            tracked['notional'] = 0.0
+            tracked['unrealized_pnl'] = 0.0
+            tracked['mark_price'] = 0.0
+            tracked['stop_order_id'] = None
+            tracked['protection_status'] = 'flat'
+            if was_openish:
                 closed_symbols.append(report_key)
             normalized_positions[position_key] = tracked
             continue
@@ -6010,7 +5539,7 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
         orphan_symbols.append(symbol if side == POSITION_SIDE_LONG else position_key)
         refreshed_symbols.append(symbol if side == POSITION_SIDE_LONG else position_key)
         normalized_positions[position_key] = tracked
-    materialized_positions = materialize_positions_state(normalized_positions, original_keys, include_legacy_alias=not saw_side_aware_keys)
+    materialized_positions = materialize_positions_state(normalized_positions, original_keys, include_legacy_alias=False)
     store.save_json('positions', materialized_positions)
     return {
         'closed_symbols': closed_symbols,
@@ -6019,7 +5548,7 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
     }
 
 
-def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orphan_position: bool = False, repair_missing_protection_enabled: bool = True) -> Dict[str, Any]:
+def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orphan_position: bool = False, repair_missing_protection_enabled: bool = True, args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
     positions_state = store.load_json('positions', {})
     if not isinstance(positions_state, dict):
         positions_state = {}
@@ -6060,6 +5589,23 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
             else:
                 positions_missing_protection.append(symbol if side == POSITION_SIDE_LONG else position_key)
                 tracked['protection_status'] = protection.get('status')
+                positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
+        else:
+            tracked['protection_status'] = 'protected'
+            if tracked.get('status') == 'protected_recovery_pending':
+                tracked['protected_recovery_pending'] = True
+                if args is not None:
+                    try:
+                        plan = build_trade_management_plan_from_position(tracked, args)
+                    except Exception:
+                        plan = None
+                    if plan and getattr(plan, 'initial_risk_per_unit', 0.0) > 0:
+                        tracked['trade_management_plan'] = asdict(plan)
+                        tracked['status'] = 'monitoring'
+                        tracked['protected_recovery_pending'] = False
+                        tracked.pop('recovery_incomplete', None)
+                        tracked.pop('recovery_reason', None)
+            positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
     sync_result = sync_tracked_positions_with_exchange(store, exchange_positions, protected_symbols=protected_symbols)
     result = {
@@ -6124,116 +5670,40 @@ def build_position_exposure_snapshot(open_positions: Sequence[Dict[str, Any]]) -
 
 
 def evaluate_portfolio_risk_guards(open_positions: Sequence[Dict[str, Any]], candidate: Any = None, max_long_positions: int = 0, max_short_positions: int = 0, max_net_exposure_usdt: float = 0.0, max_gross_exposure_usdt: float = 0.0, per_symbol_single_side_only: bool = True, opposite_side_flip_cooldown_minutes: int = 0) -> Dict[str, Any]:
-    snapshot = build_position_exposure_snapshot(open_positions)
-    reasons: List[str] = []
-    candidate_symbol = str(getattr(candidate, 'symbol', '') or '').upper()
-    candidate_side = normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)) if candidate is not None else POSITION_SIDE_LONG
-    candidate_notional = abs(_to_float(getattr(candidate, 'notional', 0.0) or getattr(candidate, 'planned_notional', 0.0)))
-    if candidate_notional <= 0:
-        candidate_notional = abs(_to_float(getattr(candidate, 'entry_price', 0.0) or getattr(candidate, 'last_price', 0.0))) * abs(_to_float(getattr(candidate, 'quantity', 0.0)))
-
-    if candidate is not None:
-        if candidate_side == POSITION_SIDE_LONG and max_long_positions > 0 and snapshot['long_count'] >= max_long_positions:
-            reasons.append('max_long_positions_reached')
-        if candidate_side == POSITION_SIDE_SHORT and max_short_positions > 0 and snapshot['short_count'] >= max_short_positions:
-            reasons.append('max_short_positions_reached')
-        if per_symbol_single_side_only and candidate_symbol:
-            active_sides = snapshot['symbol_sides'].get(candidate_symbol, [])
-            if active_sides and candidate_side not in active_sides:
-                reasons.append('per_symbol_single_side_only_violation')
-            if opposite_side_flip_cooldown_minutes > 0 and active_sides and candidate_side not in active_sides:
-                reasons.append('opposite_side_flip_cooldown_active')
-        projected_net = snapshot['net_exposure_usdt'] + (candidate_notional if candidate_side == POSITION_SIDE_LONG else -candidate_notional)
-        projected_gross = snapshot['gross_exposure_usdt'] + candidate_notional
-        if max_net_exposure_usdt > 0 and abs(projected_net) >= max_net_exposure_usdt:
-            reasons.append('max_net_exposure_reached')
-        if max_gross_exposure_usdt > 0 and projected_gross >= max_gross_exposure_usdt:
-            reasons.append('max_gross_exposure_reached')
-    snapshot['candidate_symbol'] = candidate_symbol
-    snapshot['candidate_side'] = candidate_side
-    snapshot['candidate_notional_usdt'] = candidate_notional
-    return {'allowed': not reasons, 'reasons': reasons, 'snapshot': snapshot}
+    return evaluate_portfolio_risk_guards_impl(
+        open_positions=open_positions,
+        candidate=candidate,
+        max_long_positions=max_long_positions,
+        max_short_positions=max_short_positions,
+        max_net_exposure_usdt=max_net_exposure_usdt,
+        max_gross_exposure_usdt=max_gross_exposure_usdt,
+        per_symbol_single_side_only=per_symbol_single_side_only,
+        opposite_side_flip_cooldown_minutes=opposite_side_flip_cooldown_minutes,
+        build_position_exposure_snapshot=build_position_exposure_snapshot,
+        normalize_position_side=normalize_position_side,
+        position_side_long=POSITION_SIDE_LONG,
+        position_side_short=POSITION_SIDE_SHORT,
+        _to_float=_to_float,
+    )
 
 
 def evaluate_risk_guards(symbol: Optional[str] = None, risk_state: Optional[Dict[str, Any]] = None, candidate: Any = None, now_ts: Optional[int] = None, daily_max_loss_usdt: float = 0.0, max_consecutive_losses: int = 0, symbol_cooldown_minutes: int = 0, **kwargs) -> Dict[str, Any]:
-    normalized = default_risk_state()
-    if isinstance(risk_state, dict):
-        normalized.update(risk_state)
-    if not isinstance(normalized.get('symbol_cooldowns'), dict):
-        normalized['symbol_cooldowns'] = {}
-    if not isinstance(normalized.get('portfolio_exposure_pct_by_theme'), dict):
-        normalized['portfolio_exposure_pct_by_theme'] = {}
-    if not isinstance(normalized.get('portfolio_exposure_pct_by_correlation'), dict):
-        normalized['portfolio_exposure_pct_by_correlation'] = {}
-    if not isinstance(normalized.get('portfolio_heat_r_by_theme'), dict):
-        normalized['portfolio_heat_r_by_theme'] = {}
-    if not isinstance(normalized.get('portfolio_heat_r_by_correlation'), dict):
-        normalized['portfolio_heat_r_by_correlation'] = {}
-    reasons = []
-    if normalized.get('halted'):
-        reasons.append('strategy_halted')
-    pnl = abs(_to_float(normalized.get('daily_realized_pnl_usdt')))
-    if daily_max_loss_usdt > 0 and pnl >= daily_max_loss_usdt:
-        reasons.append('daily_max_loss_reached')
-    if max_consecutive_losses > 0 and int(normalized.get('consecutive_losses', 0) or 0) >= max_consecutive_losses:
-        reasons.append('max_consecutive_losses_reached')
-    cooldown_until = None
-    if symbol:
-        cooldown_until = normalized['symbol_cooldowns'].get(symbol)
-        ts = int(time.time()) if now_ts is None else int(now_ts)
-        if cooldown_until and ts < int(cooldown_until):
-            reasons.append('symbol_cooldown_active')
-    if candidate is not None:
-        state = getattr(candidate, 'state', '')
-        if not bool(getattr(candidate, 'setup_ready', False)):
-            reasons.append('candidate_setup_not_ready')
-        elif not bool(getattr(candidate, 'trigger_fired', False)):
-            reasons.append('candidate_trigger_not_fired')
-        execution_slippage_r = compute_expected_slippage_r(candidate)
-        execution_liquidity_grade = classify_execution_liquidity_grade(getattr(candidate, 'book_depth_fill_ratio', 0.0), execution_slippage_r)
-        if state == 'distribution':
-            reasons.append('candidate_distribution_risk')
-        if _to_float(getattr(candidate, 'cvd_delta', 0.0)) < 0 and _to_float(getattr(candidate, 'cvd_zscore', 0.0)) <= -2.0:
-            reasons.append('candidate_cvd_divergence')
-        oi_hard_reversal_threshold = abs(_to_float(getattr(candidate, 'oi_hard_reversal_threshold_pct', 0.8), default=0.8))
-        if _to_float(getattr(candidate, 'oi_change_pct_5m', 0.0)) <= -oi_hard_reversal_threshold:
-            reasons.append('candidate_oi_reversal')
-        risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
-        if execution_slippage_r > risk_slippage_r:
-            reasons.append('candidate_execution_slippage_risk')
-        if execution_liquidity_grade == 'C' and _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5:
-            reasons.append('candidate_execution_liquidity_poor')
-        position_size_pct = max(_to_float(getattr(candidate, 'position_size_pct', 0.0)), 0.0)
-        portfolio_narrative_bucket = str(kwargs.get('portfolio_narrative_bucket') or getattr(candidate, 'portfolio_narrative_bucket', '') or '').strip()
-        portfolio_correlation_group = str(kwargs.get('portfolio_correlation_group') or getattr(candidate, 'portfolio_correlation_group', '') or '').strip()
-        max_theme = max(_to_float(kwargs.get('max_portfolio_exposure_pct_per_theme', 0.0)), 0.0)
-        max_corr = max(_to_float(kwargs.get('max_portfolio_exposure_pct_per_correlation_group', 0.0)), 0.0)
-        base_risk_usdt = max(_to_float(kwargs.get('base_risk_usdt', 0.0)), 0.0)
-        candidate_heat_r = estimate_candidate_heat_r(candidate, base_risk_usdt=base_risk_usdt)
-        current_open_heat_r = max(_to_float(normalized.get('portfolio_heat_open_r', 0.0)), 0.0)
-        current_pending_heat_r = max(_to_float(normalized.get('portfolio_heat_pending_r', 0.0)), 0.0)
-        gross_heat_cap_r = max(_to_float(kwargs.get('gross_heat_cap_r', 0.0)), 0.0)
-        same_theme_heat_cap_r = max(_to_float(kwargs.get('same_theme_heat_cap_r', 0.0)), 0.0)
-        same_correlation_heat_cap_r = max(_to_float(kwargs.get('same_correlation_heat_cap_r', 0.0)), 0.0)
-        if gross_heat_cap_r > 0 and (current_open_heat_r + current_pending_heat_r + candidate_heat_r) >= gross_heat_cap_r:
-            reasons.append('candidate_portfolio_heat_overexposure')
-        if portfolio_narrative_bucket and max_theme > 0 and position_size_pct > 0:
-            current_theme = _to_float(normalized['portfolio_exposure_pct_by_theme'].get(portfolio_narrative_bucket))
-            if current_theme + position_size_pct >= max_theme:
-                reasons.append('candidate_portfolio_theme_overexposure')
-        if portfolio_correlation_group and max_corr > 0 and position_size_pct > 0:
-            current_corr = _to_float(normalized['portfolio_exposure_pct_by_correlation'].get(portfolio_correlation_group))
-            if current_corr + position_size_pct >= max_corr:
-                reasons.append('candidate_portfolio_correlation_overexposure')
-        if portfolio_narrative_bucket and same_theme_heat_cap_r > 0 and candidate_heat_r > 0:
-            current_theme_heat = _to_float(normalized['portfolio_heat_r_by_theme'].get(portfolio_narrative_bucket))
-            if current_theme_heat + candidate_heat_r >= same_theme_heat_cap_r:
-                reasons.append('candidate_same_theme_heat_overexposure')
-        if portfolio_correlation_group and same_correlation_heat_cap_r > 0 and candidate_heat_r > 0:
-            current_corr_heat = _to_float(normalized['portfolio_heat_r_by_correlation'].get(portfolio_correlation_group))
-            if current_corr_heat + candidate_heat_r >= same_correlation_heat_cap_r:
-                reasons.append('candidate_same_correlation_heat_overexposure')
-    return {'allowed': not reasons, 'reasons': reasons, 'cooldown_until': cooldown_until, 'normalized_risk_state': normalized}
+    return evaluate_risk_guards_impl(
+        symbol=symbol,
+        risk_state=risk_state,
+        candidate=candidate,
+        now_ts=now_ts,
+        daily_max_loss_usdt=daily_max_loss_usdt,
+        max_consecutive_losses=max_consecutive_losses,
+        symbol_cooldown_minutes=symbol_cooldown_minutes,
+        default_risk_state=default_risk_state,
+        _to_float=_to_float,
+        compute_expected_slippage_r=compute_expected_slippage_r,
+        classify_execution_liquidity_grade=classify_execution_liquidity_grade,
+        estimate_candidate_heat_r=estimate_candidate_heat_r,
+        time_module=time,
+        **kwargs,
+    )
 
 
 SIM_PROBE_ALLOWED_RISK_REASONS = {'candidate_trigger_not_fired'}
@@ -6460,17 +5930,29 @@ def monitor_live_trade(client: Any, symbol: str, meta: SymbolMeta, args: argpars
     )
 
 
+def start_trade_monitor_thread(client: Any, symbol: str, meta: SymbolMeta, args: argparse.Namespace, trade: Dict[str, Any], store: RuntimeStateStore) -> threading.Thread:
+    return execution_start_trade_monitor_thread(
+        client,
+        symbol,
+        meta,
+        args,
+        trade,
+        store,
+        monitor_live_trade_fn=monitor_live_trade,
+        thread_factory=threading.Thread,
+    )
+
+
 def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: argparse.Namespace) -> List[str]:
-    scan_top_n = int(getattr(args, 'top_n', 5) or 5)
     top_gainers = int(getattr(args, 'top_gainers', 20) or 20)
     top_losers = int(getattr(args, 'top_losers', top_gainers) or 0)
     try:
-        square_rows = fetch_square_hot_symbols(client, limit=scan_top_n)
+        square_rows = []
     except Exception:
         square_rows = []
     square_symbols = [str(row.get('symbol', '')).upper() for row in list(square_rows or []) if str(row.get('symbol', '')).strip()]
     try:
-        tickers = fetch_24h_tickers(client)
+        tickers = fetch_tickers(client)
     except Exception:
         tickers = []
     merged_payload = merged_candidate_symbols(

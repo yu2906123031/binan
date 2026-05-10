@@ -12,14 +12,18 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 SCRIPT_PATH = SCRIPTS_DIR / 'binance_futures_momentum_long.py'
 spec = importlib.util.spec_from_file_location('binance_futures_momentum_long', SCRIPT_PATH)
+assert spec is not None
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
+assert spec.loader is not None
 spec.loader.exec_module(mod)
 
 RUNTIME_STORE_PATH = SCRIPTS_DIR / 'runtime_store.py'
 runtime_store_spec = importlib.util.spec_from_file_location('runtime_store', RUNTIME_STORE_PATH)
+assert runtime_store_spec is not None
 runtime_store = importlib.util.module_from_spec(runtime_store_spec)
 sys.modules[runtime_store_spec.name] = runtime_store
+assert runtime_store_spec.loader is not None
 runtime_store_spec.loader.exec_module(runtime_store)
 
 
@@ -72,6 +76,61 @@ def make_ticker():
         'quoteVolume': '80000000',
         'lastPrice': '132',
     }
+
+
+def make_candidate_request(**overrides):
+    klines_5m, klines_15m, klines_1h, klines_4h = make_breakout_klines()
+    base = dict(
+        symbol='TESTUSDT',
+        ticker=make_ticker(),
+        klines_5m=klines_5m,
+        klines_15m=klines_15m,
+        klines_1h=klines_1h,
+        klines_4h=klines_4h,
+        meta=make_meta(),
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0014,
+        funding_rate_avg=-0.0008,
+        market_regime={'risk_on': True, 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20'], 'label': 'risk_on'},
+        legacy_kwargs={
+            'risk_usdt': 10.0,
+            'lookback_bars': 12,
+            'swing_bars': 6,
+            'min_5m_change_pct': 0.5,
+            'min_quote_volume': 1000.0,
+            'stop_buffer_pct': 0.01,
+            'max_rsi_5m': 85.0,
+            'min_volume_multiple': 1.0,
+            'max_distance_from_ema_pct': 12.0,
+            'funding_rate_threshold': 0.0005,
+            'funding_rate_avg_threshold': 0.0003,
+            'max_distance_from_vwap_pct': 12.0,
+            'max_leverage': 5,
+            'short_bias': 0.78,
+            'oi_now': 1_450_000.0,
+            'oi_5m_ago': 1_200_000.0,
+            'oi_15m_ago': 1_050_000.0,
+            'cvd_delta': 240000.0,
+            'cvd_zscore': 3.2,
+            'oi_notional_percentile': 0.82,
+            'oi_zscore_5m': 4.1,
+            'okx_sentiment_score': 0.28,
+            'okx_sentiment_acceleration': 0.42,
+            'sector_resonance_score': 0.64,
+            'smart_money_flow_score': 0.45,
+            'onchain_smart_money_score': 0.25,
+        },
+    )
+    legacy_overrides = overrides.pop('legacy_kwargs', {})
+    if legacy_overrides:
+        base['legacy_kwargs'].update(legacy_overrides)
+    base.update(overrides)
+    return mod.BuildCandidateRequest(**base)
+
+
+def build_candidate_from_request(**overrides):
+    return mod._build_candidate_from_request(make_candidate_request(**overrides))
 
 
 def test_compute_leading_sentiment_signal_rewards_early_turn_and_penalizes_overheated_sentiment():
@@ -202,51 +261,8 @@ def test_compute_market_regime_filter_blocks_when_btc_and_sol_both_break_down():
     assert 'sol_momentum_breakdown' in payload['reasons']
 
 
-def test_build_candidate_labels_short_squeeze_launch_state_when_funding_negative_and_retail_short_heavy():
-    klines_5m, klines_15m, klines_1h, klines_4h = make_breakout_klines()
-    ticker = make_ticker()
-    meta = make_meta()
-
-    candidate = mod.build_candidate(
-        symbol='TESTUSDT',
-        ticker=ticker,
-        klines_5m=klines_5m,
-        klines_15m=klines_15m,
-        klines_1h=klines_1h,
-        klines_4h=klines_4h,
-        meta=meta,
-        hot_rank=1,
-        gainer_rank=2,
-        risk_usdt=10.0,
-        lookback_bars=12,
-        swing_bars=6,
-        min_5m_change_pct=0.5,
-        min_quote_volume=1000.0,
-        stop_buffer_pct=0.01,
-        max_rsi_5m=85.0,
-        min_volume_multiple=1.0,
-        max_distance_from_ema_pct=12.0,
-        funding_rate=-0.0014,
-        funding_rate_threshold=0.0005,
-        funding_rate_avg=-0.0008,
-        funding_rate_avg_threshold=0.0003,
-        max_distance_from_vwap_pct=12.0,
-        max_leverage=5,
-        short_bias=0.78,
-        oi_now=1_450_000.0,
-        oi_5m_ago=1_200_000.0,
-        oi_15m_ago=1_050_000.0,
-        cvd_delta=240000.0,
-        cvd_zscore=3.2,
-        oi_notional_percentile=0.82,
-        oi_zscore_5m=4.1,
-        okx_sentiment_score=0.28,
-        okx_sentiment_acceleration=0.42,
-        sector_resonance_score=0.64,
-        smart_money_flow_score=0.45,
-        onchain_smart_money_score=0.25,
-        market_regime={'risk_on': True, 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20'], 'label': 'risk_on'},
-    )
+def test_build_candidate_request_path_labels_short_squeeze_launch_state_when_funding_negative_and_retail_short_heavy():
+    candidate = build_candidate_from_request()
 
     assert candidate is not None
     assert candidate.state == 'launch'
@@ -257,49 +273,27 @@ def test_build_candidate_labels_short_squeeze_launch_state_when_funding_negative
     assert any(reason.startswith('position_size_pct=') for reason in candidate.reasons)
 
 
-def test_build_candidate_blocks_when_smart_money_veto_and_distribution_risk_present():
-    klines_5m, klines_15m, klines_1h, klines_4h = make_breakout_klines()
-    ticker = make_ticker()
-
-    candidate = mod.build_candidate(
-        symbol='TESTUSDT',
-        ticker=ticker,
-        klines_5m=klines_5m,
-        klines_15m=klines_15m,
-        klines_1h=klines_1h,
-        klines_4h=klines_4h,
-        meta=make_meta(),
-        hot_rank=1,
+def test_build_candidate_request_path_blocks_when_smart_money_veto_and_distribution_risk_present():
+    candidate = build_candidate_from_request(
         gainer_rank=1,
-        risk_usdt=10.0,
-        lookback_bars=12,
-        swing_bars=6,
-        min_5m_change_pct=0.5,
-        min_quote_volume=1000.0,
-        stop_buffer_pct=0.01,
-        max_rsi_5m=85.0,
-        min_volume_multiple=1.0,
-        max_distance_from_ema_pct=12.0,
         funding_rate=0.0001,
-        funding_rate_threshold=0.0005,
         funding_rate_avg=0.0001,
-        funding_rate_avg_threshold=0.0003,
-        max_distance_from_vwap_pct=12.0,
-        max_leverage=5,
-        short_bias=0.1,
-        oi_now=1_600_000.0,
-        oi_5m_ago=1_640_000.0,
-        oi_15m_ago=1_680_000.0,
-        cvd_delta=-260000.0,
-        cvd_zscore=-3.4,
-        oi_notional_percentile=0.992,
-        oi_zscore_5m=2.8,
-        okx_sentiment_score=0.75,
-        okx_sentiment_acceleration=-0.05,
-        sector_resonance_score=0.15,
-        smart_money_flow_score=-0.72,
-        onchain_smart_money_score=-0.64,
         market_regime={'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'risk_on'},
+        legacy_kwargs={
+            'short_bias': 0.1,
+            'oi_now': 1_600_000.0,
+            'oi_5m_ago': 1_640_000.0,
+            'oi_15m_ago': 1_680_000.0,
+            'cvd_delta': -260000.0,
+            'cvd_zscore': -3.4,
+            'oi_notional_percentile': 0.992,
+            'oi_zscore_5m': 2.8,
+            'okx_sentiment_score': 0.75,
+            'okx_sentiment_acceleration': -0.05,
+            'sector_resonance_score': 0.15,
+            'smart_money_flow_score': -0.72,
+            'onchain_smart_money_score': -0.64,
+        },
     )
 
     assert candidate is not None
@@ -307,48 +301,8 @@ def test_build_candidate_blocks_when_smart_money_veto_and_distribution_risk_pres
     assert mod.apply_hard_veto_filters(candidate) == 'smart_money_outflow_veto'
 
 
-def test_build_candidate_sets_staged_entry_and_slippage_fields():
-    klines_5m, klines_15m, klines_1h, klines_4h = make_breakout_klines()
-    candidate = mod.build_candidate(
-        symbol='TESTUSDT',
-        ticker=make_ticker(),
-        klines_5m=klines_5m,
-        klines_15m=klines_15m,
-        klines_1h=klines_1h,
-        klines_4h=klines_4h,
-        meta=make_meta(),
-        hot_rank=1,
-        gainer_rank=2,
-        risk_usdt=10.0,
-        lookback_bars=12,
-        swing_bars=6,
-        min_5m_change_pct=0.5,
-        min_quote_volume=1000.0,
-        stop_buffer_pct=0.01,
-        max_rsi_5m=85.0,
-        min_volume_multiple=1.0,
-        max_distance_from_ema_pct=12.0,
-        funding_rate=-0.0014,
-        funding_rate_threshold=0.0005,
-        funding_rate_avg=-0.0008,
-        funding_rate_avg_threshold=0.0003,
-        max_distance_from_vwap_pct=12.0,
-        max_leverage=5,
-        short_bias=0.78,
-        oi_now=1_450_000.0,
-        oi_5m_ago=1_200_000.0,
-        oi_15m_ago=1_050_000.0,
-        cvd_delta=240000.0,
-        cvd_zscore=3.2,
-        oi_notional_percentile=0.82,
-        oi_zscore_5m=4.1,
-        okx_sentiment_score=0.28,
-        okx_sentiment_acceleration=0.42,
-        sector_resonance_score=0.64,
-        smart_money_flow_score=0.45,
-        onchain_smart_money_score=0.25,
-        market_regime={'risk_on': True, 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20'], 'label': 'risk_on'},
-    )
+def test_build_candidate_request_path_sets_staged_entry_and_slippage_fields():
+    candidate = build_candidate_from_request()
 
     assert candidate is not None
     assert candidate.setup_ready is False
@@ -366,55 +320,35 @@ def test_build_candidate_sets_staged_entry_and_slippage_fields():
     assert 0.0 <= candidate.book_depth_fill_ratio <= 1.0
 
 
-def test_build_candidate_blocks_when_expected_slippage_and_overextension_stay_high():
-    klines_5m, klines_15m, klines_1h, klines_4h = make_breakout_klines()
-    stretched_5m = [row[:] for row in klines_5m]
-    stretched_15m = [row[:] for row in klines_15m]
-    stretched_5m[-1][4] = '141.0'
-    stretched_5m[-1][2] = '141.5'
-    stretched_15m[-1][4] = '141.0'
-    stretched_15m[-1][2] = '141.5'
-
-    candidate = mod.build_candidate(
-        symbol='TESTUSDT',
+def test_build_candidate_request_path_blocks_when_expected_slippage_and_overextension_stay_high():
+    request = make_candidate_request(
         ticker={'symbol': 'TESTUSDT', 'priceChangePercent': '12', 'quoteVolume': '80000000', 'lastPrice': '141.0'},
-        klines_5m=stretched_5m,
-        klines_15m=stretched_15m,
-        klines_1h=klines_1h,
-        klines_4h=klines_4h,
-        meta=make_meta(),
-        hot_rank=1,
-        gainer_rank=1,
-        risk_usdt=10.0,
-        lookback_bars=12,
-        swing_bars=6,
-        min_5m_change_pct=0.5,
-        min_quote_volume=1000.0,
-        stop_buffer_pct=0.01,
-        max_rsi_5m=95.0,
-        min_volume_multiple=1.0,
-        max_distance_from_ema_pct=12.0,
-        funding_rate=0.0001,
-        funding_rate_threshold=0.0005,
-        funding_rate_avg=0.0001,
-        funding_rate_avg_threshold=0.0003,
-        max_distance_from_vwap_pct=12.0,
-        max_leverage=5,
-        short_bias=0.2,
-        oi_now=1_300_000.0,
-        oi_5m_ago=1_240_000.0,
-        oi_15m_ago=1_180_000.0,
-        cvd_delta=160000.0,
-        cvd_zscore=2.4,
-        oi_notional_percentile=0.7,
-        oi_zscore_5m=2.5,
-        okx_sentiment_score=0.12,
-        okx_sentiment_acceleration=0.1,
-        sector_resonance_score=0.15,
-        smart_money_flow_score=0.18,
-        onchain_smart_money_score=0.0,
         market_regime={'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'risk_on'},
+        legacy_kwargs={
+            'max_rsi_5m': 95.0,
+            'funding_rate_threshold': 0.0005,
+            'funding_rate_avg_threshold': 0.0003,
+            'short_bias': 0.2,
+            'oi_now': 1_300_000.0,
+            'oi_5m_ago': 1_240_000.0,
+            'oi_15m_ago': 1_180_000.0,
+            'cvd_delta': 160000.0,
+            'cvd_zscore': 2.4,
+            'oi_notional_percentile': 0.7,
+            'oi_zscore_5m': 2.5,
+            'okx_sentiment_score': 0.12,
+            'okx_sentiment_acceleration': 0.1,
+            'sector_resonance_score': 0.15,
+            'smart_money_flow_score': 0.18,
+            'onchain_smart_money_score': 0.0,
+        },
     )
+    request.klines_5m[-1][4] = '141.0'
+    request.klines_5m[-1][2] = '141.5'
+    request.klines_15m[-1][4] = '141.0'
+    request.klines_15m[-1][2] = '141.5'
+
+    candidate = mod._build_candidate_from_request(request)
 
     assert candidate is not None
     assert candidate.overextension_flag is False
@@ -777,7 +711,73 @@ def test_build_local_open_positions_for_risk_emits_rate_limited_event_on_malform
     assert event_rows[0]['state_file'] == 'positions.json'
     assert event_rows[0]['state_key'] == 'positions'
     assert event_rows[0]['fallback_used'] == 'empty_positions'
+    assert event_rows[0]['consumer'] == 'build_local_open_positions_for_risk'
     assert event_rows[0]['error_type'] == 'JSONDecodeError'
+
+
+def test_build_local_open_positions_for_risk_matches_runtime_state_helper(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'BTCUSDT': {
+            'symbol': 'btcusdt',
+            'side': 'long',
+            'remaining_quantity': '0.015',
+            'entry_price': '64000.5',
+            'notional': '960.0075',
+        },
+        'ETHUSDT:SHORT': {
+            'symbol': 'ethusdt',
+            'side': 'short',
+            'quantity': '0.25',
+            'entry_price': '3500',
+        },
+        'XRPUSDT:LONG': {
+            'symbol': 'xrpusdt',
+            'side': 'long',
+            'remaining_quantity': '0',
+            'entry_price': '0.52',
+        },
+    })
+    expected = mod.build_local_open_positions_for_risk(store)
+
+    helper_path = SCRIPTS_DIR / 'runtime_state_risk_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('runtime_state_risk_helpers', helper_path)
+    assert helper_spec is not None
+    helper_module = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_module
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_module)
+
+    positions_state, error = store.load_json_with_error('positions', {})
+    actual = helper_module.build_local_open_positions_from_state(
+        positions_state,
+        error=error,
+        normalize_position_side=mod.normalize_position_side,
+        to_float=mod._to_float,
+        iter_canonical_open_positions=mod.iter_canonical_open_positions,
+    )
+
+    assert actual == expected
+    assert actual == [
+        {
+            'symbol': 'BTCUSDT',
+            'side': 'LONG',
+            'positionSide': 'LONG',
+            'quantity': 0.015,
+            'positionAmt': 0.015,
+            'entryPrice': 64000.5,
+            'notional': 960.0075,
+        },
+        {
+            'symbol': 'ETHUSDT',
+            'side': 'SHORT',
+            'positionSide': 'SHORT',
+            'quantity': 0.25,
+            'positionAmt': -0.25,
+            'entryPrice': 3500.0,
+            'notional': 875.0,
+        },
+    ]
 
 
 def test_load_risk_state_emits_rate_limited_event_on_malformed_risk_state_json(tmp_path):
@@ -798,6 +798,117 @@ def test_load_risk_state_emits_rate_limited_event_on_malformed_risk_state_json(t
     assert event_rows[0]['fallback_used'] == 'default_risk_state'
     assert event_rows[0]['consumer'] == 'load_risk_state'
     assert event_rows[0]['error_type'] == 'JSONDecodeError'
+
+
+def test_load_risk_state_merges_defaults_and_refreshes_heat_snapshot(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('risk_state', {
+        'daily_realized_pnl': -12.5,
+        'portfolio_heat_open_r': 0.4,
+        'symbol_cooldowns': ['corrupted'],
+        'portfolio_exposure_pct_by_theme': ['bad'],
+        'portfolio_heat_r_by_theme': {'old_theme': 0.4},
+        'portfolio_heat_r_by_correlation': {'old_corr': 0.6},
+    })
+
+    monkeypatch.setattr(mod, 'compute_positions_heat_snapshot', lambda _positions: {
+        'tracked_positions': 2,
+        'open_heat_r': 1.8,
+        'heat_r_by_theme': {'ai': 1.1},
+        'heat_r_by_correlation': {'meme-beta': 0.7},
+    })
+
+    state = mod.load_risk_state(store)
+
+    assert state['daily_realized_pnl'] == -12.5
+    assert state['halted'] is False
+    assert state['symbol_cooldowns'] == {}
+    assert state['portfolio_exposure_pct_by_theme'] == {}
+    assert state['portfolio_exposure_pct_by_correlation'] == {}
+    assert state['portfolio_heat_open_r'] == 1.8
+    assert state['portfolio_heat_r_by_theme'] == {'ai': 1.1}
+    assert state['portfolio_heat_r_by_correlation'] == {'meme-beta': 0.7}
+
+
+def test_load_risk_state_preserves_existing_heat_when_snapshot_has_no_open_positions(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('risk_state', {
+        'portfolio_heat_open_r': 0.9,
+        'portfolio_heat_r_by_theme': {'defi': 0.4},
+        'portfolio_heat_r_by_correlation': {'alts': 0.5},
+    })
+
+    monkeypatch.setattr(mod, 'compute_positions_heat_snapshot', lambda _positions: {
+        'tracked_positions': 0,
+        'open_heat_r': 3.2,
+        'heat_r_by_theme': {'ignored': 9.9},
+        'heat_r_by_correlation': {'ignored': 8.8},
+    })
+
+    state = mod.load_risk_state(store)
+
+    assert state['portfolio_heat_open_r'] == 0.9
+    assert state['portfolio_heat_r_by_theme'] == {'defi': 0.4}
+    assert state['portfolio_heat_r_by_correlation'] == {'alts': 0.5}
+
+
+def test_normalize_loaded_risk_state_matches_risk_state_module(tmp_path):
+    runtime_risk_state = {
+        'daily_realized_pnl': -12.5,
+        'portfolio_heat_open_r': 0.4,
+        'symbol_cooldowns': ['corrupted'],
+        'portfolio_exposure_pct_by_theme': ['bad'],
+        'portfolio_heat_r_by_theme': {'old_theme': 0.4},
+        'portfolio_heat_r_by_correlation': {'old_corr': 0.6},
+    }
+
+    expected = mod.normalize_loaded_risk_state(runtime_risk_state)
+
+    helper_path = SCRIPTS_DIR / 'risk_state_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('risk_state_helpers', helper_path)
+    assert helper_spec is not None
+    helper_mod = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_mod
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_mod)
+
+    actual = helper_mod.normalize_loaded_risk_state(runtime_risk_state, mod.default_risk_state)
+
+    assert actual == expected
+
+
+def test_refresh_risk_state_heat_snapshot_matches_risk_state_module(monkeypatch):
+    risk_state = {
+        'portfolio_heat_open_r': 0.9,
+        'portfolio_heat_r_by_theme': {'defi': 0.4},
+        'portfolio_heat_r_by_correlation': {'alts': 0.5},
+    }
+    positions_state = {'BTCUSDT:LONG': {'symbol': 'BTCUSDT', 'position_side': 'LONG'}}
+    heat_snapshot = {
+        'tracked_positions': 2,
+        'open_heat_r': 1.8,
+        'heat_r_by_theme': {'ai': 1.1},
+        'heat_r_by_correlation': {'meme-beta': 0.7},
+    }
+
+    monkeypatch.setattr(mod, 'compute_positions_heat_snapshot', lambda _positions: dict(heat_snapshot))
+    expected = mod.refresh_risk_state_heat_snapshot(risk_state, positions_state)
+
+    helper_path = SCRIPTS_DIR / 'risk_state_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('risk_state_helpers', helper_path)
+    assert helper_spec is not None
+    helper_mod = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_mod
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_mod)
+
+    actual = helper_mod.refresh_risk_state_heat_snapshot(
+        risk_state,
+        positions_state,
+        lambda _positions: dict(heat_snapshot),
+    )
+
+    assert actual == expected
 
 
 def test_runtime_store_load_json_returns_default_for_malformed_last_cycle_json_without_rewrite(tmp_path):
@@ -2834,7 +2945,7 @@ def test_monitor_live_trade_reads_and_persists_short_side_aware_position_key(mon
 
     result = mod.monitor_live_trade(client=object(), symbol=symbol, meta=make_meta(), args=args, trade=trade, store=store)
     rows = [mod.json.loads(line) for line in (tmp_path / 'events.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
-    positions = store.load_json('positions', {})
+    store.load_json('positions', {})
     debug_state = store.load_json('monitor_debug', {})
 
     assert result['status'] == 'closed'

@@ -5,9 +5,7 @@ import pathlib
 import sys
 import tempfile
 import time
-import types
 
-import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / 'scripts'
@@ -16,10 +14,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 MAIN_MODULE_PATH = SCRIPTS_DIR / 'binance_futures_momentum_long.py'
 EXECUTION_MODULE_PATH = SCRIPTS_DIR / 'execution_engine.py'
+CANDIDATE_MODULE_PATH = SCRIPTS_DIR / 'candidate_builder.py'
 
 
 def _load_module(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -29,6 +29,7 @@ def _load_module(name: str, path: pathlib.Path):
 
 mod = _load_module('strategy_execution_mod', MAIN_MODULE_PATH)
 exec_mod = _load_module('execution_engine_mod', EXECUTION_MODULE_PATH)
+candidate_mod = _load_module('candidate_builder_mod', CANDIDATE_MODULE_PATH)
 
 
 class Client:
@@ -151,6 +152,125 @@ def make_trade(side='LONG'):
     }
 
 
+def test_build_candidate_module_exports_entry_point():
+    assert hasattr(candidate_mod, 'build_candidate')
+
+
+def test_build_candidate_wrapper_matches_extracted_module(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def fake_build_candidate_impl(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(mod, 'build_candidate_impl', fake_build_candidate_impl)
+
+    result = mod.build_candidate(
+        symbol='TESTUSDT',
+        ticker={'quoteVolume': '1000', 'priceChangePercent': '1.2'},
+        klines_5m=[[0, 1, 2, 0.5, 1.5]] * 40,
+        klines_15m=[[0, 1, 2, 0.5, 1.5]] * 30,
+        klines_1h=[[0, 1, 2, 0.5, 1.5]] * 30,
+        klines_4h=[[0, 1, 2, 0.5, 1.5]] * 30,
+        meta=make_meta(),
+        hot_rank=3,
+        gainer_rank=5,
+        funding_rate=0.001,
+        funding_rate_avg=0.0005,
+        open_interest_rows=[{'sumOpenInterest': '1'}],
+        taker_long_short_ratio_rows=[{'buySellRatio': '1.1'}],
+        top_long_short_position_ratio_rows=[{'longShortRatio': '1.2'}],
+        top_long_short_account_ratio_rows=[{'longShortRatio': '1.3'}],
+        symbol_open_interest_rows_5m=[{'sumOpenInterest': '1'}],
+        symbol_open_interest_rows_15m=[{'sumOpenInterest': '2'}],
+        market_regime={'label': 'trend'},
+        current_timestamp_ms=1710000000000,
+        okx_sentiment={'okx_sentiment_score': 1.0},
+        smart_money_context={'smart_money_flow_score': 2.0},
+    )
+
+    assert result is sentinel
+    assert captured['symbol'] == 'TESTUSDT'
+    assert captured['ticker']['quoteVolume'] == '1000'
+    assert captured['market_regime'] == {'label': 'trend'}
+    assert captured['current_timestamp_ms'] == 1710000000000
+    assert captured['Candidate'] is mod.Candidate
+    assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
+    assert captured['compute_atr'] is mod.compute_atr
+    assert captured['compute_rsi'] is mod.compute_rsi
+    assert captured['compute_vwap'] is mod.compute_vwap
+
+
+def test_build_candidate_wrapper_accepts_legacy_keyword_contract(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def fake_build_candidate_impl(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(mod, 'build_candidate_impl', fake_build_candidate_impl)
+
+    result = mod.build_candidate(
+        symbol='TESTUSDT',
+        ticker={'quoteVolume': '2000', 'priceChangePercent': '2.4'},
+        klines_5m=[[0, 1, 2, 0.5, 1.5]] * 40,
+        klines_15m=[[0, 1, 2, 0.5, 1.5]] * 30,
+        klines_1h=[[0, 1, 2, 0.5, 1.5]] * 30,
+        klines_4h=[[0, 1, 2, 0.5, 1.5]] * 30,
+        meta=make_meta(),
+        hot_rank=3,
+        gainer_rank=5,
+        risk_usdt=25.0,
+        lookback_bars=12,
+        swing_bars=6,
+        min_5m_change_pct=3.5,
+        min_quote_volume=1500000.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=78.0,
+        min_volume_multiple=1.8,
+        max_distance_from_ema_pct=6.0,
+        funding_rate=0.001,
+        funding_rate_threshold=0.003,
+        funding_rate_avg=0.0005,
+        funding_rate_avg_threshold=0.0003,
+        loser_rank=9,
+        side='short',
+        short_bias=True,
+        oi_now=123.0,
+        oi_5m_ago=100.0,
+        oi_15m_ago=90.0,
+        cvd_delta=-12.0,
+        cvd_zscore=-2.5,
+        market_regime={'label': 'distribution'},
+        okx_sentiment_score=-1.5,
+        okx_sentiment_acceleration=0.4,
+        sector_resonance_score=0.7,
+        smart_money_flow_score=-0.9,
+    )
+
+    assert result is sentinel
+    assert captured['risk_usdt'] == 25.0
+    assert captured['lookback_bars'] == 12
+    assert captured['swing_bars'] == 6
+    assert captured['min_5m_change_pct'] == 3.5
+    assert captured['stop_buffer_pct'] == 0.01
+    assert captured['loser_rank'] == 9
+    assert captured['side'] == 'short'
+    assert captured['market_regime'] == {'label': 'distribution'}
+    assert captured['okx_sentiment']['okx_sentiment_score'] == -1.5
+    assert captured['okx_sentiment']['okx_sentiment_acceleration'] == 0.4
+    assert captured['okx_sentiment']['sector_resonance_score'] == 0.7
+    assert captured['smart_money_context']['smart_money_flow_score'] == -0.9
+    assert captured['microstructure_inputs']['short_bias'] is True
+    assert captured['microstructure_inputs']['oi_now'] == 123.0
+    assert captured['microstructure_inputs']['oi_5m_ago'] == 100.0
+    assert captured['microstructure_inputs']['oi_15m_ago'] == 90.0
+    assert captured['microstructure_inputs']['cvd_delta'] == -12.0
+    assert captured['microstructure_inputs']['cvd_zscore'] == -2.5
+
+
 def test_execution_module_matches_script_ensure_symbol_margin_type():
     client_a = Client()
     client_b = Client()
@@ -225,6 +345,87 @@ def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     assert extracted_result['filled_quantity'] == 6.5
     assert extracted_result['trade_management_plan']['quantity'] == 6.5
     assert extracted_result['entry_order_feedback']['status'] == 'FILLED'
+
+
+def test_execution_module_matches_script_resolve_position_protection_status(monkeypatch):
+    positions = [{'symbol': 'DOGEUSDT', 'positionAmt': '5', 'positionSide': 'LONG'}]
+    algo_orders = [{
+        'clientAlgoId': 'expected-stop',
+        'orderType': 'STOP_MARKET',
+        'triggerPrice': '0.1234',
+        'quantity': '5',
+        'positionSide': 'LONG',
+        'side': 'SELL',
+        'symbol': 'DOGEUSDT',
+    }]
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: copy.deepcopy(positions))
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: copy.deepcopy(algo_orders))
+
+    expected_stop_order = {
+        'clientAlgoId': 'expected-stop',
+        'triggerPrice': '0.1234',
+        'quantity': '5',
+        'positionSide': 'LONG',
+        'side': 'SELL',
+    }
+
+    script_result = mod.resolve_position_protection_status(
+        client=object(),
+        symbol='DOGEUSDT',
+        expected_stop_order=copy.deepcopy(expected_stop_order),
+        side='LONG',
+    )
+    extracted_result = exec_mod.resolve_position_protection_status(
+        client=object(),
+        symbol='DOGEUSDT',
+        expected_stop_order=copy.deepcopy(expected_stop_order),
+        side='LONG',
+        position_side_long=mod.POSITION_SIDE_LONG,
+        normalize_position_side=mod.normalize_position_side,
+        fetch_open_positions=mod.fetch_open_positions,
+        fetch_open_orders=mod.fetch_open_orders,
+        fetch_open_algo_orders=mod.fetch_open_algo_orders,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        _to_float=mod._to_float,
+    )
+
+    assert script_result == extracted_result
+    assert extracted_result['status'] == 'protected'
+    assert extracted_result['matched_via'] == 'open_algo_orders'
+
+
+
+def test_execution_module_matches_script_repair_missing_protection(monkeypatch):
+    tracked = {'side': 'LONG', 'stop_price': 98.5}
+    active_position = {'positionAmt': '3', 'positionSide': 'LONG'}
+    meta = make_meta('DOGEUSDT')
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 777, 'clientOrderId': 'repair-stop'})
+
+    script_result = mod.repair_missing_protection(
+        client=object(),
+        symbol='DOGEUSDT',
+        tracked=copy.deepcopy(tracked),
+        active_position=copy.deepcopy(active_position),
+        meta=meta,
+    )
+    extracted_result = exec_mod.repair_missing_protection(
+        client=object(),
+        symbol='DOGEUSDT',
+        tracked=copy.deepcopy(tracked),
+        active_position=copy.deepcopy(active_position),
+        meta=meta,
+        normalize_position_side=mod.normalize_position_side,
+        place_stop_market_order=mod.place_stop_market_order,
+        fetch_exchange_meta=mod.fetch_exchange_meta,
+        _to_float=mod._to_float,
+    )
+
+    assert script_result == extracted_result
+    assert extracted_result['ok'] is True
+    assert extracted_result['stop_order']['orderId'] == 777
 
 
 def test_execution_module_matches_script_monitor_live_trade(monkeypatch):
@@ -327,6 +528,13 @@ def test_execution_module_matches_script_monitor_live_trade(monkeypatch):
     normalized_events_a = normalize_event_rows(events_a)
     normalized_events_b = normalize_event_rows(events_b)
 
+    trade_invalidated_a = next((row for row in normalized_events_a if row.get('event_type') == 'trade_invalidated'), None)
+    trade_invalidated_b = next((row for row in normalized_events_b if row.get('event_type') == 'trade_invalidated'), None)
+    assert trade_invalidated_a is not None
+    assert trade_invalidated_b is not None
+    trade_invalidated_a.pop('consumer', None)
+    trade_invalidated_b.pop('consumer', None)
+
     assert script_result == extracted_result
     assert store_a.load_json('positions', {}) == store_b.load_json('positions', {})
     assert store_a.load_json('monitor_debug', {}) == store_b.load_json('monitor_debug', {})
@@ -338,6 +546,96 @@ def test_execution_module_matches_script_monitor_live_trade(monkeypatch):
 
 def test_execution_module_matches_script_start_trade_monitor_thread(monkeypatch):
     assert hasattr(exec_mod, 'start_trade_monitor_thread')
+
+
+def test_execution_module_monitor_live_trade_supports_injected_position_state(monkeypatch):
+    symbol = 'TESTUSDT'
+    position_key = 'TESTUSDT:LONG'
+    args = make_args()
+    trade = make_trade('LONG')
+    meta = make_meta(symbol)
+    shared_store = mod.RuntimeStateStore(tempfile.mkdtemp())
+    seeded_positions = {
+        position_key: {
+            'symbol': symbol,
+            'side': 'LONG',
+            'position_key': position_key,
+            'status': 'monitoring',
+            'quantity': 1.0,
+            'remaining_quantity': 1.0,
+            '_debug_current_price': 111.0,
+            '_debug_ema5m': 110.0,
+            '_debug_trailing_reference': 112.0,
+        }
+    }
+    shared_store.save_json('positions', copy.deepcopy(seeded_positions))
+
+    monkeypatch.setattr(mod, 'fetch_klines', lambda *a, **k: [[0, 0, 0, 0, 100.0]] * 21)
+    monkeypatch.setattr(mod, 'extract_closes', lambda klines: [100.0] * len(klines))
+    monkeypatch.setattr(mod, 'extract_highs', lambda klines: [112.0] * len(klines))
+    monkeypatch.setattr(mod, 'extract_lows', lambda klines: [99.0] * len(klines))
+    monkeypatch.setattr(mod, 'evaluate_management_actions', lambda *a, **k: [{'type': 'take_profit_1', 'close_qty': 1.0, 'exit_reason': 'tp1'}])
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, 'sleep', lambda *_a, **_k: None)
+
+    def fake_apply(_client, _symbol, _meta, state, action, _active_stop_order):
+        action['exit_reason'] = 'tp1'
+        state.remaining_quantity = 0.0
+        state.tp1_hit = True
+        return state, None, {'reduce_order': {'orderId': 888, 'avgPrice': '111.0'}}
+
+    monkeypatch.setattr(mod, 'apply_management_action', fake_apply)
+
+    initial_positions = copy.deepcopy(seeded_positions)
+    result = exec_mod.monitor_live_trade(
+        client=object(),
+        symbol=symbol,
+        meta=meta,
+        args=args,
+        trade=copy.deepcopy(trade),
+        store=shared_store,
+        initial_positions_state=initial_positions,
+        trade_management_plan_type=mod.TradeManagementPlan,
+        trade_management_state_type=mod.TradeManagementState,
+        position_side_long=mod.POSITION_SIDE_LONG,
+        position_side_short=mod.POSITION_SIDE_SHORT,
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        normalize_position_side=mod.normalize_position_side,
+        position_side_to_trade_side=mod.position_side_to_trade_side,
+        build_position_key=mod.build_position_key,
+        get_position_by_symbol_side=mod.get_position_by_symbol_side,
+        build_trade_analytics_snapshot=mod.build_trade_analytics_snapshot,
+        upsert_position_record=mod.upsert_position_record,
+        materialize_positions_state=mod.materialize_positions_state,
+        asdict=mod.asdict,
+        log_runtime_event=mod.log_runtime_event,
+        emit_notification=mod.emit_notification,
+        fetch_klines=mod.fetch_klines,
+        extract_closes=mod.extract_closes,
+        extract_highs=mod.extract_highs,
+        extract_lows=mod.extract_lows,
+        resolve_monitor_current_price=mod.resolve_monitor_current_price,
+        evaluate_management_actions=mod.evaluate_management_actions,
+        update_trade_progress_metrics=mod.update_trade_progress_metrics,
+        apply_management_action=mod.apply_management_action,
+        resolve_reduce_order_exit_price=mod.resolve_reduce_order_exit_price,
+        compute_trade_realized_r_increment=mod.compute_trade_realized_r_increment,
+        score_to_decile_label=mod.score_to_decile_label,
+        resolve_trigger_class=mod.resolve_trigger_class,
+        utc_now=mod._utc_now,
+        isoformat_utc=mod._isoformat_utc,
+        time_module=mod.time,
+    )
+
+    assert result['status'] == 'closed'
+    assert result['exit_reason'] == 'tp1'
+    persisted_positions = shared_store.load_json('positions', {})
+    assert persisted_positions == {}
+    assert shared_store.load_json('monitor_debug', {})['position_state_source'] == 'injected'
+    assert initial_positions[position_key]['status'] == 'monitoring'
+
 
 
 def test_execution_module_requires_monitor_live_trade_export():
