@@ -42,6 +42,31 @@
 
 ## 已完成升级记录
 
+### 2026-05-10｜下沉 build_local_open_positions_for_risk consumer helper
+- 状态：已完成
+- 范围：把 `build_local_open_positions_for_risk(...)` 的 positions 读取与 degraded-event envelope 一起下沉到独立 runtime-state consumer helper，并补齐 malformed positions 的 module parity 回归
+- 修改文件：
+  - `scripts/runtime_state_risk_helpers.py`
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 在 `scripts/runtime_state_risk_helpers.py` 新增 `load_local_open_positions_for_risk(...)`，集中承载 `positions.json` 读取、`runtime_state_degraded` 限流事件发射与 fallback envelope
+  - 主脚本 `build_local_open_positions_for_risk(...)` 收敛为 wrapper，仅负责把 `_should_emit_runtime_state_degraded`、`append_rate_limited_runtime_event`、`iter_canonical_open_positions` 等依赖注入到 helper
+  - 新增 malformed `positions.json` 场景的 consumer-helper parity regression，直接校验主脚本 wrapper 与 helper 在事件 payload 与空结果上的一致性
+  - 保留既有 `build_local_open_positions_from_state(...)` helper，形成“读取 envelope / 状态转 rows”两层边界
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k "build_local_open_positions_for_risk_matches_runtime_state_consumer_helper_on_malformed_positions_json or build_local_open_positions_for_risk_matches_runtime_state_helper"` → RED：`1 failed, 1 passed`，报错 `AttributeError: module 'runtime_state_risk_helpers' has no attribute 'load_local_open_positions_for_risk'`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k "build_local_open_positions_for_risk_matches_runtime_state_consumer_helper_on_malformed_positions_json or build_local_open_positions_for_risk_matches_runtime_state_helper or build_local_open_positions_for_risk_emits_rate_limited_event_on_malformed_positions_json"` → RED：`2 failed, 1 passed`，报错 `TypeError: append_rate_limited_runtime_event() missing 1 required positional argument: 'key'`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k "build_local_open_positions_for_risk_matches_runtime_state_consumer_helper_on_malformed_positions_json or build_local_open_positions_for_risk_matches_runtime_state_helper or build_local_open_positions_for_risk_emits_rate_limited_event_on_malformed_positions_json"` → `3 passed, 73 deselected in 0.15s`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py` → `88 passed in 0.38s`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py scripts/risk_state_helpers.py scripts/runtime_state_risk_helpers.py tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py` → 通过
+- 遗留风险：
+  - `load_risk_state(...)` 仍直接读取 `positions` 并驱动 heat snapshot，下一步适合继续把该 consumer 边界与 `load_local_open_positions_for_risk(...)` 共享的读取 / degraded 语义继续收口
+  - `runtime_state_risk_helpers.py` 当前尚未纳入项目级 mypy 文件列表
+- 对应待办编号：
+  - P1-5h
+
 ### 2026-05-10｜下沉 build_local_open_positions_for_risk runtime-state helper
 - 状态：已完成
 - 范围：围绕 `build_local_open_positions_for_risk(...)` 的 positions 读取边界，抽出 runtime-state risk helper，并补充 wrapper / module parity 回归与 degraded event consumer 字段校验
@@ -642,6 +667,7 @@
   - [x] P1-5e 拆 `load_risk_state` 内部归一化 / heat snapshot helper
   - [x] P1-5f 下沉 `risk_state_helpers.py` 并补主脚本 / 模块 parity 回归
   - [x] P1-5g 下沉 `runtime_state_risk_helpers.py` 并补 `build_local_open_positions_for_risk(...)` parity / degraded event 回归
+  - [x] P1-5h 下沉 `load_local_open_positions_for_risk(...)`，收口 positions 读取 + degraded event envelope consumer helper
 - 验证：
   - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
   - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py -k "build_candidate_wrapper or smart_money_veto or malformed_positions_json or malformed_risk_state_json or build_trade_management_plan_from_position or reconcile_runtime_state"`
@@ -705,4 +731,4 @@
 ---
 
 ## 下一步建议
-按顺序执行：继续把 `build_local_open_positions_for_risk(...)` 的 store 级 degraded event 节流与 positions 读取 envelope 一起下沉到更完整的 runtime-state consumer helper → 把 `risk_state_helpers.py` 与 `runtime_state_risk_helpers.py` 连同对应回归一起纳入项目级 mypy 覆盖范围 → 继续缩短 runtime-state risk 路径对主脚本集成回归的依赖，补独立 helper 直连测试
+按顺序执行：继续把 `load_risk_state(...)` 读取 `positions` 并刷新 heat snapshot 的 consumer 边界，与 `load_local_open_positions_for_risk(...)` 共享的 runtime-state degraded / fallback 语义进一步收口 → 把 `risk_state_helpers.py` 与 `runtime_state_risk_helpers.py` 连同对应回归一起纳入项目级 mypy 覆盖范围 → 继续缩短 runtime-state risk 路径对主脚本集成回归的依赖，补独立 helper 直连测试

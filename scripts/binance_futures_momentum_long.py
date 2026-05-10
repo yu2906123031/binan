@@ -24,7 +24,7 @@ from execution_engine import ensure_symbol_margin_type as execution_ensure_symbo
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
-from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl
+from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl, load_local_open_positions_for_risk as load_local_open_positions_for_risk_impl
 from runtime_store import RuntimeStateStore as RuntimeStateStoreImpl, restore_position_lifecycle_fields as restore_position_lifecycle_fields_impl, save_positions_state as save_positions_state_impl
 
 try:
@@ -2366,17 +2366,11 @@ def _should_emit_runtime_state_degraded(store: RuntimeStateStore, state_key: str
 
 
 def build_local_open_positions_for_risk(store: RuntimeStateStore) -> List[Dict[str, Any]]:
-    positions_state, error = store.load_json_with_error('positions', {})
-    if error:
-        if _should_emit_runtime_state_degraded(store, 'positions'):
-            store.append_event('runtime_state_degraded', {
-                **error,
-                'fallback_used': 'empty_positions',
-                'consumer': 'build_local_open_positions_for_risk',
-            })
-    return build_local_open_positions_from_state_impl(
-        positions_state,
-        error=error,
+    return load_local_open_positions_for_risk_impl(
+        store,
+        should_emit_runtime_state_degraded=_should_emit_runtime_state_degraded,
+        append_runtime_state_degraded_event=append_rate_limited_runtime_event,
+        build_local_open_positions_from_state=build_local_open_positions_from_state_impl,
         normalize_position_side=normalize_position_side,
         to_float=_to_float,
         iter_canonical_open_positions=iter_canonical_open_positions,

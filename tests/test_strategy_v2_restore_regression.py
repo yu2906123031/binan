@@ -780,6 +780,47 @@ def test_build_local_open_positions_for_risk_matches_runtime_state_helper(tmp_pa
     ]
 
 
+def test_build_local_open_positions_for_risk_matches_runtime_state_consumer_helper_on_malformed_positions_json(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    (tmp_path / 'positions.json').write_text('{bad json', encoding='utf-8')
+
+    expected_rows = mod.build_local_open_positions_for_risk(store)
+    expected_events = store.read_events(limit=10)
+
+    helper_path = SCRIPTS_DIR / 'runtime_state_risk_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('runtime_state_risk_helpers', helper_path)
+    assert helper_spec is not None
+    helper_module = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_module
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_module)
+
+    helper_root = tmp_path / 'helper-store'
+    helper_root.mkdir(parents=True, exist_ok=True)
+    (helper_root / 'positions.json').write_text('{bad json', encoding='utf-8')
+    helper_store = mod.RuntimeStateStore(str(helper_root))
+
+    actual_rows = helper_module.load_local_open_positions_for_risk(
+        helper_store,
+        should_emit_runtime_state_degraded=mod._should_emit_runtime_state_degraded,
+        append_runtime_state_degraded_event=mod.append_rate_limited_runtime_event,
+        build_local_open_positions_from_state=helper_module.build_local_open_positions_from_state,
+        normalize_position_side=mod.normalize_position_side,
+        to_float=mod._to_float,
+        iter_canonical_open_positions=mod.iter_canonical_open_positions,
+    )
+    actual_events = helper_store.read_events(limit=10)
+
+    assert actual_rows == expected_rows == []
+    assert len(expected_events) == 1
+    assert len(actual_events) == 1
+    assert expected_events[0]['event_type'] == actual_events[0]['event_type'] == 'runtime_state_degraded'
+    assert expected_events[0]['state_key'] == actual_events[0]['state_key'] == 'positions'
+    assert expected_events[0]['state_file'] == actual_events[0]['state_file'] == 'positions.json'
+    assert expected_events[0]['fallback_used'] == actual_events[0]['fallback_used'] == 'empty_positions'
+    assert expected_events[0]['consumer'] == actual_events[0]['consumer'] == 'build_local_open_positions_for_risk'
+
+
 def test_load_risk_state_emits_rate_limited_event_on_malformed_risk_state_json(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     (tmp_path / 'risk_state.json').write_text('{bad json', encoding='utf-8')
