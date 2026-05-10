@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import importlib.util
 import sys
 from pathlib import Path
@@ -693,6 +694,963 @@ def test_run_loop_records_rejection_event_when_max_open_positions_blocks_trade(m
     assert rows[-1]['event_type'] == 'candidate_rejected'
     assert rows[-1]['symbol'] == 'TESTUSDT'
     assert rows[-1]['reasons'] == ['max_open_positions_reached']
+
+
+def test_run_auto_loop_user_data_stream_monitor_returns_skipped_payload_for_okx_simulated(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(okx_simulated_trading=True)
+    fixed_now = datetime.datetime(2026, 5, 10, 12, 0, tzinfo=datetime.timezone.utc)
+
+    monkeypatch.setattr(mod, '_utc_now', lambda: fixed_now)
+
+    result = mod.run_auto_loop_user_data_stream_monitor(client=object(), store=store, args=args)
+    saved_state = store.load_json('user_data_stream', {})
+
+    assert result['alert'] is None
+    assert result['monitor']['status'] == 'skipped'
+    assert result['monitor']['exchange'] == 'OKX_SIMULATED'
+    assert result['monitor']['now_utc'] == mod._isoformat_utc(fixed_now)
+    assert saved_state == result['monitor']
+
+
+def test_run_auto_loop_user_data_stream_monitor_cycles_existing_listen_key_and_emits_alert(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('user_data_stream', {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'})
+    store.save_json('positions', {
+        'TESTUSDT:LONG': {
+            'symbol': 'TESTUSDT',
+            'position_side': 'LONG',
+        }
+    })
+    args = argparse.Namespace(
+        okx_simulated_trading=False,
+        user_stream_refresh_interval_minutes=12.5,
+        user_stream_disconnect_timeout_minutes=34.0,
+        disable_notify=False,
+        notify_target='',
+    )
+    fake_monitor = {
+        'status': 'refresh_failed',
+        'action': 'refresh_failed',
+        'listen_key': 'lk-1',
+        'error': 'boom',
+        'health': {
+            'symbol': 'TESTUSDT',
+            'detail': 'boom',
+            'disconnect_count': 2,
+            'refresh_failure_count': 3,
+            'reconnect_count': 4,
+            'started_at': '2026-05-10T11:00:00+00:00',
+            'last_refresh_at': '2026-05-10T11:30:00+00:00',
+            'updated_at': '2026-05-10T11:31:00+00:00',
+        },
+        'now_utc': '2026-05-10T11:31:00+00:00',
+    }
+    recorded_notifications = []
+    client = object()
+
+    def fake_cycle(**kwargs):
+        assert kwargs['client'] is client
+        assert kwargs['store'] is store
+        assert kwargs['symbol'] == 'TESTUSDT'
+        assert kwargs['refresh_interval_minutes'] == 12.5
+        assert kwargs['disconnect_timeout_minutes'] == 34.0
+        return dict(fake_monitor)
+
+    def fake_emit_notification(notify_args, event_type, payload):
+        recorded_notifications.append((notify_args, event_type, payload))
+
+    monkeypatch.setattr(mod, 'run_user_data_stream_monitor_cycle', fake_cycle)
+    monkeypatch.setattr(mod, 'emit_notification', fake_emit_notification)
+
+    result = mod.run_auto_loop_user_data_stream_monitor(client=client, store=store, args=args)
+    positions_state = store.load_json('positions', {})
+
+    assert result['monitor'] == fake_monitor
+    assert result['alert']['status'] == 'refresh_failed'
+    assert result['alert']['symbol'] == 'TESTUSDT'
+    assert positions_state['TESTUSDT:LONG']['user_data_stream']['listen_key'] == 'lk-1'
+    assert recorded_notifications == [(args, 'user_data_stream_alert', result['alert'])]
+
+
+def test_run_auto_loop_user_data_stream_monitor_returns_empty_payload_without_existing_listen_key(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(okx_simulated_trading=False)
+
+    result = mod.run_auto_loop_user_data_stream_monitor(client=object(), store=store, args=args)
+
+    assert result == {'monitor': None, 'alert': None}
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_uses_supervisor_and_health(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(auto_loop=True)
+    ws_module = object()
+    supervisor_calls = []
+
+    monkeypatch.setattr(mod, 'websocket', ws_module)
+    monkeypatch.setattr(mod, 'resolve_auto_loop_book_ticker_symbols', lambda client, args: ['BTCUSDT', 'ETHUSDT'])
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'store': store_arg,
+            'initial_symbols': list(initial_symbols),
+            'ws_module': ws_module,
+            'provider_symbols': list(symbol_provider()),
+        })
+        store_arg.save_json('book_ticker_ws_status', {'status': 'healthy', 'messages_processed': 7})
+        return {'cycles_completed': 1, 'subscription_version': 2, 'symbols': ['BTCUSDT', 'ETHUSDT']}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(client=object(), store=store, args=args)
+
+    assert supervisor_calls == [{
+        'store': store,
+        'initial_symbols': ['BTCUSDT', 'ETHUSDT'],
+        'ws_module': ws_module,
+        'provider_symbols': ['BTCUSDT', 'ETHUSDT'],
+    }]
+    assert result == {
+        'status': 'available',
+        'summary': {
+            'cycles_completed': 1,
+            'subscription_version': 2,
+            'symbols': ['BTCUSDT', 'ETHUSDT'],
+        },
+        'health': {'status': 'healthy', 'messages_processed': 7},
+    }
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_marks_unavailable_without_websocket(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(auto_loop=True)
+    events = []
+
+    monkeypatch.setattr(mod, 'websocket', None)
+    monkeypatch.setattr(
+        mod,
+        'append_rate_limited_runtime_event',
+        lambda store_arg, event_type, payload, **kwargs: events.append({
+            'store': store_arg,
+            'event_type': event_type,
+            'payload': payload,
+            'kwargs': kwargs,
+        }),
+    )
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(client=object(), store=store, args=args)
+
+    assert result == {
+        'status': 'unavailable',
+        'summary': {'status': 'unavailable', 'reason': 'websocket_client_missing'},
+        'health': {},
+    }
+    assert events == [{
+        'store': store,
+        'event_type': 'book_ticker_ws_unavailable',
+        'payload': {
+            'event_source': 'book_ticker_websocket',
+            'reason': 'websocket_client_missing',
+        },
+        'kwargs': {'key': 'global', 'min_interval_seconds': 3600.0},
+    }]
+
+
+def test_build_auto_loop_user_data_stream_monitor_config_reads_explicit_fields_only():
+    args = argparse.Namespace(
+        okx_simulated_trading=True,
+        user_stream_refresh_interval_minutes=12.5,
+        user_stream_disconnect_timeout_minutes=34.0,
+        unrelated_field='ignored',
+    )
+
+    config = mod.build_auto_loop_user_data_stream_monitor_config(args)
+
+    assert config == mod.AutoLoopUserDataStreamMonitorConfig(
+        okx_simulated_trading=True,
+        refresh_interval_minutes=12.5,
+        disconnect_timeout_minutes=34.0,
+    )
+
+
+def test_run_auto_loop_user_data_stream_monitor_uses_explicit_config_without_args_namespace(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('user_data_stream', {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'})
+    recorded = {}
+
+    def fake_cycle(**kwargs):
+        recorded.update(kwargs)
+        return {
+            'status': 'healthy',
+            'listen_key': 'lk-1',
+            'symbol': 'TESTUSDT',
+            'refresh_failure_count': 0,
+            'disconnect_count': 0,
+        }
+
+    monkeypatch.setattr(mod, 'run_user_data_stream_monitor_cycle', fake_cycle)
+    monkeypatch.setattr(mod, 'emit_user_data_stream_alert_if_needed', lambda args, symbol, monitor: None)
+
+    config = mod.AutoLoopUserDataStreamMonitorConfig(
+        okx_simulated_trading=False,
+        refresh_interval_minutes=22.0,
+        disconnect_timeout_minutes=44.0,
+    )
+
+    result = mod.run_auto_loop_user_data_stream_monitor(
+        client=object(),
+        store=store,
+        args=object(),
+        config=config,
+    )
+
+    assert recorded['refresh_interval_minutes'] == 22.0
+    assert recorded['disconnect_timeout_minutes'] == 44.0
+    assert result['monitor']['symbol'] == 'TESTUSDT'
+    assert result['alert'] is None
+
+
+def test_build_auto_loop_book_ticker_monitor_optional_store_seams_wires_loader_and_emitter(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    expected_loader = object()
+    expected_emitter = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_health_loader',
+        lambda store, health_store_key='book_ticker_ws_status': expected_loader,
+    )
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_unavailable_event_emitter',
+        lambda store: expected_emitter,
+    )
+
+    seams = mod.build_auto_loop_book_ticker_monitor_optional_store_seams(
+        store=store,
+        health_store_key='book_ticker_ws_status',
+    )
+
+    assert seams == {
+        'health_loader': expected_loader,
+        'unavailable_event_emitter': expected_emitter,
+    }
+
+
+def test_build_auto_loop_book_ticker_monitor_default_seams_wires_probe_and_summary_builder(monkeypatch):
+    expected_probe = object()
+    expected_summary_builder = object()
+
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_websocket_capability_probe', lambda: expected_probe)
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_unavailable_summary_builder', lambda: expected_summary_builder)
+
+    seams = mod.build_auto_loop_book_ticker_monitor_default_seams()
+
+    assert seams == {
+        'websocket_capability_probe': expected_probe,
+        'unavailable_summary_builder': expected_summary_builder,
+    }
+
+
+def test_build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker(monkeypatch, tmp_path):
+    args = argparse.Namespace(auto_loop=True, another_field='ignored')
+    expected_provider = object()
+    expected_store_seams = {
+        'health_loader': object(),
+        'unavailable_event_emitter': object(),
+    }
+    expected_default_seams = {
+        'websocket_capability_probe': object(),
+        'unavailable_summary_builder': object(),
+    }
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_symbol_provider',
+        lambda client, args: expected_provider,
+    )
+    monkeypatch.setattr(
+        mod,
+        'build_auto_loop_book_ticker_monitor_optional_store_seams',
+        lambda store, health_store_key='book_ticker_ws_status': expected_store_seams,
+    )
+    monkeypatch.setattr(
+        mod,
+        'build_auto_loop_book_ticker_monitor_default_seams',
+        lambda: expected_default_seams,
+    )
+
+    config = mod.build_auto_loop_book_ticker_websocket_monitor_config(client=object(), args=args, store=store)
+
+    assert config == mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=expected_provider,
+        health_loader=expected_store_seams['health_loader'],
+        health_store_key='book_ticker_ws_status',
+        websocket_capability_probe=expected_default_seams['websocket_capability_probe'],
+        unavailable_event_emitter=expected_store_seams['unavailable_event_emitter'],
+        unavailable_summary_builder=expected_default_seams['unavailable_summary_builder'],
+        unavailable_reason='websocket_client_missing',
+        max_supervisor_cycles=1,
+    )
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_uses_explicit_config_without_args_namespace(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    supervisor_calls = []
+    ws_module = object()
+    provider_calls = []
+    health_loader_calls = []
+
+    monkeypatch.setattr(mod, 'websocket', ws_module)
+
+    def fake_provider():
+        provider_calls.append('called')
+        return ['BTCUSDT']
+
+    def fake_health_loader():
+        health_loader_calls.append('called')
+        return {'status': 'healthy', 'messages_processed': 9}
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'store': store_arg,
+            'initial_symbols': list(initial_symbols),
+            'provider_symbols': list(symbol_provider()),
+            'ws_module': ws_module,
+            'max_supervisor_cycles': kwargs.get('max_supervisor_cycles'),
+        })
+        return {'cycles_completed': 1}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(
+        client=object(),
+        store=store,
+        args=object(),
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            symbol_provider=fake_provider,
+            health_loader=fake_health_loader,
+            health_store_key='custom_health_key',
+            max_supervisor_cycles=7,
+        ),
+    )
+
+    assert provider_calls == ['called', 'called']
+    assert health_loader_calls == ['called']
+    assert supervisor_calls == [{
+        'store': store,
+        'initial_symbols': ['BTCUSDT'],
+        'provider_symbols': ['BTCUSDT'],
+        'ws_module': ws_module,
+        'max_supervisor_cycles': 7,
+    }]
+    assert result == {
+        'status': 'available',
+        'summary': {'cycles_completed': 1},
+        'health': {'status': 'healthy', 'messages_processed': 9},
+    }
+
+
+def test_build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter(monkeypatch, tmp_path):
+    args = argparse.Namespace(auto_loop=True)
+    store = mod.RuntimeStateStore(str(tmp_path))
+    expected_provider = object()
+    expected_loader = object()
+    expected_probe = object()
+    expected_emitter = object()
+    expected_summary_builder = object()
+
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_symbol_provider', lambda client, args: expected_provider)
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_health_loader', lambda store, health_store_key='book_ticker_ws_status': expected_loader)
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_websocket_capability_probe', lambda: expected_probe)
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_unavailable_event_emitter', lambda store: expected_emitter)
+    monkeypatch.setattr(mod, 'make_auto_loop_book_ticker_unavailable_summary_builder', lambda: expected_summary_builder)
+
+    config = mod.build_auto_loop_book_ticker_websocket_monitor_config(client=object(), args=args, store=store)
+
+    assert config == mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=expected_provider,
+        health_loader=expected_loader,
+        health_store_key='book_ticker_ws_status',
+        websocket_capability_probe=expected_probe,
+        unavailable_event_emitter=expected_emitter,
+        unavailable_summary_builder=expected_summary_builder,
+        unavailable_reason='websocket_client_missing',
+        max_supervisor_cycles=1,
+    )
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_complete_config_path_avoids_fallback_builders(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    supervisor_calls = []
+    ws_module = object()
+
+    monkeypatch.setattr(mod, 'websocket', ws_module)
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_symbol_provider',
+        lambda client, args: (_ for _ in ()).throw(AssertionError('symbol fallback builder should stay unused')),
+    )
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_health_loader',
+        lambda store, health_store_key='book_ticker_ws_status': (_ for _ in ()).throw(AssertionError('health fallback builder should stay unused')),
+    )
+    monkeypatch.setattr(
+        mod,
+        'build_auto_loop_book_ticker_websocket_monitor_config',
+        lambda client, args, store=None: (_ for _ in ()).throw(AssertionError('config builder should stay unused')),
+    )
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'store': store_arg,
+            'initial_symbols': list(initial_symbols),
+            'provider_symbols': list(symbol_provider()),
+            'ws_module': ws_module,
+        })
+        return {'cycles_completed': 3}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(
+        client=object(),
+        store=store,
+        args=object(),
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            symbol_provider=lambda: ['SOLUSDT'],
+            health_loader=lambda: {'status': 'healthy', 'messages_processed': 11},
+        ),
+    )
+
+    assert supervisor_calls == [{
+        'store': store,
+        'initial_symbols': ['SOLUSDT'],
+        'provider_symbols': ['SOLUSDT'],
+        'ws_module': ws_module,
+    }]
+    assert result == {
+        'status': 'available',
+        'summary': {'cycles_completed': 3},
+        'health': {'status': 'healthy', 'messages_processed': 11},
+    }
+
+
+def test_resolve_auto_loop_book_ticker_websocket_capability_probe_prefers_config_probe(monkeypatch):
+    expected_probe = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_websocket_capability_probe',
+        lambda: (_ for _ in ()).throw(AssertionError('fallback probe factory should stay unused')),
+    )
+
+    result = mod.resolve_auto_loop_book_ticker_websocket_capability_probe(
+        mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            websocket_capability_probe=expected_probe,
+        )
+    )
+
+    assert result is expected_probe
+
+
+def test_resolve_auto_loop_book_ticker_unavailable_summary_builder_prefers_config_builder(monkeypatch):
+    expected_builder = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_unavailable_summary_builder',
+        lambda: (_ for _ in ()).throw(AssertionError('fallback summary builder factory should stay unused')),
+    )
+
+    result = mod.resolve_auto_loop_book_ticker_unavailable_summary_builder(
+        mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            unavailable_summary_builder=expected_builder,
+        )
+    )
+
+    assert result is expected_builder
+
+
+def test_resolve_auto_loop_book_ticker_unavailable_event_emitter_prefers_config_emitter(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    expected_emitter = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_unavailable_event_emitter',
+        lambda store: (_ for _ in ()).throw(AssertionError('fallback event emitter factory should stay unused')),
+    )
+
+    result = mod.resolve_auto_loop_book_ticker_unavailable_event_emitter(
+        store=store,
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            unavailable_event_emitter=expected_emitter,
+        ),
+    )
+
+    assert result is expected_emitter
+
+
+def test_resolve_auto_loop_book_ticker_health_loader_prefers_config_loader(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    expected_loader = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_health_loader',
+        lambda store, health_store_key='book_ticker_ws_status': (_ for _ in ()).throw(AssertionError('fallback health loader factory should stay unused')),
+    )
+
+    result = mod.resolve_auto_loop_book_ticker_health_loader(
+        store=store,
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            health_loader=expected_loader,
+            health_store_key='custom_health_key',
+        ),
+    )
+
+    assert result is expected_loader
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    ws_module = object()
+    branch_calls = []
+
+    def fake_probe():
+        return ws_module
+
+    def fake_available_branch(*, store, config, ws_module):
+        branch_calls.append({
+            'kind': 'available',
+            'store': store,
+            'config': config,
+            'ws_module': ws_module,
+        })
+        return {'status': 'available', 'summary': {'cycles_completed': 5}, 'health': {'status': 'healthy'}}
+
+    monkeypatch.setattr(mod, 'resolve_auto_loop_book_ticker_websocket_capability_probe', lambda config: fake_probe)
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor_available_branch', fake_available_branch)
+    monkeypatch.setattr(
+        mod,
+        'run_auto_loop_book_ticker_websocket_monitor_unavailable_branch',
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError('core should dispatch to available branch')),
+    )
+    monkeypatch.setattr(
+        mod,
+        'run_book_ticker_websocket_supervisor',
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('core should stay at orchestration level')),
+    )
+
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=lambda: ['BNBUSDT'],
+        health_loader=lambda: {'status': 'healthy', 'messages_processed': 17},
+        max_supervisor_cycles=9,
+    )
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor_core(
+        store=store,
+        config=config,
+    )
+
+    assert branch_calls == [{
+        'kind': 'available',
+        'store': store,
+        'config': config,
+        'ws_module': ws_module,
+    }]
+    assert result == {'status': 'available', 'summary': {'cycles_completed': 5}, 'health': {'status': 'healthy'}}
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    events = []
+    summary_calls = []
+    result_calls = []
+
+    def fake_summary_builder(reason):
+        summary_calls.append(reason)
+        return {'status': 'unavailable', 'reason': reason, 'source': 'test'}
+
+    def fake_emitter(summary):
+        events.append(summary)
+
+    def fake_result_builder(*, summary):
+        result_calls.append(summary)
+        return {
+            'status': 'unavailable',
+            'summary': summary,
+            'health': {'source': 'result-builder'},
+        }
+
+    monkeypatch.setattr(mod, 'build_auto_loop_book_ticker_unavailable_result', fake_result_builder)
+
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        unavailable_summary_builder=fake_summary_builder,
+        unavailable_event_emitter=fake_emitter,
+        unavailable_reason='missing_ws',
+    )
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(
+        store=store,
+        config=config,
+    )
+
+    assert summary_calls == ['missing_ws']
+    assert events == [{'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}]
+    assert result_calls == [{'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}]
+    assert result == {
+        'status': 'unavailable',
+        'summary': {'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'},
+        'health': {'source': 'result-builder'},
+    }
+
+
+def test_build_auto_loop_book_ticker_unavailable_result_returns_default_payload():
+    summary = {'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}
+
+    result = mod.build_auto_loop_book_ticker_unavailable_result(summary=summary)
+
+    assert result == {
+        'status': 'unavailable',
+        'summary': summary,
+        'health': {},
+    }
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    ws_module = object()
+    summary_calls = []
+    health_reader_calls = []
+
+    def fake_provider():
+        return ['BTCUSDT', 'ETHUSDT']
+
+    def fake_summary_builder(*, store, symbol_provider, ws_module, max_supervisor_cycles):
+        summary_calls.append({
+            'store': store,
+            'symbols': list(symbol_provider()),
+            'ws_module': ws_module,
+            'max_supervisor_cycles': max_supervisor_cycles,
+        })
+        return {'cycles_completed': 3, 'subscription_version': 4}
+
+    def fake_health_reader(*, store, config):
+        health_reader_calls.append({'store': store, 'config': config})
+        return {'status': 'healthy', 'messages_processed': 11}
+
+    monkeypatch.setattr(mod, 'build_auto_loop_book_ticker_supervisor_summary', fake_summary_builder)
+    monkeypatch.setattr(mod, 'read_auto_loop_book_ticker_health', fake_health_reader)
+    monkeypatch.setattr(
+        mod,
+        'run_book_ticker_websocket_supervisor',
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('available branch should use extracted supervisor summary seam')),
+    )
+
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=fake_provider,
+        health_loader=lambda: (_ for _ in ()).throw(AssertionError('available branch should use extracted health seam')),
+        max_supervisor_cycles=7,
+    )
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor_available_branch(
+        store=store,
+        config=config,
+        ws_module=ws_module,
+    )
+
+    assert summary_calls == [{
+        'store': store,
+        'symbols': ['BTCUSDT', 'ETHUSDT'],
+        'ws_module': ws_module,
+        'max_supervisor_cycles': 7,
+    }]
+    assert health_reader_calls == [{'store': store, 'config': config}]
+    assert result == {
+        'status': 'available',
+        'summary': {'cycles_completed': 3, 'subscription_version': 4},
+        'health': {'status': 'healthy', 'messages_processed': 11},
+    }
+
+
+def test_resolve_auto_loop_book_ticker_symbol_provider_prefers_config_provider(monkeypatch):
+    expected_provider = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_symbol_provider',
+        lambda client, args: (_ for _ in ()).throw(AssertionError('symbol provider builder should stay unused')),
+    )
+
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(symbol_provider=expected_provider)
+
+    result = mod.resolve_auto_loop_book_ticker_symbol_provider(client=object(), args=object(), config=config)
+
+    assert result is expected_provider
+
+
+def test_resolve_auto_loop_book_ticker_symbol_provider_builds_fallback_provider(monkeypatch):
+    fallback_provider = object()
+    builder_calls = []
+    client = object()
+    args = object()
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_symbol_provider',
+        lambda client_arg, args_arg: builder_calls.append({'client': client_arg, 'args': args_arg}) or fallback_provider,
+    )
+
+    result = mod.resolve_auto_loop_book_ticker_symbol_provider(
+        client=client,
+        args=args,
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(),
+    )
+
+    assert builder_calls == [{'client': client, 'args': args}]
+    assert result is fallback_provider
+
+
+def test_build_auto_loop_book_ticker_available_result_returns_default_payload():
+    summary = {'cycles_completed': 2, 'symbols': ['BTCUSDT']}
+    health = {'status': 'healthy', 'messages_processed': 17}
+
+    result = mod.build_auto_loop_book_ticker_available_result(summary=summary, health=health)
+
+    assert result == {
+        'status': 'available',
+        'summary': summary,
+        'health': health,
+    }
+
+
+def test_resolve_auto_loop_book_ticker_max_supervisor_cycles_reads_config_value():
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(max_supervisor_cycles=9)
+
+    result = mod.resolve_auto_loop_book_ticker_max_supervisor_cycles(config)
+
+    assert result == 9
+
+
+def test_build_auto_loop_book_ticker_supervisor_summary_runs_supervisor(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    ws_module = object()
+    supervisor_calls = []
+    provider_calls = []
+
+    def fake_provider():
+        provider_calls.append('called')
+        return ['SOLUSDT']
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'store': store_arg,
+            'initial_symbols': list(initial_symbols),
+            'provider_symbols': list(symbol_provider()),
+            'ws_module': ws_module,
+            'max_supervisor_cycles': kwargs.get('max_supervisor_cycles'),
+        })
+        return {'cycles_completed': 8}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    result = mod.build_auto_loop_book_ticker_supervisor_summary(
+        store=store,
+        symbol_provider=fake_provider,
+        ws_module=ws_module,
+        max_supervisor_cycles=5,
+    )
+
+    assert supervisor_calls == [{
+        'store': store,
+        'initial_symbols': ['SOLUSDT'],
+        'provider_symbols': ['SOLUSDT'],
+        'ws_module': ws_module,
+        'max_supervisor_cycles': 5,
+    }]
+    assert provider_calls == ['called', 'called']
+    assert result == {'cycles_completed': 8}
+
+
+def test_read_auto_loop_book_ticker_health_uses_config_loader(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    builder_calls = []
+
+    monkeypatch.setattr(
+        mod,
+        'make_auto_loop_book_ticker_health_loader',
+        lambda store_arg, health_store_key='book_ticker_ws_status': builder_calls.append({'store': store_arg, 'health_store_key': health_store_key}) or (lambda: {'status': 'fallback'}),
+    )
+
+    config = mod.AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=lambda: ['BTCUSDT'],
+        health_loader=lambda: {'status': 'healthy', 'messages_processed': 13},
+        health_store_key='custom_key',
+    )
+
+    result = mod.read_auto_loop_book_ticker_health(store=store, config=config)
+
+    assert builder_calls == []
+    assert result == {'status': 'healthy', 'messages_processed': 13}
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_builds_config_then_delegates_to_core(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    client = object()
+    args = argparse.Namespace(auto_loop=True)
+    expected_config = mod.AutoLoopBookTickerWebsocketMonitorConfig(symbol_provider=lambda: ['BTCUSDT'])
+    calls = []
+
+    def fake_build_config(client_arg, args_arg, store=None):
+        calls.append({'step': 'build', 'client': client_arg, 'args': args_arg, 'store': store})
+        return expected_config
+
+    def fake_core(*, store, config):
+        calls.append({'step': 'core', 'store': store, 'config': config})
+        return {'status': 'available', 'summary': {'cycles_completed': 1}, 'health': {'status': 'ok'}}
+
+    monkeypatch.setattr(mod, 'build_auto_loop_book_ticker_websocket_monitor_config', fake_build_config)
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor_core', fake_core)
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(client=client, store=store, args=args)
+
+    assert mod.run_auto_loop_book_ticker_websocket_monitor.__doc__ == 'Compatibility wrapper: build fallback config then delegate to core helper.'
+    assert calls == [
+        {'step': 'build', 'client': client, 'args': args, 'store': store},
+        {'step': 'core', 'store': store, 'config': expected_config},
+    ]
+    assert result == {'status': 'available', 'summary': {'cycles_completed': 1}, 'health': {'status': 'ok'}}
+
+
+def test_run_cycle_auto_loop_builds_book_ticker_config_then_calls_core_helper(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    client = object()
+    args = argparse.Namespace(auto_loop=True, reconcile_only=False, live=False, scan_only=False)
+    expected_book_ticker_config = mod.AutoLoopBookTickerWebsocketMonitorConfig(symbol_provider=lambda: ['BTCUSDT'])
+    expected_user_stream_config = mod.AutoLoopUserDataStreamMonitorConfig(
+        okx_simulated_trading=False,
+        refresh_interval_minutes=30.0,
+        disconnect_timeout_minutes=65.0,
+    )
+    calls = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args_arg: store)
+    monkeypatch.setattr(mod, 'execution_exchange_label', lambda args_arg: 'binance')
+    monkeypatch.setattr(mod, 'is_binance_simulated_trading', lambda args_arg: False)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(
+        mod,
+        'build_auto_loop_book_ticker_websocket_monitor_config',
+        lambda client_arg, args_arg, store=None: calls.append({'step': 'build-book', 'client': client_arg, 'args': args_arg, 'store': store}) or expected_book_ticker_config,
+    )
+    monkeypatch.setattr(
+        mod,
+        'build_auto_loop_user_data_stream_monitor_config',
+        lambda args_arg: calls.append({'step': 'build-uds', 'args': args_arg}) or expected_user_stream_config,
+    )
+    monkeypatch.setattr(
+        mod,
+        'run_auto_loop_book_ticker_websocket_monitor',
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError('wrapper should stay unused in outer auto-loop orchestration')),
+    )
+    monkeypatch.setattr(
+        mod,
+        'run_auto_loop_book_ticker_websocket_monitor_core',
+        lambda *, store, config: calls.append({'step': 'core-book', 'store': store, 'config': config}) or {'status': 'available', 'summary': {'cycles_completed': 2}, 'health': {'status': 'healthy'}},
+    )
+    monkeypatch.setattr(
+        mod,
+        'run_auto_loop_user_data_stream_monitor',
+        lambda **kwargs: calls.append({'step': 'uds-run', 'kwargs': kwargs}) or {'monitor': None, 'alert': None},
+    )
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client_arg, args_arg: ({'funnel': {}}, None, {}))
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+
+    result = mod.run_loop(client=client, args=args)
+
+    assert calls[:4] == [
+        {'step': 'build-book', 'client': client, 'args': args, 'store': store},
+        {'step': 'build-uds', 'args': args},
+        {'step': 'core-book', 'store': store, 'config': expected_book_ticker_config},
+        {
+            'step': 'uds-run',
+            'kwargs': {
+                'client': client,
+                'store': store,
+                'args': args,
+                'config': expected_user_stream_config,
+            },
+        },
+    ]
+    assert result['cycles'][0]['book_ticker_websocket'] == {
+        'cycles_completed': 2,
+        'health': {'status': 'healthy'},
+    }
+
+
+def test_run_auto_loop_book_ticker_websocket_monitor_uses_explicit_unavailable_adapters_without_store_event_side_effects(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    capability_probe_calls = []
+    unavailable_emitter_calls = []
+    unavailable_summary_calls = []
+    append_calls = []
+
+    monkeypatch.setattr(mod, 'websocket', object())
+    monkeypatch.setattr(
+        mod,
+        'append_rate_limited_runtime_event',
+        lambda *args, **kwargs: append_calls.append({'args': args, 'kwargs': kwargs}),
+    )
+
+    def fake_probe():
+        capability_probe_calls.append('called')
+        return None
+
+    def fake_summary_builder(reason):
+        unavailable_summary_calls.append(reason)
+        return {
+            'status': 'custom-unavailable',
+            'reason': reason,
+            'source': 'explicit-builder',
+        }
+
+    def fake_unavailable_emitter(summary):
+        unavailable_emitter_calls.append(summary)
+
+    result = mod.run_auto_loop_book_ticker_websocket_monitor(
+        client=object(),
+        store=store,
+        args=object(),
+        config=mod.AutoLoopBookTickerWebsocketMonitorConfig(
+            websocket_capability_probe=fake_probe,
+            unavailable_event_emitter=fake_unavailable_emitter,
+            unavailable_summary_builder=fake_summary_builder,
+            unavailable_reason='custom_reason',
+        ),
+    )
+
+    assert capability_probe_calls == ['called']
+    assert unavailable_summary_calls == ['custom_reason']
+    assert unavailable_emitter_calls == [{
+        'status': 'custom-unavailable',
+        'reason': 'custom_reason',
+        'source': 'explicit-builder',
+    }]
+    assert append_calls == []
+    assert result == {
+        'status': 'unavailable',
+        'summary': {
+            'status': 'custom-unavailable',
+            'reason': 'custom_reason',
+            'source': 'explicit-builder',
+        },
+        'health': {},
+    }
 
 
 def test_build_local_open_positions_for_risk_emits_rate_limited_event_on_malformed_positions_json(tmp_path):

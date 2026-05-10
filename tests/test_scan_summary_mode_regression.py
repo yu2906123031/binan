@@ -9,12 +9,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 MODULE_PATH = SCRIPTS_DIR / 'binance_futures_momentum_long.py'
 SUMMARY_RENDER_PATH = SCRIPTS_DIR / 'summary_render.py'
 spec = importlib.util.spec_from_file_location('binance_futures_momentum_long', MODULE_PATH)
+assert spec is not None
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 assert spec.loader is not None
 spec.loader.exec_module(mod)
 
 summary_render_spec = importlib.util.spec_from_file_location('summary_render', SUMMARY_RENDER_PATH)
+assert summary_render_spec is not None
 summary_render_mod = importlib.util.module_from_spec(summary_render_spec)
 sys.modules[summary_render_spec.name] = summary_render_mod
 assert summary_render_spec.loader is not None

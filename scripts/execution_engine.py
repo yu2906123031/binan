@@ -2,10 +2,166 @@ from __future__ import annotations
 
 import argparse
 import copy
-import dataclasses
 import datetime
-import time
+import threading
 from typing import Any, Callable, Dict, Optional
+
+
+MONITOR_EVENT_ROW_VOLATILE_FIELDS = frozenset({'recorded_at', 'opened_at', 'closed_at', 'consumer'})
+TRADE_INVALIDATED_VOLATILE_FIELDS = frozenset({'time_in_trade_minutes'})
+MONITOR_EVENT_PAYLOAD_VOLATILE_FIELDS = frozenset({'recorded_at', 'opened_at', 'closed_at'})
+
+
+def normalize_monitor_event_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = {k: v for k, v in row.items() if k not in MONITOR_EVENT_ROW_VOLATILE_FIELDS}
+    if cleaned.get('event_type') == 'trade_invalidated':
+        for field in TRADE_INVALIDATED_VOLATILE_FIELDS:
+            cleaned.pop(field, None)
+    payload = cleaned.get('payload')
+    if isinstance(payload, dict):
+        cleaned['payload'] = {
+            k: v for k, v in payload.items() if k not in MONITOR_EVENT_PAYLOAD_VOLATILE_FIELDS
+        }
+    return cleaned
+
+
+def normalize_monitor_event_rows(rows: Any) -> list[Dict[str, Any]]:
+    normalized: list[Dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict):
+            normalized.append(normalize_monitor_event_row(row))
+    return normalized
+
+
+def resolve_position_protection_status(
+    client: Any,
+    symbol: str,
+    *,
+    expected_stop_order: Optional[Dict[str, Any]] = None,
+    allow_missing_when_flat: bool = True,
+    side: Any,
+    position_side_long: str,
+    normalize_position_side: Callable[..., str],
+    fetch_open_positions: Callable[..., Any],
+    fetch_open_orders: Callable[..., Any],
+    fetch_open_algo_orders: Callable[..., Any],
+    position_row_matches_symbol_side: Callable[..., bool],
+    _to_float: Callable[..., float],
+) -> Dict[str, Any]:
+    position_side = normalize_position_side(side)
+    positions = fetch_open_positions(client)
+    active = next((row for row in positions if position_row_matches_symbol_side(row, symbol, position_side)), None)
+    expected_order_id = expected_stop_order.get('orderId') if isinstance(expected_stop_order, dict) else None
+    expected_client_algo_id = expected_stop_order.get('clientAlgoId') if isinstance(expected_stop_order, dict) else None
+    expected_trigger_price = _to_float(expected_stop_order.get('triggerPrice')) if isinstance(expected_stop_order, dict) else 0.0
+    expected_quantity = abs(_to_float(expected_stop_order.get('quantity') or expected_stop_order.get('origQty'))) if isinstance(expected_stop_order, dict) else 0.0
+    if active is None:
+        return {
+            'status': 'flat',
+            'active_position': None,
+            'expected_order_id': expected_order_id,
+            'expected_client_algo_id': expected_client_algo_id,
+            'matched_via': 'flat',
+            'side': position_side,
+        }
+    open_orders = fetch_open_orders(client, symbol)
+    matched = None
+    matched_via = 'unmatched'
+    matched_trigger_price = None
+    matched_quantity = None
+    if expected_order_id is not None:
+        matched = next((row for row in open_orders if row.get('orderId') == expected_order_id), None)
+        if matched is not None:
+            matched_via = 'open_orders'
+    elif open_orders:
+        matched = open_orders[0]
+        matched_via = 'open_orders'
+    if matched is None:
+        open_algo_orders = fetch_open_algo_orders(client, symbol)
+        if expected_client_algo_id:
+            candidates = [row for row in open_algo_orders if row.get('clientAlgoId') == expected_client_algo_id]
+            if expected_trigger_price > 0:
+                candidates = [row for row in candidates if abs(_to_float(row.get('triggerPrice')) - expected_trigger_price) <= 1e-9]
+            if expected_quantity > 0:
+                candidates = [row for row in candidates if abs(abs(_to_float(row.get('quantity') or row.get('origQty'))) - expected_quantity) <= 1e-9]
+            matched = candidates[0] if candidates else None
+            if matched is not None:
+                matched_via = 'open_algo_orders'
+        elif open_algo_orders:
+            matched = next((row for row in open_algo_orders if str(row.get('orderType') or '').upper() == 'STOP_MARKET'), open_algo_orders[0])
+            matched_via = 'open_algo_orders'
+    if matched is None:
+        return {
+            'status': 'missing',
+            'active_position': active,
+            'expected_order_id': expected_order_id,
+            'expected_client_algo_id': expected_client_algo_id,
+            'matched_via': matched_via,
+            'side': position_side,
+        }
+    matched_trigger_price = _to_float(matched.get('triggerPrice')) if isinstance(matched, dict) else None
+    matched_quantity = abs(_to_float(matched.get('quantity') or matched.get('origQty'))) if isinstance(matched, dict) else None
+    return {
+        'status': 'protected',
+        'active_position': active,
+        'expected_order_id': expected_order_id,
+        'expected_client_algo_id': expected_client_algo_id,
+        'stop_order': matched,
+        'matched_via': matched_via,
+        'matched_trigger_price': matched_trigger_price,
+        'matched_quantity': matched_quantity,
+        'side': position_side,
+    }
+
+
+def repair_missing_protection(
+    client: Any,
+    symbol: str,
+    *,
+    tracked: Optional[Dict[str, Any]],
+    active_position: Optional[Dict[str, Any]],
+    meta: Optional[Any] = None,
+    normalize_position_side: Callable[..., str],
+    place_stop_market_order: Callable[..., Dict[str, Any]],
+    fetch_exchange_meta: Callable[..., Any],
+    _to_float: Callable[..., float],
+) -> Dict[str, Any]:
+    tracked = tracked if isinstance(tracked, dict) else {}
+    active_position = active_position if isinstance(active_position, dict) else {}
+    quantity = abs(_to_float(active_position.get('positionAmt')))
+    stop_price = _to_float(tracked.get('stop_price'))
+    side = normalize_position_side(tracked.get('side') or active_position.get('positionSide'))
+    if quantity <= 0 or stop_price <= 0:
+        return {
+            'ok': False,
+            'symbol': symbol,
+            'side': side,
+            'status': 'repair_failed',
+            'message': 'missing stop_price or active quantity for repair',
+            'repair_attempted': False,
+        }
+    if meta is None:
+        meta = fetch_exchange_meta(client).get(symbol)
+    if meta is None:
+        return {
+            'ok': False,
+            'symbol': symbol,
+            'side': side,
+            'status': 'repair_failed',
+            'message': 'missing symbol meta for repair',
+            'repair_attempted': False,
+        }
+    stop_order = place_stop_market_order(client, symbol, stop_price, quantity, meta, side=side)
+    return {
+        'ok': True,
+        'symbol': symbol,
+        'side': side,
+        'status': 'protected',
+        'stop_order': stop_order,
+        'stop_price': stop_price,
+        'quantity': quantity,
+        'repair_attempted': True,
+    }
 
 
 def ensure_symbol_margin_type(
@@ -348,6 +504,7 @@ def monitor_live_trade(
     trade: Dict[str, Any],
     store: Any,
     *,
+    initial_positions_state: Optional[Dict[str, Any]] = None,
     trade_management_plan_type,
     trade_management_state_type,
     position_side_long: str,
@@ -383,15 +540,20 @@ def monitor_live_trade(
     entry_price = _to_float(trade.get('entry_price'))
     stop_order = trade.get('stop_order') if isinstance(trade.get('stop_order'), dict) else None
     protection_check = trade.get('protection_check') if isinstance(trade.get('protection_check'), dict) else {}
-    plan_payload = copy.deepcopy(trade.get('trade_management_plan') if isinstance(trade.get('trade_management_plan'), dict) else {})
+    raw_plan_payload = trade.get('trade_management_plan')
+    plan_payload: Dict[str, Any] = copy.deepcopy(raw_plan_payload) if isinstance(raw_plan_payload, dict) else {}
     trade_side = normalize_position_side(trade.get('side') or plan_payload.get('side'))
     plan_payload.setdefault('side', trade_side)
     plan_payload.setdefault('position_side', trade_side)
-    plan = trade_management_plan_type(**plan_payload)
-    positions = store.load_json('positions', {})
+    positions = copy.deepcopy(initial_positions_state) if isinstance(initial_positions_state, dict) else store.load_json('positions', {})
+    position_state_source = 'injected' if isinstance(initial_positions_state, dict) else 'store'
     if not isinstance(positions, dict):
         positions = {}
     position_key, tracked = get_position_by_symbol_side(positions, symbol, trade_side)
+    tracked_stop_price = _to_float(tracked.get('current_stop_price') or tracked.get('stop_price'), default=0.0)
+    if tracked_stop_price > 0:
+        plan_payload['stop_price'] = tracked_stop_price
+    plan = trade_management_plan_type(**plan_payload)
     state = trade_management_state_type(
         symbol=symbol,
         side=position_side_to_trade_side(trade_side),
@@ -399,7 +561,7 @@ def monitor_live_trade(
         position_key=position_key,
         initial_quantity=_to_float(tracked.get('quantity') or plan.quantity or trade.get('quantity')),
         remaining_quantity=_to_float(tracked.get('remaining_quantity') or tracked.get('quantity') or plan.quantity),
-        current_stop_price=_to_float(tracked.get('stop_price') or tracked.get('current_stop_price') or plan.stop_price, default=plan.stop_price),
+        current_stop_price=_to_float(tracked.get('current_stop_price') or tracked.get('stop_price') or plan.stop_price, default=plan.stop_price),
         moved_to_breakeven=bool(tracked.get('moved_to_breakeven', False)),
         tp1_hit=bool(tracked.get('tp1_hit', False)),
         tp2_hit=bool(tracked.get('tp2_hit', False)),
@@ -420,6 +582,8 @@ def monitor_live_trade(
     ) -> Dict[str, Any]:
         position_payload = dict(tracked)
         analytics_snapshot = build_trade_analytics_snapshot(state, plan, closed_at=closed_at)
+        normalized_opened_at = state.opened_at
+        normalized_closed_at = isoformat_utc(closed_at) if closed_at else None
         position_payload.update({
             'symbol': symbol,
             'side': state.side,
@@ -437,8 +601,9 @@ def monitor_live_trade(
             'tp2_hit': state.tp2_hit,
             'highest_price_seen': round(state.highest_price_seen, 10) if state.highest_price_seen is not None else None,
             'lowest_price_seen': round(state.lowest_price_seen, 10) if state.lowest_price_seen is not None else None,
-            'opened_at': state.opened_at,
+            'opened_at': normalized_opened_at,
             'first_1r_at': state.first_1r_at,
+            'closed_at': normalized_closed_at,
             'realized_r': analytics_snapshot['realized_r'],
             'mfe_r': analytics_snapshot['mfe_r'],
             'mae_r': analytics_snapshot['mae_r'],
@@ -480,19 +645,19 @@ def monitor_live_trade(
             emit_notification(args, event_type, event_payload)
         return row
 
-    persist_position(status='monitoring', protection_status=protection_check.get('status'), active_stop_order=stop_order)
+    persist_position(status='monitoring', protection_status=protection_check.get('status') if isinstance(protection_check, dict) else None, active_stop_order=stop_order)
     record_event('entry_filled', {
         'entry_price': round(entry_price, 10),
         'stop_price': round(plan.stop_price, 10),
         'quantity': round(state.initial_quantity, 10),
     })
     record_event('protection_confirmed', {
-        'protection_status': protection_check.get('status'),
+        'protection_status': protection_check.get('status') if isinstance(protection_check, dict) else None,
         'stop_order_id': stop_order.get('orderId') if isinstance(stop_order, dict) else None,
     })
 
     active_stop_order = stop_order
-    protection_status = protection_check.get('status')
+    protection_status = protection_check.get('status') if isinstance(protection_check, dict) else None
     max_cycles = max(int(getattr(args, 'max_monitor_cycles', 20) or 20), 1)
     if getattr(args, 'monitor_poll_interval_sec', None) in (None, 0, 0.0, '0', '0.0') and getattr(args, 'max_monitor_cycles', None) is None:
         max_cycles = max(max_cycles, 50)
@@ -551,6 +716,7 @@ def monitor_live_trade(
         debug_payload = {
             'symbol': symbol,
             'position_side': state.position_side,
+            'position_state_source': position_state_source,
             'current_price': current_price,
             'current_price_source': current_price_source or 'kline_close_fallback',
             'current_price_cache_max_age_seconds': book_ticker_cache_max_age_seconds,
@@ -643,6 +809,8 @@ def monitor_live_trade(
                 final_exit_reason = action.get('exit_reason', 'flat')
                 closed_at = utc_now()
                 analytics_snapshot = build_trade_analytics_snapshot(state, plan, closed_at=closed_at)
+                analytics_snapshot.pop('opened_at', None)
+                analytics_snapshot.pop('closed_at', None)
                 selected_score = _to_float(
                     tracked.get('selected_score', tracked.get('score', selection_context.get('selected_score', selection_context.get('score')))),
                     default=0.0,
@@ -698,3 +866,32 @@ def monitor_live_trade(
         'exit_reason': final_exit_reason if final_status == 'closed' else None,
         'realized_r': round(state.realized_r, 4),
     }
+
+
+def start_trade_monitor_thread(
+    client: Any,
+    symbol: str,
+    meta: Any,
+    args: argparse.Namespace,
+    trade: Dict[str, Any],
+    store: Any,
+    *,
+    monitor_live_trade_fn: Callable[..., Dict[str, Any]],
+    thread_factory: Callable[..., threading.Thread] = threading.Thread,
+):
+    thread_name = f"trade-monitor-{str(symbol or '').upper()}"
+    thread = thread_factory(
+        target=monitor_live_trade_fn,
+        kwargs={
+            'client': client,
+            'symbol': symbol,
+            'meta': meta,
+            'args': args,
+            'trade': trade,
+            'store': store,
+        },
+        daemon=True,
+        name=thread_name,
+    )
+    thread.start()
+    return thread

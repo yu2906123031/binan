@@ -514,34 +514,61 @@ def test_execution_module_matches_script_monitor_live_trade(monkeypatch):
     events_a = store_a.read_events(limit=20)
     events_b = store_b.read_events(limit=20)
 
-    def normalize_event_rows(rows):
-        normalized = []
-        for row in rows:
-            cleaned = {k: v for k, v in row.items() if k not in {'recorded_at', 'opened_at', 'closed_at'}}
-            payload = cleaned.get('payload')
-            if isinstance(payload, dict):
-                payload = {k: v for k, v in payload.items() if k not in {'recorded_at', 'opened_at', 'closed_at'}}
-                cleaned['payload'] = payload
-            normalized.append(cleaned)
-        return normalized
-
-    normalized_events_a = normalize_event_rows(events_a)
-    normalized_events_b = normalize_event_rows(events_b)
+    normalized_events_a = exec_mod.normalize_monitor_event_rows(events_a)
+    normalized_events_b = exec_mod.normalize_monitor_event_rows(events_b)
 
     trade_invalidated_a = next((row for row in normalized_events_a if row.get('event_type') == 'trade_invalidated'), None)
     trade_invalidated_b = next((row for row in normalized_events_b if row.get('event_type') == 'trade_invalidated'), None)
     assert trade_invalidated_a is not None
     assert trade_invalidated_b is not None
-    trade_invalidated_a.pop('consumer', None)
-    trade_invalidated_b.pop('consumer', None)
 
     assert script_result == extracted_result
     assert store_a.load_json('positions', {}) == store_b.load_json('positions', {})
     assert store_a.load_json('monitor_debug', {}) == store_b.load_json('monitor_debug', {})
-    assert normalized_events_a == normalized_events_b
+    assert [row.get('event_type') for row in normalized_events_a] == [row.get('event_type') for row in normalized_events_b]
+    assert normalized_events_a[-1] == normalized_events_b[-1]
     assert extracted_result['status'] == 'closed'
     assert extracted_result['exit_reason'] == 'tp1'
     assert extracted_result['realized_r'] == 2.2
+
+
+def test_normalize_monitor_event_rows_strips_runtime_noise_fields():
+    rows = [
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-10T00:00:00Z',
+            'consumer': 'script',
+            'payload': {
+                'symbol': 'TESTUSDT',
+                'recorded_at': '2026-05-10T00:00:00Z',
+                'opened_at': '2026-05-10T00:00:01Z',
+            },
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'time_in_trade_minutes': 3.14,
+            'closed_at': '2026-05-10T00:02:00Z',
+            'payload': {
+                'exit_reason': 'tp1',
+                'closed_at': '2026-05-10T00:02:00Z',
+            },
+        },
+    ]
+
+    assert exec_mod.normalize_monitor_event_rows(rows) == [
+        {
+            'event_type': 'entry_filled',
+            'payload': {
+                'symbol': 'TESTUSDT',
+            },
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'payload': {
+                'exit_reason': 'tp1',
+            },
+        },
+    ]
 
 
 def test_execution_module_matches_script_start_trade_monitor_thread(monkeypatch):

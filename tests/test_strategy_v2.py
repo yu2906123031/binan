@@ -1,16 +1,17 @@
 import argparse
 import dataclasses
 import importlib.util
-import json
 import pathlib
-import statistics
 import sys
-import tempfile
 
 import pytest
 
-MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / 'scripts'
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+MODULE_PATH = SCRIPTS_DIR / 'binance_futures_momentum_long.py'
 spec = importlib.util.spec_from_file_location('strategy_mod', MODULE_PATH)
+assert spec is not None
 mod = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = mod
@@ -418,7 +419,7 @@ def test_run_book_ticker_cache_monitor_cycle_records_disconnect_and_closes_socke
     assert events[-1]['event_type'] == 'book_ticker_ws_disconnected'
 
 
-def test_run_book_ticker_cache_monitor_cycle_records_disconnect_and_closes_socket(tmp_path):
+def test_run_book_ticker_cache_monitor_cycle_records_disconnect_and_closes_socket_repeatable(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
 
     class TimeoutError(Exception):
@@ -708,7 +709,7 @@ def test_collect_book_ticker_samples_rate_limits_repeated_cache_miss_events(tmp_
     assert state['book_ticker_cache_miss']['TESTUSDT']['suppressed_since_last'] == 1
 
 
-def test_collect_book_ticker_samples_rate_limits_cache_miss_per_symbol(tmp_path):
+def test_collect_book_ticker_samples_rate_limits_cache_miss_per_symbol_distinct_symbols(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     calls = []
 

@@ -20,7 +20,7 @@ def build_runtime_health_summary(cycle: Dict[str, Any], mask_sensitive_token) ->
     user_data_stream_monitor = cycle.get('user_data_stream_monitor', {}) if isinstance(cycle, dict) else {}
     user_data_stream_alert = cycle.get('user_data_stream_alert', {}) if isinstance(cycle, dict) else {}
 
-    runtime_summary = {
+    runtime_summary: Dict[str, Dict[str, Any]] = {
         'BookTicker WS': {},
         'User Data Stream': {},
         '告警': {},

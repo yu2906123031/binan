@@ -1,0 +1,36 @@
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+extend-exclude = [
+  ".hermes",
+  ".git",
+  "__pycache__",
+  ".venv-typecheck",
+]
+
+[tool.ruff.lint]
+select = ["F"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+files = [
+  "scripts/candidate_builder.py",
+  "scripts/execution_engine.py",
+  "scripts/runtime_store.py",
+  "scripts/summary_render.py",
+  "scripts/risk_state_helpers.py",
+  "scripts/runtime_state_risk_helpers.py",
+  "scripts/risk_engine.py",
+  "scripts/hermes_outer_watcher.py",
+  "tests/test_execution_module_regression.py",
+  "tests/test_strategy_v2_restore_regression.py",
+  "tests/test_cli_args.py",
+  "tests/test_run_loop_smoke.py",
+  "tests/test_scan_summary_mode_regression.py",
+  "tests/test_strategy_v2.py",
+  "tests/test_hermes_outer_watcher.py",
+]
+warn_unused_configs = true
+show_error_codes = true
+pretty = true

@@ -3,6 +3,9 @@ import sys
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
+SCRIPTS_DIR = SCRIPT_PATH.parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def load_module():

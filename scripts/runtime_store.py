@@ -248,7 +248,7 @@ def restore_position_lifecycle_fields(
         else:
             restored['status'] = 'recovery_pending'
     else:
-        normalized_plan = dict(plan_payload)
+        normalized_plan = dict(plan_payload or {})
         normalized_plan['side'] = position_side_to_trade_side(position_side)
         normalized_plan['position_side'] = position_side
         restored['trade_management_plan'] = normalized_plan

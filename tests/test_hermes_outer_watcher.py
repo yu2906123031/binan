@@ -4,10 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'hermes_outer_watcher.py'
 spec = importlib.util.spec_from_file_location('hermes_outer_watcher', MODULE_PATH)
+assert spec is not None
+assert spec.loader is not None
 watcher = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = watcher
 spec.loader.exec_module(watcher)

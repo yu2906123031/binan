@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -14,7 +13,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import binance_futures_momentum_long as strategy
+strategy = __import__('binance_futures_momentum_long')
 
 
 def build_strategy_args(argv: Sequence[str]) -> argparse.Namespace:

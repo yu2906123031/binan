@@ -21,6 +21,7 @@ runtime-state-binance-futures-testnet/
 .env.*
 !.env.example
 .venv/
+.venv-typecheck/
 
 # OS/editor noise
 .DS_Store

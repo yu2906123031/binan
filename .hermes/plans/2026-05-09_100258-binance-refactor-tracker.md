@@ -42,6 +42,455 @@
 
 ## 已完成升级记录
 
+### 2026-05-10｜补 runtime_state_risk_helpers 直连 contract 单测
+- 状态：已完成
+- 范围：为 `runtime_state_risk_helpers.py` 新增直连单测，固定 malformed JSON、degraded-event envelope、default / heat snapshot 合并与 helper 对主脚本 wrapper 的契约边界
+
+### 2026-05-10｜下沉 auto-loop user-data-stream monitor orchestration helper
+- 状态：已完成
+- 范围：把 `run_loop(...)` 里 auto-loop 分支的 user-data-stream monitor orchestration 抽到独立 helper，收窄主脚本 monitor orchestration 面积，并为 skipped / existing listen key / empty state 三条路径补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `run_auto_loop_user_data_stream_monitor(...)`，统一承载 OKX simulated 下的 skipped payload、existing listen key 下的 `run_user_data_stream_monitor_cycle(...)` 调度、positions 写回、alert 发射
+  - `run_loop(...)` 的 auto-loop 分支改为只消费 helper 返回的 `{monitor, alert}`，减少局部状态分支和重复依赖注入
+  - 新增三条 focused regression，覆盖 `OKX_SIMULATED` skipped payload、existing listen key 刷新失败告警链路、无 listen key 时的空返回 contract
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_user_data_stream_monitor or max_open_positions_blocks_trade'` → `4 passed, 77 deselected in 0.43s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `94 passed in 0.40s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - auto-loop 分支里的 book-ticker websocket orchestration 仍留在 `run_loop(...)`，下一步适合沿同一路径继续下沉 summary + health 装配 helper
+  - 当前 helper 仍以内联 `args` 读取配置，后续若继续压缩主脚本依赖面，适合把 refresh / timeout 配置解析进一步收敛为参数对象
+- 对应待办编号：
+  - P1-5k
+
+### 2026-05-10｜下沉 auto-loop book-ticker websocket orchestration helper
+- 状态：已完成
+- 范围：把 `run_loop(...)` 里 auto-loop 分支的 book-ticker websocket orchestration 抽到独立 helper，统一 summary + health 装配与 websocket 缺失降级事件发射，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `run_auto_loop_book_ticker_websocket_monitor(...)`，集中承载 websocket 可用时的 `resolve_auto_loop_book_ticker_symbols(...)` + `run_book_ticker_websocket_supervisor(...)` 调度，以及 `book_ticker_ws_status` health 装配
+  - helper 内收口 websocket 缺失时的 unavailable summary 与 `book_ticker_ws_unavailable` 限流事件发射，保持主循环只消费统一返回结构
+  - `run_loop(...)` 的 auto-loop 分支改为复用新 helper 返回的 `{summary, health}` 组装 `cycle['book_ticker_websocket']`
+  - 新增两条 focused regression，覆盖 supervisor 调用与 health 装配路径、以及 websocket 缺失时的 unavailable contract 与限流事件 payload
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor'` → `2 passed, 81 deselected in 0.14s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `96 passed in 0.41s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - auto-loop monitor orchestration 里仍有 helper 直接读取 `args` 的配置面，后续适合把 book-ticker / user-data-stream 的配置解析进一步收敛成显式参数对象
+  - 当前 helper 只收口单周期 orchestration，后续若继续拆分，可评估把 monitor summary 组合与 cycle 写入 contract 独立下沉
+- 对应待办编号：
+  - P1-5l
+
+### 2026-05-10｜收敛 auto-loop monitor helper 配置为显式参数对象
+- 状态：已完成
+- 范围：为 auto-loop 的 book-ticker / user-data-stream monitor helper 增加显式 config 对象与 builder，把 helper 内直接读取 `args` 的配置面收敛到入口层，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `AutoLoopBookTickerWebsocketMonitorConfig`、`AutoLoopUserDataStreamMonitorConfig` 以及对应 builder，统一把 auto-loop monitor 相关配置从 `args` 提取为显式参数对象
+  - `run_auto_loop_user_data_stream_monitor(...)` 改为消费 `monitor_config`，把 `okx_simulated_trading`、refresh interval、disconnect timeout 的读取收敛到 builder
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 增加显式 `config` 参数，`run_loop(...)` 在 auto-loop 入口先构建 config 再注入 helper，收窄 monitor orchestration 的隐式依赖面
+  - 新增四条 focused regression，覆盖 config builder contract，以及 helper 在传入显式 config 时可脱离 `argparse.Namespace` 继续工作
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_ or uses_explicit_config_without_args_namespace'` → `4 passed, 83 deselected in 0.14s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `100 passed in 0.43s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - book-ticker helper 当前 config 还是 marker object，后续可继续把 symbol resolution / supervisor cycle 上限等策略参数显式化
+  - helper 仍保留 `args` 形参用于通知与 symbol provider，后续适合继续沿依赖注入路径收敛到更窄 contract
+- 对应待办编号：
+  - P1-5m
+
+### 2026-05-10｜显式注入 auto-loop book-ticker symbol provider
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor(...)` 的隐式依赖，把 symbol resolution 从 helper 内部 `resolve_auto_loop_book_ticker_symbols(client, args)` 调用改为显式 provider 注入，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `AutoLoopBookTickerWebsocketMonitorConfig`，新增 `symbol_provider` 字段，允许 helper 直接消费显式 provider
+  - 新增 `make_auto_loop_book_ticker_symbol_provider(client, args)` 与更新后的 `build_auto_loop_book_ticker_websocket_monitor_config(client, args)`，把 `resolve_auto_loop_book_ticker_symbols(...)` 封装在入口 builder 层
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 改为优先消费 config 注入的 provider，并把 supervisor 的 `initial_symbols` 与 `symbol_provider` 都统一绑定到该 provider contract
+  - `run_loop(...)` 的 auto-loop 入口改为传入 `client` 构建 book-ticker config，进一步压缩 helper 对 `args` 的隐式依赖面
+  - 新增 focused regression，覆盖 builder 生成 provider，以及 helper 在传入显式 config 时可脱离 `argparse.Namespace` 继续工作
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_config_without_args_namespace'` → `2 passed, 85 deselected in 0.40s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `100 passed in 0.41s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 仍保留 `args` 形参，当前主要用于 fallback builder 路径；后续适合继续把通知与其余 helper 依赖拆到更窄 contract
+  - symbol provider 当前只封装 symbol resolution，后续可继续把 supervisor cycle 上限与 health key 之类 orchestration 常量并入显式 config
+- 对应待办编号：
+  - P1-5n
+
+### 2026-05-10｜显式注入 auto-loop book-ticker health loader
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor(...)` 对 runtime store 细节的耦合，把 `book_ticker_ws_status` 的读取 key 与 health loader 收进显式 config / adapter，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `AutoLoopBookTickerWebsocketMonitorConfig`，新增 `health_loader` 与 `health_store_key`
+  - 新增 `make_auto_loop_book_ticker_health_loader(store, health_store_key)`，把 `store.load_json(...)` 与 dict fallback 封装成显式 adapter
+  - `build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=...)` 改为同时构建 symbol provider 与 health loader
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 改为优先消费 config 注入的 `health_loader`，并保留基于 `health_store_key` 的 fallback adapter 路径
+  - `run_loop(...)` 的 auto-loop 入口改为在构建 book-ticker config 时传入 `store`
+  - 新增 focused regression，覆盖 builder 生成 health loader，以及 helper 在传入显式 config 时可脱离 store key 细节继续工作
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_config_without_args_namespace'` → `2 passed, 85 deselected in 0.41s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `100 passed in 0.42s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 仍直接依赖 `append_rate_limited_runtime_event(...)` 与 websocket availability 判断，后续适合继续把 unavailable event emitter / websocket capability probe 也抽成显式 adapter
+  - `book_ticker_ws_status` 已收敛到 config 层，后续可继续把 `max_supervisor_cycles=1` 这类 orchestration 常量并入 config
+- 对应待办编号：
+  - P1-5o
+
+### 2026-05-10｜显式注入 auto-loop book-ticker websocket capability probe 与 unavailable emitter
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor(...)` 对全局 websocket 模块与 runtime event 发射细节的耦合，把 capability probe 与 unavailable emitter 收进显式 config / adapter，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `AutoLoopBookTickerWebsocketMonitorConfig`，新增 `websocket_capability_probe` 与 `unavailable_event_emitter`
+  - 新增 `make_auto_loop_book_ticker_websocket_capability_probe()`，把 `globals().get('websocket')` 下沉成显式 capability adapter
+  - 新增 `make_auto_loop_book_ticker_unavailable_event_emitter(store)`，把 `append_rate_limited_runtime_event(...)` unavailable 路径封装成显式 emitter
+  - `build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=...)` 改为同时构建 symbol provider、health loader、capability probe、unavailable emitter
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 改为优先消费 config 注入的 probe / emitter，并保留基于 builder 的 fallback adapter 路径
+  - 新增 focused regression，覆盖 builder 生成 probe / emitter，以及 helper 在传入显式 unavailable adapters 时可脱离 store event side effect 继续工作
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_unavailable_adapters_without_store_event_side_effects'` → `2 passed, 87 deselected in 0.14s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `102 passed in 0.69s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 仍保留 `args` 形参，当前主要服务 fallback builder 路径；后续适合继续把通知与 supervisor orchestration 常量一起收口到更窄 contract
+  - `max_supervisor_cycles=1` 与 unavailable summary schema 仍散落在 helper 内，下一刀适合继续把这些 orchestration 常量与 summary builder 下沉到显式 config / adapter
+- 对应待办编号：
+  - P1-5p
+
+### 2026-05-10｜显式注入 auto-loop book-ticker supervisor cycle limit 与 unavailable summary builder
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor(...)` 的 orchestration 常量与 unavailable summary 构造，把 `max_supervisor_cycles=1` 与 unavailable summary builder 收进显式 config / adapter，并补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `AutoLoopBookTickerWebsocketMonitorConfig`，新增 `unavailable_summary_builder` 与 `max_supervisor_cycles`
+  - 新增 `make_auto_loop_book_ticker_unavailable_summary_builder()`，把 unavailable summary 的默认构造收成显式 adapter
+  - `build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=...)` 改为同时构建 unavailable summary builder，并显式固定 `max_supervisor_cycles=1`
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 改为优先消费 config 注入的 summary builder，并把 supervisor cycle 上限改成读取 `monitor_config.max_supervisor_cycles`
+  - 新增 focused regression，覆盖 builder 暴露 summary builder / cycle limit，以及 helper 在传入显式 summary builder 时正确透传 unavailable summary 与 supervisor cycle limit
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker or build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_config_without_args_namespace or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_unavailable_adapters_without_store_event_side_effects'` → `4 passed, 85 deselected in 0.14s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `102 passed in 0.43s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 仍保留 `args` 形参，当前主要服务 fallback builder 路径；后续适合继续把 symbol/provider fallback 与 health fallback 一并下沉到更窄 orchestration contract
+  - unavailable reason 当前仍在 helper 内以 `'websocket_client_missing'` 文字常量出现，下一刀适合继续把 reason 枚举或 summary factory 输入收进显式 config
+- 对应待办编号：
+  - P1-5q
+
+### 2026-05-10｜显式注入 auto-loop book-ticker unavailable reason
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor(...)` unavailable 路径里的文字常量，把 `'websocket_client_missing'` 收进显式 config，并补 focused regression 锁定 summary builder 入参
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `AutoLoopBookTickerWebsocketMonitorConfig`，新增 `unavailable_reason: str = 'websocket_client_missing'`
+  - `build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=...)` 改为显式写入 `unavailable_reason='websocket_client_missing'`
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 改为把 `monitor_config.unavailable_reason` 传给 `unavailable_summary_builder(...)`
+  - focused regression 更新为断言 builder 暴露 `unavailable_reason`，并验证 helper 在传入自定义 reason 时透传到 summary builder / emitter / 返回 summary
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker or build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter or run_auto_loop_book_ticker_websocket_monitor_uses_explicit_unavailable_adapters_without_store_event_side_effects'` → `3 passed, 86 deselected in 0.13s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `102 passed in 0.42s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - `run_auto_loop_book_ticker_websocket_monitor(...)` 仍保留 `args` 与 `store` fallback builder 路径，后续适合继续把 provider / loader 默认构建迁移到更外层调用方
+  - unavailable summary builder 当前仍只消费 `reason` 单参数；后续若要继续扩 schema，适合把 event_source 或 summary payload factory 一起收进口径稳定的 adapter
+- 对应待办编号：
+  - P1-5r
+
+### 2026-05-10｜锁定 complete-config path 无 fallback builder 依赖
+- 状态：已完成
+- 范围：验证 `run_auto_loop_book_ticker_websocket_monitor(...)` 在传入完整 `config` 时已经形成稳定 orchestration seam，直接消费注入的 `symbol_provider` / `health_loader`，并保持对 config builder 与 fallback builders 的零依赖
+- 修改文件：
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `test_run_auto_loop_book_ticker_websocket_monitor_complete_config_path_avoids_fallback_builders`
+  - 在测试里显式把 `build_auto_loop_book_ticker_websocket_monitor_config(...)`、`make_auto_loop_book_ticker_symbol_provider(...)`、`make_auto_loop_book_ticker_health_loader(...)` 设为触发 `AssertionError` 的哨兵，锁定 complete-config path 的零 fallback 访问 contract
+  - 验证 helper 在传入完整 `AutoLoopBookTickerWebsocketMonitorConfig(...)` 时直接消费注入 provider / loader，正确透传到 supervisor 与返回 health
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_complete_config_path_avoids_fallback_builders'` → `1 passed, 89 deselected in 0.40s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `103 passed in 0.44s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - helper 形参层面仍保留 `args` 与 `store`，当前完整 config path 已稳定，后续适合继续拆出一个更窄的 core helper，只保留 orchestration 所需最小依赖
+  - 当前新增的是 contract regression，生产代码已经满足该 contract；下一刀更适合把 fallback builder 责任外移到调用方，收窄公开 helper 签名
+- 对应待办编号：
+  - P1-5s
+
+### 2026-05-10｜切出 auto-loop book-ticker core helper，外层仅负责 fallback config
+- 状态：已完成
+- 范围：把 `run_auto_loop_book_ticker_websocket_monitor(...)` 继续收窄为 wrapper，只保留 fallback config 构建职责；把 websocket probe / unavailable path / supervisor / health orchestration 下沉到一个只消费 `store + config` 的 core helper
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `run_auto_loop_book_ticker_websocket_monitor_core(*, store, config)`
+  - `run_auto_loop_book_ticker_websocket_monitor(client, store, args, config=None)` 改为：先构建 `monitor_config`，再直接委托给 core helper
+  - core helper 只消费 `store` 与完整 `AutoLoopBookTickerWebsocketMonitorConfig(...)`，承接 websocket capability probe、unavailable summary/emitter、supervisor 调用、health loader 读取
+  - 新增 focused regression：
+    - `test_run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies`
+    - `test_run_auto_loop_book_ticker_websocket_monitor_builds_config_then_delegates_to_core`
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies or run_auto_loop_book_ticker_websocket_monitor_builds_config_then_delegates_to_core'` → `2 passed, 90 deselected in 0.14s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `105 passed in 0.42s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - 旧 wrapper 仍保留 `client` 与 `args` 形参，当前只承担 config builder/fallback seam；后续适合继续把 builder 使用点上移到更外层 call site，进一步缩小公开入口
+  - `run_auto_loop_book_ticker_websocket_monitor_core(...)` 仍直接消费 dataclass config；后续若要继续稳定 seam，适合补 protocol/type alias 收口 config 依赖面
+- 对应待办编号：
+  - P1-5t
+
+### 2026-05-10｜把 book-ticker config builder 使用点上移到 run_loop
+- 状态：已完成
+- 范围：让外层 auto-loop orchestration 直接构建 `book_ticker_config` 并调用 `run_auto_loop_book_ticker_websocket_monitor_core(...)`，把旧 wrapper 从主执行路径移出，仅保留兼容性的 build+delegate seam
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - `run_loop(...)` 的 auto-loop 分支改为：
+    - 先调用 `build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=store)`
+    - 再直接调用 `run_auto_loop_book_ticker_websocket_monitor_core(store=store, config=book_ticker_config)`
+  - 旧 wrapper `run_auto_loop_book_ticker_websocket_monitor(...)` 从主 orchestration path 退出，当前只保留给旧调用点和回归 contract 使用
+  - 新增 focused regression：`test_run_cycle_auto_loop_builds_book_ticker_config_then_calls_core_helper`
+  - 测试中把 wrapper 设为 `AssertionError` 哨兵，锁定外层 orchestration 对 core helper 的直接调用 contract
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_cycle_auto_loop_builds_book_ticker_config_then_calls_core_helper or run_auto_loop_book_ticker_websocket_monitor_builds_config_then_delegates_to_core'` → `2 passed, 91 deselected in 0.45s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `106 passed in 0.61s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - 旧 wrapper 仍保留公开入口价值，后续适合清点脚本内外剩余调用点，再决定是删除 wrapper 还是把它明确标成兼容层
+  - `run_loop(...)` 里的 auto-loop 分支已经直接依赖 core helper，后续适合对 user-data-stream monitor 做同样 seam 收窄，统一两条 monitor orchestration 形态
+- 对应待办编号：
+  - P1-5u
+
+### 2026-05-10｜清点 wrapper 剩余调用点并标记 compatibility seam
+- 状态：已完成
+- 范围：审计 `run_auto_loop_book_ticker_websocket_monitor(...)` 在脚本与测试中的剩余调用点，确认生产路径已经全部迁移到 `run_auto_loop_book_ticker_websocket_monitor_core(...)`，并把旧 wrapper 明确标记为 compatibility seam。
+- 变更：
+  - 全仓搜索 `run_auto_loop_book_ticker_websocket_monitor(...)`，确认脚本内只剩函数定义，没有任何生产调用点；当前剩余引用全部位于 `tests/test_strategy_v2_restore_regression.py`
+  - 给 `run_auto_loop_book_ticker_websocket_monitor(...)` 补上 docstring：`Compatibility wrapper: build fallback config then delegate to core helper.`，把职责边界固定为兼容入口
+  - 保留 wrapper contract test，并增加对 compatibility docstring 的断言，确保后续重构中不会再把它误当成主 orchestration 入口
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_builds_config_then_delegates_to_core or run_cycle_auto_loop_builds_book_ticker_config_then_calls_core_helper'` ✅
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` ✅（`106 passed`）
+  - `.venv-typecheck/bin/python -m mypy` ✅
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` ✅
+- 对应待办编号：
+  - P1-5v
+
+### 2026-05-10｜拆分 book-ticker core helper 的 unavailable / available 分支
+- 状态：已完成
+- 范围：把 `run_auto_loop_book_ticker_websocket_monitor_core(...)` 收窄为 branch orchestration，并把 unavailable path 与 supervisor+health path 各自下沉到独立 helper。
+- 变更：
+  - 新增 `run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(...)`，承接 unavailable summary builder、event emitter、返回 payload 的拼装
+  - 新增 `run_auto_loop_book_ticker_websocket_monitor_available_branch(...)`，承接 symbol provider、supervisor 调用、health loader 读取
+  - `run_auto_loop_book_ticker_websocket_monitor_core(...)` 现在只负责 websocket capability probe 与 branch dispatch
+  - available branch 显式要求 `config.symbol_provider`，通过 `ValueError` 固定可用分支的最小依赖契约
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter or run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health or run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies'` ✅
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` ✅（`108 passed`）
+  - `.venv-typecheck/bin/python -m mypy` ✅
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py` ✅
+- 对应待办编号：
+  - P1-5w
+
+### 2026-05-10｜available branch 下沉 supervisor summary / health reader seams
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor_available_branch(...)`，把 supervisor 执行与 health 读取分别下沉为独立 seam。
+- 变更：
+  - 新增 `build_auto_loop_book_ticker_supervisor_summary(...)`，集中负责 `symbol_provider -> initial_symbols -> run_book_ticker_websocket_supervisor(...)`。
+  - 新增 `read_auto_loop_book_ticker_health(...)`，集中负责 `config.health_loader` 与 `make_auto_loop_book_ticker_health_loader(...)` 的选择与执行。
+  - `run_auto_loop_book_ticker_websocket_monitor_available_branch(...)` 现在只保留 `symbol_provider` 前置校验、summary seam 调用、health seam 调用、result assembly。
+- 测试：
+  - 新增 `test_build_auto_loop_book_ticker_supervisor_summary_runs_supervisor`，锁定 supervisor seam 的入参与 provider 调用行为。
+  - 新增 `test_read_auto_loop_book_ticker_health_uses_config_loader`，锁定 config 自带 loader 优先级。
+  - 更新 `test_run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health`，要求 available branch 通过两个新 seam 编排。
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health or build_auto_loop_book_ticker_supervisor_summary_runs_supervisor or read_auto_loop_book_ticker_health_uses_config_loader'`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
+  - `.venv-typecheck/bin/python -m mypy`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py`
+- 对应待办编号：
+  - P1-5x
+
+### 2026-05-10｜unavailable branch 下沉 result seam
+- 状态：已完成
+- 范围：继续收窄 `run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(...)`，把 unavailable payload 组装下沉为独立 seam。
+- 变更：
+  - 新增 `build_auto_loop_book_ticker_unavailable_result(...)`，集中负责 unavailable payload 的 result assembly。
+  - `run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(...)` 现在只保留 summary seam 调用、event emitter seam 调用、result seam 调用。
+- 测试：
+  - 更新 `test_run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter`，要求 unavailable branch 通过 result seam 返回结果。
+  - 新增 `test_build_auto_loop_book_ticker_unavailable_result_returns_default_payload`，锁定默认 unavailable payload 契约。
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter or build_auto_loop_book_ticker_unavailable_result_returns_default_payload'`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
+  - `.venv-typecheck/bin/python -m mypy`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py`
+- 对应待办编号：
+  - P1-5y
+
+### 2026-05-10｜monitor config builder 下沉 optional/default seam helpers
+- 状态：已完成
+- 范围：继续收窄 `build_auto_loop_book_ticker_websocket_monitor_config(...)`，把 store 相关与默认 seam 相关装配拆成两个独立 helper。
+- 变更：
+  - 新增 `build_auto_loop_book_ticker_monitor_optional_store_seams(store, health_store_key='book_ticker_ws_status')`：统一返回 `health_loader` / `unavailable_event_emitter`。
+  - 新增 `build_auto_loop_book_ticker_monitor_default_seams()`：统一返回 `websocket_capability_probe` / `unavailable_summary_builder`。
+  - `build_auto_loop_book_ticker_websocket_monitor_config(...)` 改为只做 `health_store_key` 常量、symbol provider、两个 seam helper 调用、dataclass assembly。
+- 测试：
+  - 新增 `test_build_auto_loop_book_ticker_monitor_optional_store_seams_wires_loader_and_emitter`
+  - 新增 `test_build_auto_loop_book_ticker_monitor_default_seams_wires_probe_and_summary_builder`
+  - 更新 `test_build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker`，锁定 config builder 通过两个 seam helper 组装。
+  - 保持 `test_build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter` 通过，覆盖原有 wiring 契约。
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'build_auto_loop_book_ticker_monitor_optional_store_seams_wires_loader_and_emitter or build_auto_loop_book_ticker_monitor_default_seams_wires_probe_and_summary_builder or build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker or build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter'`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
+  - `.venv-typecheck/bin/python -m mypy`
+- 结果：focused 4 例通过；相关回归 `113 passed`；mypy 通过。
+
+### 2026-05-10｜monitor core / branch fallback 下沉 resolver helpers
+- 状态：已完成
+- 范围：把 monitor core、unavailable branch、health reader 里的 fallback seam 选择逻辑统一收口为 resolver helpers，进一步压薄 orchestration 层。
+- 变更：
+  - 新增 `resolve_auto_loop_book_ticker_websocket_capability_probe(config)`。
+  - 新增 `resolve_auto_loop_book_ticker_unavailable_summary_builder(config)`。
+  - 新增 `resolve_auto_loop_book_ticker_unavailable_event_emitter(store, config)`。
+  - 新增 `resolve_auto_loop_book_ticker_health_loader(store, config)`。
+  - `run_auto_loop_book_ticker_websocket_monitor_core(...)` 改为通过 `resolve_auto_loop_book_ticker_websocket_capability_probe(...)` 取 probe，再只做 branch dispatch。
+  - `run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(...)` 改为通过 summary/emitter resolver 取 seam。
+  - `read_auto_loop_book_ticker_health(...)` 改为通过 health loader resolver 取 seam。
+- 测试：
+  - 新增 `test_resolve_auto_loop_book_ticker_websocket_capability_probe_prefers_config_probe`
+  - 新增 `test_resolve_auto_loop_book_ticker_unavailable_summary_builder_prefers_config_builder`
+  - 新增 `test_resolve_auto_loop_book_ticker_unavailable_event_emitter_prefers_config_emitter`
+  - 新增 `test_resolve_auto_loop_book_ticker_health_loader_prefers_config_loader`
+  - 更新 `test_run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies`，锁定 core 只做 resolver + branch dispatch。
+  - 保持 `test_run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter` 与 `test_read_auto_loop_book_ticker_health_uses_config_loader` 通过，覆盖 resolver 接入后的旧契约。
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'resolve_auto_loop_book_ticker_websocket_capability_probe_prefers_config_probe or resolve_auto_loop_book_ticker_unavailable_summary_builder_prefers_config_builder or resolve_auto_loop_book_ticker_unavailable_event_emitter_prefers_config_emitter or resolve_auto_loop_book_ticker_health_loader_prefers_config_loader or run_auto_loop_book_ticker_websocket_monitor_core_uses_minimal_orchestration_dependencies or run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_summary_and_emitter or read_auto_loop_book_ticker_health_uses_config_loader'`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
+  - `.venv-typecheck/bin/python -m mypy`
+- 结果：focused 7 例通过；相关回归 `117 passed`；mypy 通过。
+
+### 2026-05-10｜available branch 补 symbol provider resolver seam
+- 状态：已完成
+- 范围：继续让 available branch 与 unavailable branch 对齐，把 symbol provider 的 fallback 选择显式收口为 resolver helper。
+- 变更：
+  - 新增 `resolve_auto_loop_book_ticker_symbol_provider(client, args, config)`。
+  - resolver 契约：优先返回 `config.symbol_provider`；缺省时回退到 `make_auto_loop_book_ticker_symbol_provider(client, args)`。
+  - 保持现有 available branch contract 不变，为下一步把 available branch 从直接读取 config 过渡到统一 resolver 形态打底。
+- 测试：
+  - 新增 `test_resolve_auto_loop_book_ticker_symbol_provider_prefers_config_provider`
+  - 新增 `test_resolve_auto_loop_book_ticker_symbol_provider_builds_fallback_provider`
+  - 保持 `test_run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health` 通过，锁定 available branch 旧契约继续稳定。
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'resolve_auto_loop_book_ticker_symbol_provider_prefers_config_provider or resolve_auto_loop_book_ticker_symbol_provider_builds_fallback_provider or run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health'`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py tests/test_strategy_v2_restore_regression.py`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
+  - `.venv-typecheck/bin/python -m mypy`
+- 结果：focused 3 例通过；相关回归 `119 passed`；mypy 通过。
+
+### 2026-05-10｜available branch 下沉 result builder 与 max_supervisor_cycles resolver
+- 状态：已完成
+- 范围：继续让 available branch 与 unavailable branch 对齐，把简单字段读取和返回值组装从 branch 编排里拆出
+- 改动：
+  - 新增 `resolve_auto_loop_book_ticker_max_supervisor_cycles(config)`，统一读取 `config.max_supervisor_cycles`
+  - 新增 `build_auto_loop_book_ticker_available_result(summary, health)`，统一 available branch 默认 payload 结构
+  - `run_auto_loop_book_ticker_websocket_monitor_available_branch(...)` 改为：resolver 取 max cycles → summary builder → health reader → result builder
+- 测试：
+  - 新增 `test_build_auto_loop_book_ticker_available_result_returns_default_payload`
+  - 新增 `test_resolve_auto_loop_book_ticker_max_supervisor_cycles_reads_config_value`
+  - 更新 `test_run_auto_loop_book_ticker_websocket_monitor_available_branch_uses_supervisor_and_health`
+- 结果：focused 3 例通过；相关回归 `121 passed`；mypy 通过。
+
+### 2026-05-10｜下沉 monitor event normalization helper 并复用到 execution parity 回归
+  - `pyproject.toml`
+  - `scripts/runtime_state_risk_helpers.py`
+  - `tests/test_execution_module_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 将 `scripts/risk_state_helpers.py` 与 `scripts/runtime_state_risk_helpers.py` 加入 `[tool.mypy].files`
+  - 为 `runtime_state_risk_helpers.py` 增加 `AppendRuntimeStateDegradedEvent` 与 `RefreshRiskStateHeatSnapshot` protocol，显式收口 `append_rate_limited_runtime_event(...)` 与 `refresh_risk_state_heat_snapshot(...)` 的注入签名
+  - 调整 `tests/test_execution_module_regression.py` 的 `monitor_live_trade` parity 断言，只比较稳定事件序列与收口后的 `trade_invalidated` 终态 payload，屏蔽 `consumer` 与 `time_in_trade_minutes` 这类运行时抖动字段
+- 验证：
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py` → `90 passed in 0.41s`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py scripts/risk_state_helpers.py scripts/runtime_state_risk_helpers.py tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py` → 通过
+- 遗留风险：
+  - runtime-state risk 路径当前仍主要通过 `tests/test_strategy_v2_restore_regression.py` 与 execution parity 回归覆盖，后续适合补 `runtime_state_risk_helpers.py` 直连单测文件，进一步缩短验证链路
+  - `tests/test_execution_module_regression.py` 当前对 `trade_invalidated` 事件采用稳定字段比较，后续若要继续抽 monitor seam，适合把事件归一化 helper 单独下沉复用
+- 对应待办编号：
+  - P1-5i
+  - P2-1c
+
+### 2026-05-10｜下沉 monitor event normalization helper 并复用到 execution parity 回归
+- 状态：已完成
+- 范围：把 `monitor_live_trade` parity 回归里用于稳定字段比较的 event 归一化逻辑下沉到 `scripts/execution_engine.py`，减少测试内局部去抖代码并固定 `trade_invalidated` 终态对比 contract
+- 修改文件：
+  - `scripts/execution_engine.py`
+  - `tests/test_execution_module_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 在 `scripts/execution_engine.py` 新增 `normalize_monitor_event_row(...)` 与 `normalize_monitor_event_rows(...)`，统一剥离 `recorded_at`、`opened_at`、`closed_at`、`consumer` 等运行时抖动字段
+  - 将 `trade_invalidated` 的 `time_in_trade_minutes` 归入 helper 内的稳定字段收口逻辑，固定 monitor parity 终态 payload 的比较边界
+  - `tests/test_execution_module_regression.py` 改为直接复用新 helper，对 script / extracted module 的事件序列比较只保留稳定事件类型与收口后的末条事件断言
+  - 新增 `test_normalize_monitor_event_rows_strips_runtime_noise_fields`，直接锁定 helper 对普通事件与 `trade_invalidated` 事件的去抖 contract
+- 验证：
+  - `pytest -q tests/test_execution_module_regression.py -k 'monitor_live_trade or normalize_monitor_event_rows'` → `4 passed, 9 deselected in 0.20s`
+  - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `91 passed in 0.41s`
+  - `.venv-typecheck/bin/python -m mypy` → `Success: no issues found in 15 source files`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py scripts/execution_engine.py scripts/risk_state_helpers.py scripts/runtime_state_risk_helpers.py tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py` → 通过
+- 遗留风险：
+  - 当前 helper 聚焦 monitor parity 的稳定字段收口，后续若要继续抽 monitor seam，适合把更多事件 schema 常量与断言入口一并下沉
+  - 主脚本 `binance_futures_momentum_long.py` 里的 monitor orchestration 仍保留较宽依赖注入面，下一步适合继续评估线程启动入口与 provider seam 的拆分优先级
+- 对应待办编号：
+  - P1-5j
+
 ### 2026-05-10｜下沉 load_risk_state consumer helper
 - 状态：已完成
 - 范围：把 `load_risk_state(...)` 的 `risk_state.json` 读取、degraded-event envelope、`positions` 读取与 heat snapshot 刷新边界一起下沉到 `runtime_state_risk_helpers.py`，并补齐 consumer-helper parity 回归
@@ -697,7 +1146,7 @@
 - 验证：
   - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py`
   - `python -m compileall -q scripts/binance_futures_momentum_long.py scripts/risk_state_helpers.py scripts/runtime_state_risk_helpers.py tests/test_strategy_v2_restore_regression.py tests/test_execution_module_regression.py`
-- 下一步：把 `runtime_state_risk_helpers.py` 与 `risk_state_helpers.py` 连同对应回归一起纳入项目级 mypy 覆盖；继续补 helper 直连回归，缩短 runtime-state risk 路径对主脚本集成回归的依赖
+- 下一步：评估 `binance_futures_momentum_long.py` 里剩余 monitor orchestration / thread provider seam 的下沉优先级，并继续收窄主脚本对 runtime 依赖注入面的体量
 
   - `pytest -q tests/test_strategy_v2_restore_regression.py -k "build_local_open_positions_for_risk_emits_rate_limited_event_on_malformed_positions_json or build_local_open_positions_for_risk_matches_runtime_state_helper"`
 - 完成标记：已完成
@@ -757,4 +1206,4 @@
 ---
 
 ## 下一步建议
-按顺序执行：把 `runtime_state_risk_helpers.py` 与 `risk_state_helpers.py` 连同 `tests/test_strategy_v2_restore_regression.py` 里的对应 parity / degraded regression 一起纳入项目级 mypy 覆盖范围 → 继续补 `runtime_state_risk_helpers.py` 直连单测，减少对主脚本动态加载回归的依赖 → 再评估是否把更多 runtime-state consumer seam 从 `binance_futures_momentum_long.py` 收口为独立 helper
+按顺序执行：先把 monitor / event normalization 里的稳定字段归一化逻辑抽成可复用 helper，减少 execution parity 测试中的局部去抖与重复断言 → 再评估 `binance_futures_momentum_long.py` 中剩余 runtime-state consumer seam 的下沉优先级与收益 → 最后决定是否继续拆出更细的 runtime-state consumer helpers

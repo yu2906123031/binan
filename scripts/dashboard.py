@@ -15,7 +15,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from binance_futures_momentum_long import RuntimeStateStore, load_dotenv
+_strategy_module = __import__('binance_futures_momentum_long')
+RuntimeStateStore = _strategy_module.RuntimeStateStore
+load_dotenv = _strategy_module.load_dotenv
 
 
 DEFAULT_RUNTIME_DIR = os.path.expanduser('~/.hermes/binance-futures-momentum-long/runtime-state')

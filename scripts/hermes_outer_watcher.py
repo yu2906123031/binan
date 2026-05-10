@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNNER = ROOT / 'main.py'
@@ -160,10 +160,10 @@ def _build_command(runner: Path, runtime_state_dir: Path, forwarded: Sequence[st
 def _run_once(cmd: Sequence[str], print_command: bool, timeout_sec: float = 0.0) -> subprocess.CompletedProcess[str]:
     if print_command:
         _emit('watcher_run_start', command=' '.join(cmd), timeout_sec=max(timeout_sec, 0.0))
-    run_kwargs = {'capture_output': True, 'text': True}
+    run_kwargs: Dict[str, Any] = {'capture_output': True, 'text': True}
     if timeout_sec > 0:
         run_kwargs['timeout'] = timeout_sec
-    return subprocess.run(cmd, **run_kwargs)
+    return cast(subprocess.CompletedProcess[str], subprocess.run(cmd, **run_kwargs))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

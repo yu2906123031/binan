@@ -1,16 +1,34 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+
+class AppendRuntimeStateDegradedEvent(Protocol):
+    def __call__(
+        self,
+        store: Any,
+        event_type: str,
+        payload: Dict[str, Any],
+        key: str,
+        min_interval_seconds: float = 60.0,
+    ) -> None: ...
+
+
+class RefreshRiskStateHeatSnapshot(Protocol):
+    def __call__(
+        self,
+        risk_state: Dict[str, Any],
+        positions_state: Any,
+        compute_positions_heat_snapshot_func: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]: ...
 
 
 CanonicalOpenPositionsIter = Callable[[Any], List[Tuple[str, Dict[str, Any]]]]
 NormalizePositionSide = Callable[[Any], str]
 ShouldEmitRuntimeStateDegraded = Callable[[Any, str], bool]
-AppendRuntimeStateDegradedEvent = Callable[[Any, str, Dict[str, Any], str], None]
 ToFloat = Callable[..., float]
 DefaultRiskState = Callable[[], Dict[str, Any]]
 NormalizeLoadedRiskState = Callable[[Any], Dict[str, Any]]
-RefreshRiskStateHeatSnapshot = Callable[[Dict[str, Any], Any], Dict[str, Any]]
 ComputePositionsHeatSnapshot = Callable[[Any], Dict[str, Any]]
 
 
@@ -96,4 +114,8 @@ def load_runtime_risk_state(
         )
     normalized = normalize_loaded_risk_state(default_risk_state() if error else state)
     positions_state = store.load_json('positions', {})
-    return refresh_risk_state_heat_snapshot(normalized, positions_state, compute_positions_heat_snapshot)
+    return refresh_risk_state_heat_snapshot(
+        normalized,
+        positions_state,
+        compute_positions_heat_snapshot,
+    )

@@ -1456,26 +1456,327 @@ def persist_user_data_stream_monitor_to_positions(store: RuntimeStateStore, uds_
     return positions_state
 
 
-def emit_user_data_stream_alert_if_needed(args: argparse.Namespace, symbol: Optional[str], uds_monitor: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if uds_monitor.get('status') not in {'refresh_failed', 'disconnected'}:
+def emit_user_data_stream_alert_if_needed(
+    args: argparse.Namespace,
+    symbol: Optional[str],
+    monitor: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(monitor, dict):
         return None
-    health = uds_monitor.get('health', {}) if isinstance(uds_monitor.get('health'), dict) else {}
+    if str(monitor.get('status') or '').strip().lower() not in {'unhealthy', 'disconnected', 'refresh_failed'}:
+        return None
     payload = {
-        'symbol': symbol or health.get('symbol'),
-        'listen_key': uds_monitor.get('listen_key'),
-        'status': uds_monitor.get('status'),
-        'action': uds_monitor.get('action'),
-        'error': uds_monitor.get('error') or health.get('detail'),
-        'detail': health.get('detail'),
-        'disconnect_count': health.get('disconnect_count', 0),
-        'refresh_failure_count': health.get('refresh_failure_count', 0),
-        'reconnect_count': health.get('reconnect_count', 0),
-        'started_at': health.get('started_at'),
-        'last_refresh_at': health.get('last_refresh_at'),
-        'updated_at': health.get('updated_at'),
+        'symbol': str(symbol or monitor.get('symbol') or '').upper(),
+        'status': str(monitor.get('status') or '').lower(),
+        'detail': str(monitor.get('detail') or ''),
+        'listen_key': str(monitor.get('listen_key') or ''),
+        'disconnect_count': int(monitor.get('disconnect_count', 0) or 0),
+        'refresh_failure_count': int(monitor.get('refresh_failure_count', 0) or 0),
+        'now_utc': str(monitor.get('now_utc') or _isoformat_utc(_utc_now())),
     }
     emit_notification(args, 'user_data_stream_alert', payload)
     return payload
+
+
+@dataclass(frozen=True)
+class AutoLoopBookTickerWebsocketMonitorConfig:
+    symbol_provider: Optional[Callable[[], List[str]]] = None
+    health_loader: Optional[Callable[[], Dict[str, Any]]] = None
+    health_store_key: str = 'book_ticker_ws_status'
+    websocket_capability_probe: Optional[Callable[[], Any]] = None
+    unavailable_event_emitter: Optional[Callable[[Dict[str, Any]], None]] = None
+    unavailable_summary_builder: Optional[Callable[[str], Dict[str, Any]]] = None
+    unavailable_reason: str = 'websocket_client_missing'
+    max_supervisor_cycles: int = 1
+
+
+def make_auto_loop_book_ticker_symbol_provider(
+    client: BinanceFuturesClient,
+    args: argparse.Namespace,
+) -> Callable[[], List[str]]:
+    return lambda: resolve_auto_loop_book_ticker_symbols(client, args)
+
+
+def make_auto_loop_book_ticker_health_loader(
+    store: RuntimeStateStore,
+    health_store_key: str = 'book_ticker_ws_status',
+) -> Callable[[], Dict[str, Any]]:
+    def _load_health() -> Dict[str, Any]:
+        health = store.load_json(health_store_key, {})
+        if not isinstance(health, dict):
+            return {}
+        return health
+
+    return _load_health
+
+
+def make_auto_loop_book_ticker_websocket_capability_probe() -> Callable[[], Any]:
+    return lambda: globals().get('websocket')
+
+
+def make_auto_loop_book_ticker_unavailable_event_emitter(
+    store: RuntimeStateStore,
+) -> Callable[[Dict[str, Any]], None]:
+    def _emit_unavailable(summary: Dict[str, Any]) -> None:
+        append_rate_limited_runtime_event(store, 'book_ticker_ws_unavailable', {
+            'event_source': 'book_ticker_websocket',
+            'reason': summary.get('reason', 'websocket_client_missing'),
+        }, key='global', min_interval_seconds=3600.0)
+
+    return _emit_unavailable
+
+
+def make_auto_loop_book_ticker_unavailable_summary_builder() -> Callable[[str], Dict[str, Any]]:
+    def _build_unavailable_summary(reason: str) -> Dict[str, Any]:
+        return {
+            'status': 'unavailable',
+            'reason': reason,
+        }
+
+    return _build_unavailable_summary
+
+
+@dataclass(frozen=True)
+class AutoLoopUserDataStreamMonitorConfig:
+    okx_simulated_trading: bool = False
+    refresh_interval_minutes: float = 30.0
+    disconnect_timeout_minutes: float = 65.0
+
+
+def build_auto_loop_book_ticker_monitor_optional_store_seams(
+    store: Optional[RuntimeStateStore],
+    health_store_key: str = 'book_ticker_ws_status',
+) -> Dict[str, Any]:
+    if store is None:
+        return {
+            'health_loader': None,
+            'unavailable_event_emitter': None,
+        }
+    return {
+        'health_loader': make_auto_loop_book_ticker_health_loader(store, health_store_key),
+        'unavailable_event_emitter': make_auto_loop_book_ticker_unavailable_event_emitter(store),
+    }
+
+
+def build_auto_loop_book_ticker_monitor_default_seams() -> Dict[str, Any]:
+    return {
+        'websocket_capability_probe': make_auto_loop_book_ticker_websocket_capability_probe(),
+        'unavailable_summary_builder': make_auto_loop_book_ticker_unavailable_summary_builder(),
+    }
+
+
+def build_auto_loop_book_ticker_websocket_monitor_config(
+    client: BinanceFuturesClient,
+    args: argparse.Namespace,
+    store: Optional[RuntimeStateStore] = None,
+) -> AutoLoopBookTickerWebsocketMonitorConfig:
+    health_store_key = 'book_ticker_ws_status'
+    optional_store_seams = build_auto_loop_book_ticker_monitor_optional_store_seams(
+        store=store,
+        health_store_key=health_store_key,
+    )
+    default_seams = build_auto_loop_book_ticker_monitor_default_seams()
+    return AutoLoopBookTickerWebsocketMonitorConfig(
+        symbol_provider=make_auto_loop_book_ticker_symbol_provider(client, args),
+        health_loader=optional_store_seams['health_loader'],
+        health_store_key=health_store_key,
+        websocket_capability_probe=default_seams['websocket_capability_probe'],
+        unavailable_event_emitter=optional_store_seams['unavailable_event_emitter'],
+        unavailable_summary_builder=default_seams['unavailable_summary_builder'],
+        unavailable_reason='websocket_client_missing',
+        max_supervisor_cycles=1,
+    )
+
+
+def build_auto_loop_user_data_stream_monitor_config(
+    args: argparse.Namespace,
+) -> AutoLoopUserDataStreamMonitorConfig:
+    return AutoLoopUserDataStreamMonitorConfig(
+        okx_simulated_trading=bool(getattr(args, 'okx_simulated_trading', False)),
+        refresh_interval_minutes=float(getattr(args, 'user_stream_refresh_interval_minutes', 30.0) or 30.0),
+        disconnect_timeout_minutes=float(getattr(args, 'user_stream_disconnect_timeout_minutes', 65.0) or 65.0),
+    )
+
+
+def run_auto_loop_book_ticker_websocket_monitor(
+    client: BinanceFuturesClient,
+    store: RuntimeStateStore,
+    args: argparse.Namespace,
+    config: Optional[AutoLoopBookTickerWebsocketMonitorConfig] = None,
+) -> Dict[str, Any]:
+    """Compatibility wrapper: build fallback config then delegate to core helper."""
+    monitor_config = config or build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=store)
+    return run_auto_loop_book_ticker_websocket_monitor_core(store=store, config=monitor_config)
+
+
+def resolve_auto_loop_book_ticker_symbol_provider(
+    *,
+    client: BinanceFuturesClient,
+    args: argparse.Namespace,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Callable[[], Sequence[str]]:
+    symbol_provider = config.symbol_provider
+    if symbol_provider is not None:
+        return symbol_provider
+    return make_auto_loop_book_ticker_symbol_provider(client, args)
+
+
+def resolve_auto_loop_book_ticker_websocket_capability_probe(
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Callable[[], Any]:
+    return config.websocket_capability_probe or make_auto_loop_book_ticker_websocket_capability_probe()
+
+
+def resolve_auto_loop_book_ticker_unavailable_summary_builder(
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Callable[[str], Dict[str, Any]]:
+    return config.unavailable_summary_builder or make_auto_loop_book_ticker_unavailable_summary_builder()
+
+
+def resolve_auto_loop_book_ticker_unavailable_event_emitter(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Callable[[Dict[str, Any]], None]:
+    return config.unavailable_event_emitter or make_auto_loop_book_ticker_unavailable_event_emitter(store)
+
+
+def resolve_auto_loop_book_ticker_health_loader(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Callable[[], Dict[str, Any]]:
+    return config.health_loader or make_auto_loop_book_ticker_health_loader(store, config.health_store_key)
+
+
+def resolve_auto_loop_book_ticker_max_supervisor_cycles(
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Optional[int]:
+    return config.max_supervisor_cycles
+
+
+def run_auto_loop_book_ticker_websocket_monitor_core(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Dict[str, Any]:
+    monitor_config = config
+    websocket_capability_probe = resolve_auto_loop_book_ticker_websocket_capability_probe(monitor_config)
+    ws_module = websocket_capability_probe()
+    if ws_module is None:
+        return run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(store=store, config=monitor_config)
+    return run_auto_loop_book_ticker_websocket_monitor_available_branch(store=store, config=monitor_config, ws_module=ws_module)
+
+
+def run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Dict[str, Any]:
+    unavailable_summary_builder = resolve_auto_loop_book_ticker_unavailable_summary_builder(config)
+    summary = unavailable_summary_builder(config.unavailable_reason)
+    unavailable_event_emitter = resolve_auto_loop_book_ticker_unavailable_event_emitter(store=store, config=config)
+    unavailable_event_emitter(summary)
+    return build_auto_loop_book_ticker_unavailable_result(summary=summary)
+
+
+def build_auto_loop_book_ticker_unavailable_result(*, summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'status': 'unavailable',
+        'summary': summary,
+        'health': {},
+    }
+
+
+def run_auto_loop_book_ticker_websocket_monitor_available_branch(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+    ws_module: Any,
+) -> Dict[str, Any]:
+    symbol_provider = config.symbol_provider
+    if symbol_provider is None:
+        raise ValueError('AutoLoopBookTickerWebsocketMonitorConfig.symbol_provider is required for available branch')
+    max_supervisor_cycles = resolve_auto_loop_book_ticker_max_supervisor_cycles(config)
+    summary = build_auto_loop_book_ticker_supervisor_summary(
+        store=store,
+        symbol_provider=symbol_provider,
+        ws_module=ws_module,
+        max_supervisor_cycles=max_supervisor_cycles,
+    )
+    health = read_auto_loop_book_ticker_health(store=store, config=config)
+    return build_auto_loop_book_ticker_available_result(summary=summary, health=health)
+
+
+def build_auto_loop_book_ticker_available_result(*, summary: Dict[str, Any], health: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'status': 'available',
+        'summary': summary,
+        'health': health,
+    }
+
+
+def build_auto_loop_book_ticker_supervisor_summary(
+    *,
+    store: RuntimeStateStore,
+    symbol_provider: Callable[[], Sequence[str]],
+    ws_module: Any,
+    max_supervisor_cycles: Optional[int],
+) -> Dict[str, Any]:
+    initial_symbols = list(symbol_provider())
+    return run_book_ticker_websocket_supervisor(
+        store,
+        initial_symbols=initial_symbols,
+        symbol_provider=symbol_provider,
+        ws_module=ws_module,
+        max_supervisor_cycles=max_supervisor_cycles,
+    )
+
+
+def read_auto_loop_book_ticker_health(
+    *,
+    store: RuntimeStateStore,
+    config: AutoLoopBookTickerWebsocketMonitorConfig,
+) -> Dict[str, Any]:
+    health_loader = resolve_auto_loop_book_ticker_health_loader(store=store, config=config)
+    return health_loader()
+
+
+def run_auto_loop_user_data_stream_monitor(
+    client: BinanceFuturesClient,
+    store: RuntimeStateStore,
+    args: argparse.Namespace,
+    config: Optional[AutoLoopUserDataStreamMonitorConfig] = None,
+) -> Dict[str, Any]:
+    monitor_config = config or build_auto_loop_user_data_stream_monitor_config(args)
+    if monitor_config.okx_simulated_trading:
+        uds_monitor = {
+            'status': 'skipped',
+            'action': 'skipped',
+            'exchange': 'OKX_SIMULATED',
+            'listen_key': '',
+            'detail': 'okx_simulated_trading_uses_okx_private_state_not_binance_listen_key',
+            'now_utc': _isoformat_utc(_utc_now()),
+            'refresh_failure_count': 0,
+            'disconnect_count': 0,
+        }
+        store.save_json('user_data_stream', uds_monitor)
+        return {'monitor': uds_monitor, 'alert': None}
+    existing_uds_state = store.load_json('user_data_stream', {})
+    if not (isinstance(existing_uds_state, dict) and existing_uds_state.get('listen_key')):
+        return {'monitor': None, 'alert': None}
+    uds_monitor = run_user_data_stream_monitor_cycle(
+        client=client,
+        store=store,
+        symbol=existing_uds_state.get('symbol'),
+        refresh_interval_minutes=monitor_config.refresh_interval_minutes,
+        disconnect_timeout_minutes=monitor_config.disconnect_timeout_minutes,
+    )
+    persist_user_data_stream_monitor_to_positions(store, uds_monitor)
+    return {
+        'monitor': uds_monitor,
+        'alert': emit_user_data_stream_alert_if_needed(args, existing_uds_state.get('symbol'), uds_monitor),
+    }
 
 
 def summarize_candidate_rejected_events(store: RuntimeStateStore, limit: int = 1000) -> Dict[str, Any]:
@@ -6129,57 +6430,25 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     cycle: Dict[str, Any] = {'reconcile': reconcile}
     result['cycles'].append(cycle)
     if getattr(args, 'auto_loop', False):
-        ws_module = globals().get('websocket')
-        if ws_module is not None:
-            book_ticker_symbols = resolve_auto_loop_book_ticker_symbols(client, args)
-            book_ticker_summary = run_book_ticker_websocket_supervisor(
-                store,
-                initial_symbols=book_ticker_symbols,
-                symbol_provider=lambda: resolve_auto_loop_book_ticker_symbols(client, args),
-                ws_module=ws_module,
-                max_supervisor_cycles=1,
-            )
-            book_ticker_health = store.load_json('book_ticker_ws_status', {})
-            if not isinstance(book_ticker_health, dict):
-                book_ticker_health = {}
-            cycle['book_ticker_websocket'] = dict(book_ticker_summary, health=book_ticker_health)
-        else:
-            cycle['book_ticker_websocket'] = {
-                'status': 'unavailable',
-                'reason': 'websocket_client_missing',
-            }
-            append_rate_limited_runtime_event(store, 'book_ticker_ws_unavailable', {
-                'event_source': 'book_ticker_websocket',
-                'reason': 'websocket_client_missing',
-            }, key='global', min_interval_seconds=3600.0)
-        if okx_simulated_trading:
-            uds_monitor = {
-                'status': 'skipped',
-                'action': 'skipped',
-                'exchange': 'OKX_SIMULATED',
-                'listen_key': '',
-                'detail': 'okx_simulated_trading_uses_okx_private_state_not_binance_listen_key',
-                'now_utc': _isoformat_utc(_utc_now()),
-                'refresh_failure_count': 0,
-                'disconnect_count': 0,
-            }
-            store.save_json('user_data_stream', uds_monitor)
+        book_ticker_config = build_auto_loop_book_ticker_websocket_monitor_config(client, args, store=store)
+        user_data_stream_config = build_auto_loop_user_data_stream_monitor_config(args)
+        book_ticker_result = run_auto_loop_book_ticker_websocket_monitor_core(
+            store=store,
+            config=book_ticker_config,
+        )
+        cycle['book_ticker_websocket'] = dict(book_ticker_result.get('summary', {}), health=book_ticker_result.get('health', {}))
+        user_data_stream_result = run_auto_loop_user_data_stream_monitor(
+            client=client,
+            store=store,
+            args=args,
+            config=user_data_stream_config,
+        )
+        uds_monitor = user_data_stream_result.get('monitor')
+        if uds_monitor is not None:
             cycle['user_data_stream_monitor'] = uds_monitor
-        else:
-            existing_uds_state = store.load_json('user_data_stream', {})
-            if isinstance(existing_uds_state, dict) and existing_uds_state.get('listen_key'):
-                uds_monitor = run_user_data_stream_monitor_cycle(
-                    client=client,
-                    store=store,
-                    symbol=existing_uds_state.get('symbol'),
-                    refresh_interval_minutes=float(getattr(args, 'user_stream_refresh_interval_minutes', 30.0) or 30.0),
-                    disconnect_timeout_minutes=float(getattr(args, 'user_stream_disconnect_timeout_minutes', 65.0) or 65.0),
-                )
-                persist_user_data_stream_monitor_to_positions(store, uds_monitor)
-                cycle['user_data_stream_monitor'] = uds_monitor
-                alert_payload = emit_user_data_stream_alert_if_needed(args, existing_uds_state.get('symbol'), uds_monitor)
-                if alert_payload is not None:
-                    cycle['user_data_stream_alert'] = alert_payload
+        alert_payload = user_data_stream_result.get('alert')
+        if alert_payload is not None:
+            cycle['user_data_stream_alert'] = alert_payload
     if reconcile.get('positions_missing_protection') and reconcile.get('ok', True):
         symbols = reconcile.get('positions_missing_protection', [])
         halt_reason = f"missing_protection:{','.join(symbols)}"
