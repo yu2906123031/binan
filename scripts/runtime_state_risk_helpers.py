@@ -8,6 +8,10 @@ NormalizePositionSide = Callable[[Any], str]
 ShouldEmitRuntimeStateDegraded = Callable[[Any, str], bool]
 AppendRuntimeStateDegradedEvent = Callable[[Any, str, Dict[str, Any], str], None]
 ToFloat = Callable[..., float]
+DefaultRiskState = Callable[[], Dict[str, Any]]
+NormalizeLoadedRiskState = Callable[[Any], Dict[str, Any]]
+RefreshRiskStateHeatSnapshot = Callable[[Dict[str, Any], Any], Dict[str, Any]]
+ComputePositionsHeatSnapshot = Callable[[Any], Dict[str, Any]]
 
 
 def build_local_open_positions_from_state(
@@ -66,3 +70,30 @@ def load_local_open_positions_for_risk(
         to_float=to_float,
         iter_canonical_open_positions=iter_canonical_open_positions,
     )
+
+
+def load_runtime_risk_state(
+    store: Any,
+    *,
+    should_emit_runtime_state_degraded: ShouldEmitRuntimeStateDegraded,
+    append_runtime_state_degraded_event: AppendRuntimeStateDegradedEvent,
+    default_risk_state: DefaultRiskState,
+    normalize_loaded_risk_state: NormalizeLoadedRiskState,
+    refresh_risk_state_heat_snapshot: RefreshRiskStateHeatSnapshot,
+    compute_positions_heat_snapshot: ComputePositionsHeatSnapshot,
+) -> Dict[str, Any]:
+    state, error = store.load_json_with_error('risk_state', default_risk_state())
+    if error and should_emit_runtime_state_degraded(store, 'risk_state'):
+        append_runtime_state_degraded_event(
+            store,
+            'runtime_state_degraded',
+            {
+                **error,
+                'fallback_used': 'default_risk_state',
+                'consumer': 'load_risk_state',
+            },
+            key='risk_state',
+        )
+    normalized = normalize_loaded_risk_state(default_risk_state() if error else state)
+    positions_state = store.load_json('positions', {})
+    return refresh_risk_state_heat_snapshot(normalized, positions_state, compute_positions_heat_snapshot)

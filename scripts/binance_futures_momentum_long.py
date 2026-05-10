@@ -24,7 +24,7 @@ from execution_engine import ensure_symbol_margin_type as execution_ensure_symbo
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
-from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl, load_local_open_positions_for_risk as load_local_open_positions_for_risk_impl
+from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl, load_local_open_positions_for_risk as load_local_open_positions_for_risk_impl, load_runtime_risk_state as load_runtime_risk_state_impl
 from runtime_store import RuntimeStateStore as RuntimeStateStoreImpl, restore_position_lifecycle_fields as restore_position_lifecycle_fields_impl, save_positions_state as save_positions_state_impl
 
 try:
@@ -5250,18 +5250,24 @@ def normalize_loaded_risk_state(state: Any) -> Dict[str, Any]:
     return normalize_loaded_risk_state_impl(state, default_risk_state)
 
 
-def refresh_risk_state_heat_snapshot(risk_state: Dict[str, Any], positions_state: Any) -> Dict[str, Any]:
-    return refresh_risk_state_heat_snapshot_impl(risk_state, positions_state, compute_positions_heat_snapshot)
+def refresh_risk_state_heat_snapshot(risk_state: Dict[str, Any], positions_state: Any, compute_positions_heat_snapshot_func=None) -> Dict[str, Any]:
+    return refresh_risk_state_heat_snapshot_impl(
+        risk_state,
+        positions_state,
+        compute_positions_heat_snapshot_func or compute_positions_heat_snapshot,
+    )
 
 
 def load_risk_state(store: RuntimeStateStore) -> Dict[str, Any]:
-    state, error = store.load_json_with_error('risk_state', default_risk_state())
-    if error:
-        if _should_emit_runtime_state_degraded(store, 'risk_state'):
-            store.append_event('runtime_state_degraded', {**error, 'fallback_used': 'default_risk_state', 'consumer': 'load_risk_state'})
-        state = default_risk_state()
-    merged = normalize_loaded_risk_state(state)
-    return refresh_risk_state_heat_snapshot(merged, store.load_json('positions', {}))
+    return load_runtime_risk_state_impl(
+        store,
+        should_emit_runtime_state_degraded=_should_emit_runtime_state_degraded,
+        append_runtime_state_degraded_event=append_rate_limited_runtime_event,
+        default_risk_state=default_risk_state,
+        normalize_loaded_risk_state=normalize_loaded_risk_state,
+        refresh_risk_state_heat_snapshot=refresh_risk_state_heat_snapshot,
+        compute_positions_heat_snapshot=compute_positions_heat_snapshot,
+    )
 
 
 def log_runtime_event(event_type: str, payload: Dict[str, Any]) -> None:

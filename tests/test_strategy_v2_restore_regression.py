@@ -952,6 +952,111 @@ def test_refresh_risk_state_heat_snapshot_matches_risk_state_module(monkeypatch)
     assert actual == expected
 
 
+def test_load_risk_state_matches_runtime_state_consumer_helper(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('risk_state', {
+        'daily_realized_pnl': -12.5,
+        'portfolio_heat_open_r': 0.4,
+        'symbol_cooldowns': ['corrupted'],
+        'portfolio_exposure_pct_by_theme': ['bad'],
+        'portfolio_heat_r_by_theme': {'old_theme': 0.4},
+        'portfolio_heat_r_by_correlation': {'old_corr': 0.6},
+    })
+    store.save_json('positions', {'BTCUSDT:LONG': {'symbol': 'BTCUSDT', 'position_side': 'LONG'}})
+
+    heat_snapshot = {
+        'tracked_positions': 2,
+        'open_heat_r': 1.8,
+        'heat_r_by_theme': {'ai': 1.1},
+        'heat_r_by_correlation': {'meme-beta': 0.7},
+    }
+    monkeypatch.setattr(mod, 'compute_positions_heat_snapshot', lambda _positions: dict(heat_snapshot))
+    expected = mod.load_risk_state(store)
+
+    helper_path = SCRIPTS_DIR / 'runtime_state_risk_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('runtime_state_risk_helpers', helper_path)
+    assert helper_spec is not None
+    helper_mod = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_mod
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_mod)
+
+    helper_root = tmp_path / 'helper-store'
+    helper_root.mkdir(parents=True, exist_ok=True)
+    helper_store = mod.RuntimeStateStore(str(helper_root))
+    helper_store.save_json('risk_state', {
+        'daily_realized_pnl': -12.5,
+        'portfolio_heat_open_r': 0.4,
+        'symbol_cooldowns': ['corrupted'],
+        'portfolio_exposure_pct_by_theme': ['bad'],
+        'portfolio_heat_r_by_theme': {'old_theme': 0.4},
+        'portfolio_heat_r_by_correlation': {'old_corr': 0.6},
+    })
+    helper_store.save_json('positions', {'BTCUSDT:LONG': {'symbol': 'BTCUSDT', 'position_side': 'LONG'}})
+
+    actual = helper_mod.load_runtime_risk_state(
+        helper_store,
+        should_emit_runtime_state_degraded=mod._should_emit_runtime_state_degraded,
+        append_runtime_state_degraded_event=mod.append_rate_limited_runtime_event,
+        default_risk_state=mod.default_risk_state,
+        normalize_loaded_risk_state=mod.normalize_loaded_risk_state,
+        refresh_risk_state_heat_snapshot=mod.refresh_risk_state_heat_snapshot,
+        compute_positions_heat_snapshot=lambda _positions: dict(heat_snapshot),
+    )
+
+    assert actual == expected
+
+
+def test_load_risk_state_matches_runtime_state_consumer_helper_on_malformed_risk_state_json(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    (tmp_path / 'risk_state.json').write_text('{bad json', encoding='utf-8')
+    store.save_json('positions', {'BTCUSDT:LONG': {'symbol': 'BTCUSDT', 'position_side': 'LONG'}})
+
+    heat_snapshot = {
+        'tracked_positions': 2,
+        'open_heat_r': 1.8,
+        'heat_r_by_theme': {'ai': 1.1},
+        'heat_r_by_correlation': {'meme-beta': 0.7},
+    }
+    monkeypatch.setattr(mod, 'compute_positions_heat_snapshot', lambda _positions: dict(heat_snapshot))
+    expected = mod.load_risk_state(store)
+    expected_events = store.read_events(limit=10)
+
+    helper_path = SCRIPTS_DIR / 'runtime_state_risk_helpers.py'
+    helper_spec = importlib.util.spec_from_file_location('runtime_state_risk_helpers', helper_path)
+    assert helper_spec is not None
+    helper_mod = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper_mod
+    assert helper_spec.loader is not None
+    helper_spec.loader.exec_module(helper_mod)
+
+    helper_root = tmp_path / 'helper-risk-store'
+    helper_root.mkdir(parents=True, exist_ok=True)
+    (helper_root / 'risk_state.json').write_text('{bad json', encoding='utf-8')
+    helper_store = mod.RuntimeStateStore(str(helper_root))
+    helper_store.save_json('positions', {'BTCUSDT:LONG': {'symbol': 'BTCUSDT', 'position_side': 'LONG'}})
+
+    actual = helper_mod.load_runtime_risk_state(
+        helper_store,
+        should_emit_runtime_state_degraded=mod._should_emit_runtime_state_degraded,
+        append_runtime_state_degraded_event=mod.append_rate_limited_runtime_event,
+        default_risk_state=mod.default_risk_state,
+        normalize_loaded_risk_state=mod.normalize_loaded_risk_state,
+        refresh_risk_state_heat_snapshot=mod.refresh_risk_state_heat_snapshot,
+        compute_positions_heat_snapshot=lambda _positions: dict(heat_snapshot),
+    )
+    actual_events = helper_store.read_events(limit=10)
+
+    assert actual == expected
+    assert len(expected_events) == 1
+    assert len(actual_events) == 1
+    assert expected_events[0]['event_type'] == actual_events[0]['event_type'] == 'runtime_state_degraded'
+    assert expected_events[0]['state_key'] == actual_events[0]['state_key'] == 'risk_state'
+    assert expected_events[0]['state_file'] == actual_events[0]['state_file'] == 'risk_state.json'
+    assert expected_events[0]['fallback_used'] == actual_events[0]['fallback_used'] == 'default_risk_state'
+    assert expected_events[0]['consumer'] == actual_events[0]['consumer'] == 'load_risk_state'
+
+
 def test_runtime_store_load_json_returns_default_for_malformed_last_cycle_json_without_rewrite(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     raw_path = tmp_path / 'last_cycle.json'
