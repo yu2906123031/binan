@@ -288,6 +288,34 @@ def test_execution_module_matches_script_ensure_symbol_margin_type():
     ]
 
 
+def test_execution_module_ensure_symbol_margin_type_falls_back_to_crossed_under_multi_assets_mode():
+    class MultiAssetsClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append((path, dict(params)))
+            raise mod.BinanceAPIError("Binance API error 400: {'code': -4168, 'msg': 'Unable to adjust to isolated-margin mode under the Multi-Assets mode.'}")
+
+    client = MultiAssetsClient()
+
+    result = exec_mod.ensure_symbol_margin_type(
+        client,
+        'TESTUSDT',
+        binance_api_error=mod.BinanceAPIError,
+    )
+
+    assert result['ok'] is True
+    assert result['requested'] == 'ISOLATED'
+    assert result['actual'] == 'CROSSED'
+    assert result['applied'] is False
+    assert result['multi_assets_mode'] is True
+    assert result['fallback_reason'] == 'binance_multi_assets_mode_blocks_isolated'
+    assert client.calls == [
+        ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'})
+    ]
+
+
 def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     candidate = make_candidate()
     meta = make_meta()

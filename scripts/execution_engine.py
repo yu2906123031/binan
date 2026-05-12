@@ -185,6 +185,8 @@ def ensure_symbol_margin_type(
             'actual': normalized_margin_type,
             'response': response if isinstance(response, dict) else {},
             'already_set': False,
+            'applied': normalized_margin_type == 'ISOLATED',
+            'multi_assets_mode': False,
         }
     except binance_api_error as exc:
         message = str(exc)
@@ -195,6 +197,19 @@ def ensure_symbol_margin_type(
                 'actual': normalized_margin_type,
                 'response': {'message': message},
                 'already_set': True,
+                'applied': normalized_margin_type == 'ISOLATED',
+                'multi_assets_mode': False,
+            }
+        if normalized_margin_type == 'ISOLATED' and ('-4168' in message or 'Multi-Assets mode' in message):
+            return {
+                'ok': True,
+                'requested': normalized_margin_type,
+                'actual': 'CROSSED',
+                'response': {'message': message},
+                'already_set': False,
+                'applied': False,
+                'multi_assets_mode': True,
+                'fallback_reason': 'binance_multi_assets_mode_blocks_isolated',
             }
         raise
 
@@ -218,6 +233,7 @@ def place_live_trade(
     fetch_open_orders: Callable[..., Any],
     fetch_open_algo_orders: Callable[..., Any],
     place_stop_market_order: Callable[..., Dict[str, Any]],
+    place_take_profit_market_order: Optional[Callable[..., Dict[str, Any]]],
     resolve_position_protection_status: Callable[..., Dict[str, Any]],
     recover_unknown_entry_order: Callable[..., Dict[str, Any]],
     query_order: Callable[..., Dict[str, Any]],
@@ -405,6 +421,8 @@ def place_live_trade(
         side=normalize_position_side(getattr(candidate, 'side', position_side_long)),
         breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
         breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
+        tp1_profit_usdt=float(getattr(args, 'tp1_profit_usdt', 0.0) or 0.0),
+        tp2_profit_usdt=float(getattr(args, 'tp2_profit_usdt', 0.0) or 0.0),
     )
     payload = {
         'symbol': candidate.symbol,
@@ -473,6 +491,28 @@ def place_live_trade(
     }
     log_runtime_event('initial_stop_placed', stop_payload)
     emit_notification(args, 'initial_stop_placed', stop_payload)
+    position_side = normalize_position_side(getattr(candidate, 'side', position_side_long))
+    tp1_order = None
+    if place_take_profit_market_order and plan.tp1_close_qty > 0:
+        tp1_order = place_take_profit_market_order(
+            client,
+            candidate.symbol,
+            float(plan.tp1_trigger_price),
+            float(plan.tp1_close_qty),
+            meta,
+            side=position_side,
+        )
+    tp2_order = None
+    tp2_close_qty = float(plan.tp2_close_qty) + float(plan.runner_qty)
+    if place_take_profit_market_order and tp2_close_qty > 0:
+        tp2_order = place_take_profit_market_order(
+            client,
+            candidate.symbol,
+            float(plan.tp2_trigger_price),
+            tp2_close_qty,
+            meta,
+            side=position_side,
+        )
     return {
         'symbol': candidate.symbol,
         'side': normalize_position_side(getattr(candidate, 'side', position_side_long)),
@@ -491,6 +531,8 @@ def place_live_trade(
             'response': leverage_response if isinstance(leverage_response, dict) else {},
         },
         'stop_order': stop_order,
+        'tp1_order': tp1_order,
+        'tp2_order': tp2_order,
         'protection_check': protection,
         'trade_management_plan': asdict(plan),
     }

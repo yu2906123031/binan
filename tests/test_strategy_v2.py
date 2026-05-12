@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -2350,6 +2351,9 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
         liquidity_grade='B',
         expected_slippage_pct=0.23,
         book_depth_fill_ratio=0.63,
+        must_pass_flags={'execution_slippage_ok': True, 'execution_depth_ok': True},
+        quality_score=85.0,
+        execution_priority_score=40.0,
         setup_ready=True,
         trigger_fired=True,
     )
@@ -2390,6 +2394,7 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
     monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
     monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 54321, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 98765, 'clientOrderId': 'tp-1'})
     monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321})
 
     result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
@@ -2401,6 +2406,283 @@ def test_place_live_trade_applies_execution_quality_size_multiplier(monkeypatch)
     assert result['trade_management_plan']['quantity'] == 6.5
     assert result['entry_order_feedback']['status'] == 'FILLED'
 
+
+def test_build_trade_management_plan_supports_absolute_profit_targets():
+    plan = mod.build_trade_management_plan(
+        entry_price=100.0,
+        stop_price=98.0,
+        quantity=2.0,
+        tp1_r=1.5,
+        tp1_close_pct=0.5,
+        tp2_r=2.0,
+        tp2_close_pct=0.5,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+    )
+
+    assert plan.tp1_trigger_price == 102.5
+    assert plan.tp2_trigger_price == 105.0
+    assert plan.tp1_close_qty == 1.0
+    assert plan.tp2_close_qty == 1.0
+
+
+def test_build_trade_management_plan_from_position_prefers_persisted_absolute_profit_targets():
+    position = {
+        'symbol': 'TESTUSDT',
+        'position_side': 'LONG',
+        'entry_price': 100.0,
+        'stop_price': 98.0,
+        'current_stop_price': 98.0,
+        'quantity': 2.0,
+        'tp1_profit_usdt': 5.0,
+        'tp2_profit_usdt': 10.0,
+        'trade_management_plan': {
+            'entry_price': 100.0,
+            'stop_price': 98.0,
+            'quantity': 2.0,
+            'initial_risk_per_unit': 2.0,
+            'breakeven_trigger_price': 102.0,
+            'tp1_trigger_price': 102.5,
+            'tp1_close_qty': 1.0,
+            'tp2_trigger_price': 105.0,
+            'tp2_close_qty': 1.0,
+            'runner_qty': 0.0,
+            'tp1_profit_usdt': 5.0,
+            'tp2_profit_usdt': 10.0,
+        },
+    }
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.5,
+        tp2_r=2.0,
+        tp2_close_pct=0.5,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.001,
+    )
+
+    plan = mod.build_trade_management_plan_from_position(position, args)
+
+    assert plan.tp1_trigger_price == 102.5
+    assert plan.tp2_trigger_price == 105.0
+    assert plan.tp1_profit_usdt == 5.0
+    assert plan.tp2_profit_usdt == 10.0
+
+
+def test_manage_okx_simulated_positions_uses_args_absolute_profit_targets_when_plan_missing(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(tmp_path)
+    store.save_json('positions', {
+        'TESTUSDT:LONG': {
+            'symbol': 'TESTUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'entry_price': 100.0,
+            'stop_price': 98.0,
+            'current_stop_price': 98.0,
+            'quantity': 2.0,
+            'filled_quantity': 2.0,
+            'remaining_quantity': 2.0,
+            'status': 'open',
+            'protection_status': 'simulated',
+        }
+    })
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.5,
+        tp2_r=2.0,
+        tp2_close_pct=0.5,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+        breakeven_r=1.0,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.001,
+        trailing_buffer_pct=0.02,
+        profile='test-profile',
+    )
+    reduce_calls = []
+
+    monkeypatch.setattr(mod, 'build_okx_account_snapshot', lambda client: {})
+    monkeypatch.setattr(mod, 'fetch_okx_ticker_last', lambda client, inst_id: 102.5)
+    monkeypatch.setattr(mod, 'place_okx_reduce_only_market', lambda client, position, close_qty, args, account_snapshot: reduce_calls.append(close_qty) or {'order_feedback': {'order_id': 'okx-order-1'}})
+
+    result = mod.manage_okx_simulated_positions(store, args, okx_client=object())
+    positions_state = store.load_json('positions', {})
+    position = positions_state['TESTUSDT:LONG']
+    events_path = pathlib.Path(store.runtime_state_dir) / 'events.jsonl'
+    events = [json.loads(line) for line in events_path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+    assert result['ok'] is True
+    assert reduce_calls == [1.0]
+    assert position['remaining_quantity'] == 1.0
+    assert position['tp1_hit'] is True
+    assert position['tp2_hit'] is False
+    assert any(event.get('event_type') == 'okx_tp1_hit' for event in events)
+
+
+def test_manage_okx_simulated_positions_uses_persisted_absolute_profit_targets_over_args(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'TESTUSDT:LONG': {
+            'symbol': 'TESTUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'entry_price': 100.0,
+            'stop_price': 98.0,
+            'current_stop_price': 98.0,
+            'quantity': 2.0,
+            'filled_quantity': 2.0,
+            'remaining_quantity': 2.0,
+            'status': 'open',
+            'protection_status': 'simulated',
+            'tp1_profit_usdt': 5.0,
+            'tp2_profit_usdt': 10.0,
+            'trade_management_plan': {
+                'entry_price': 100.0,
+                'stop_price': 98.0,
+                'quantity': 2.0,
+                'initial_risk_per_unit': 2.0,
+                'breakeven_trigger_price': 102.0,
+                'tp1_trigger_price': 102.5,
+                'tp1_close_qty': 1.0,
+                'tp2_trigger_price': 105.0,
+                'tp2_close_qty': 1.0,
+                'runner_qty': 0.0,
+                'tp1_profit_usdt': 5.0,
+                'tp2_profit_usdt': 10.0,
+            },
+        }
+    })
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.5,
+        tp2_r=2.0,
+        tp2_close_pct=0.5,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.001,
+        trailing_buffer_pct=0.02,
+        profile='test-profile',
+    )
+    reduce_calls = []
+
+    monkeypatch.setattr(mod, 'build_okx_account_snapshot', lambda client: {})
+    monkeypatch.setattr(mod, 'fetch_okx_ticker_last', lambda client, inst_id: 102.5)
+    monkeypatch.setattr(mod, 'place_okx_reduce_only_market', lambda client, position, close_qty, args, account_snapshot: reduce_calls.append(close_qty) or {'order_feedback': {'order_id': 'okx-order-1'}})
+
+    result = mod.manage_okx_simulated_positions(store, args, okx_client=object())
+    positions_state = store.load_json('positions', {})
+    position = positions_state['TESTUSDT:LONG']
+    events_path = pathlib.Path(store.runtime_state_dir) / 'events.jsonl'
+    events = [json.loads(line) for line in events_path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+    assert result['ok'] is True
+    assert reduce_calls == [1.0]
+    assert position['remaining_quantity'] == 1.0
+    assert position['tp1_hit'] is True
+    assert position['tp2_hit'] is False
+    assert any(event.get('event_type') == 'okx_tp1_hit' for event in events)
+
+
+def test_place_live_trade_supports_absolute_profit_targets(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=2.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        must_pass_flags={'execution_slippage_ok': True, 'execution_depth_ok': True},
+        quality_score=85.0,
+        execution_priority_score=40.0,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    meta = mod.SymbolMeta(
+        symbol='TESTUSDT',
+        price_precision=2,
+        quantity_precision=1,
+        tick_size=0.01,
+        step_size=0.1,
+        min_qty=0.1,
+        quote_asset='USDT',
+        status='TRADING',
+        contract_type='PERPETUAL',
+    )
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.5,
+        tp2_r=2.0,
+        tp2_close_pct=0.5,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+        breakeven_r=1.0,
+        profile='test-profile',
+    )
+    calls = []
+
+    class Client:
+        def signed_post(self, path, params):
+            calls.append((path, params))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'TESTUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '100.0',
+                    'executedQty': params['quantity'],
+                    'cumQuote': '200.0',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected'})
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 54321, 'clientOrderId': 'stop-1'})
+    tp_calls = []
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda client, symbol, trigger_price, quantity, meta, side=None: tp_calls.append((symbol, trigger_price, quantity, side)) or {'orderId': len(tp_calls), 'triggerPrice': trigger_price, 'quantity': quantity})
+
+    result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert result['stop_order']['orderId'] == 54321
+    assert result['tp1_order']['orderId'] == 1
+    assert result['tp2_order']['orderId'] == 2
+    assert tp_calls == [
+        ('TESTUSDT', pytest.approx(103.84615384615384), 0.65, 'LONG'),
+        ('TESTUSDT', pytest.approx(107.6923076923077), 0.65, 'LONG'),
+    ]
 
 def test_place_live_trade_scales_quantity_down_to_zero_and_skips_entry_order(monkeypatch):
     candidate = mod.Candidate(
@@ -2880,20 +3162,20 @@ def test_compute_market_regime_filter_labels_dual_breakdown_as_risk_off():
 
 def test_derive_regime_entry_thresholds_bias_by_regime_and_side():
     assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_LONG, 'risk_on', 2.0) == {
-        'min_5m_change_pct': 1.7,
-        'acceleration_ratio': 1.35,
+        'min_5m_change_pct': 1.5,
+        'acceleration_ratio': 1.25,
     }
     assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_LONG, 'risk_off', 2.0) == {
-        'min_5m_change_pct': 2.5,
-        'acceleration_ratio': 1.85,
+        'min_5m_change_pct': 2.2,
+        'acceleration_ratio': 1.7,
     }
     assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_SHORT, 'risk_off', 2.0) == {
-        'min_5m_change_pct': 1.7,
-        'acceleration_ratio': 1.35,
+        'min_5m_change_pct': 1.5,
+        'acceleration_ratio': 1.25,
     }
     assert mod.derive_regime_entry_thresholds(mod.TRADE_SIDE_SHORT, 'risk_on', 2.0) == {
-        'min_5m_change_pct': 2.5,
-        'acceleration_ratio': 1.85,
+        'min_5m_change_pct': 2.2,
+        'acceleration_ratio': 1.7,
     }
 
 

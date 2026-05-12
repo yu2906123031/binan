@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'binance_futures_momentum_long.py'
 SCRIPTS_DIR = SCRIPT_PATH.parent
 if str(SCRIPTS_DIR) not in sys.path:
@@ -276,6 +278,115 @@ def test_binance_public_get_retries_transient_timeout(monkeypatch):
 
     assert client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'}) == {'ok': True}
     assert session.calls == 2
+
+
+def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):
+    mod = load_module()
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=''):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.get_calls = []
+            self.time_calls = 0
+            self.account_calls = 0
+
+        def get(self, url, params=None, timeout=15):
+            self.get_calls.append((url, dict(params or {}), timeout))
+            if url.endswith('/fapi/v1/time'):
+                payload = {'serverTime': 2_000_000 if self.time_calls == 0 else 3_000_000}
+                self.time_calls += 1
+                return Response(payload=payload)
+            self.account_calls += 1
+            if self.account_calls == 1:
+                return Response(status_code=400, payload={'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'})
+            return Response(payload={'assets': []})
+
+    now_values = iter([1000.0, 1000.1, 1000.15, 2000.0, 2000.1, 2000.15])
+    monkeypatch.setattr(mod.time, 'time', lambda: next(now_values))
+
+    session = Session()
+    client = mod.BinanceFuturesClient('https://example.test', api_key='k', api_secret='s', session=session)
+
+    assert client.signed_get('/fapi/v2/account') == {'assets': []}
+    assert session.time_calls == 2
+    assert session.account_calls == 2
+    first_account_params = session.get_calls[1][1]
+    second_account_params = session.get_calls[3][1]
+    assert first_account_params['timestamp'] == 2_000_100
+    assert second_account_params['timestamp'] == 3_000_100
+    assert first_account_params['recvWindow'] == 10_000
+    assert second_account_params['recvWindow'] == 10_000
+
+
+def test_signed_get_raises_original_error_when_recvwindow_resync_still_fails(monkeypatch):
+    mod = load_module()
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=''):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.time_calls = 0
+            self.account_calls = 0
+
+        def get(self, url, params=None, timeout=15):
+            if url.endswith('/fapi/v1/time'):
+                self.time_calls += 1
+                return Response(payload={'serverTime': 2_000_000})
+            self.account_calls += 1
+            return Response(status_code=400, payload={'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'})
+
+    now_values = iter([1000.0, 1000.1, 1000.15, 1000.2, 1000.3, 1000.35])
+    monkeypatch.setattr(mod.time, 'time', lambda: next(now_values))
+
+    session = Session()
+    client = mod.BinanceFuturesClient('https://example.test', api_key='k', api_secret='s', session=session)
+
+    with pytest.raises(mod.BinanceAPIError, match='outside of the recvWindow'):
+        client.signed_get('/fapi/v2/account')
+
+    assert session.time_calls == 2
+    assert session.account_calls == 2
+
+
+def test_sync_server_time_uses_midpoint_without_negative_bias(monkeypatch):
+    mod = load_module()
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {'serverTime': 2_000_000}
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, params=None, timeout=15):
+            return Response()
+
+    now_values = iter([1000.0, 1000.1])
+    monkeypatch.setattr(mod.time, 'time', lambda: next(now_values))
+
+    client = mod.BinanceFuturesClient('https://example.test', session=Session())
+
+    assert client.sync_server_time() == 999_950
 
 
 def test_external_accumulation_setup_params_are_explicitly_enabled():

@@ -16,10 +16,10 @@
 - 项目主复杂度集中在 `scripts/binance_futures_momentum_long.py`
 - 当前测试基线：
   - `pytest -q` 通过
-  - `pytest -q tests/test_strategy_v2.py` → `65 passed in 0.41s`
+  - `pytest -q tests/test_strategy_v2.py` → `69 passed in 0.52s`
   - `pytest -q tests/test_strategy_v2.py tests/test_hermes_outer_watcher.py` → `75 passed in 0.46s`
-  - `pytest -q tests/test_strategy_v2_restore_regression.py` → `70 passed`
-  - `pytest -q tests/test_execution_module_regression.py` → `6 passed in 0.12s`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py` → `123 passed in 0.81s`
+  - `pytest -q tests/test_execution_module_regression.py` → `14 passed in 0.12s`
   - `pytest -q tests/test_scan_summary_mode_regression.py` → `6 passed in 0.15s`
   - `pytest -q tests/test_cli_args.py tests/test_run_loop_smoke.py tests/test_scan_summary_mode_regression.py` → `60 passed in 1.04s`
   - `pytest -q tests/test_strategy_v2.py tests/test_cli_args.py tests/test_run_loop_smoke.py tests/test_scan_summary_mode_regression.py` → `125 passed in 1.16s`
@@ -41,6 +41,74 @@
 ---
 
 ## 已完成升级记录
+
+### 2026-05-11｜补齐 OKX simulated 对 absolute profit targets 的契约回归
+- 状态：已完成
+- 范围：核对 OKX simulated 持仓管理路径对 `tp1_profit_usdt` / `tp2_profit_usdt` 的支持现状，补回归测试固定“无 persisted plan 时走 args，存在 persisted plan 时优先沿用持久化 plan”的 contract
+- 修改文件：
+  - `tests/test_strategy_v2.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 代码现状确认：`manage_okx_simulated_positions(...)` 已经通过 `build_trade_management_plan_from_position(...)` 进入 absolute profit targets 路径；当 `trade_management_plan` 已持久化时直接回放 plan payload，当 plan 缺失时回退到 `args.tp1_profit_usdt` / `args.tp2_profit_usdt` 重新构建
+  - 新增 `test_manage_okx_simulated_positions_uses_args_absolute_profit_targets_when_plan_missing`，固定无 persisted plan 时，OKX simulated 会按 args 里的绝对利润目标在 `102.5` 触发 TP1、减仓 `1.0`
+  - 将已有 OKX simulated 回归收窄为 persisted-plan 优先语义，重命名为 `test_manage_okx_simulated_positions_uses_persisted_absolute_profit_targets_over_args`，固定 runtime-state 已持久化 absolute profit targets 时优先使用 plan 内数值
+  - 结论：本轮关闭的是 contract 缺口，生产实现已具备 OKX simulated absolute profit targets 透传能力，本次无需新增生产代码
+- 验证：
+  - `pytest -q /root/binan/tests/test_strategy_v2.py -k 'manage_okx_simulated_positions and absolute_profit_targets'` → `2 passed, 68 deselected in 0.36s`
+  - `pytest -q /root/binan/tests/test_strategy_v2.py` → `69 passed in 0.52s`
+- 遗留风险：
+  - 当前 OKX simulated 路径仍通过 `place_okx_reduce_only_market(...)` 直接按市价减仓，后续若要把 absolute profit targets 扩展到更细的成交归因或通知 payload，适合继续补 event payload 中的目标利润字段
+  - 目前 focused 回归覆盖 LONG 仓位，后续适合补一条 SHORT 仓位 absolute profit targets 的对称验证，锁定方向换算 contract
+- 对应待办编号：
+  - t4
+  - t5
+  - t6
+
+### 2026-05-11｜两段止盈支持绝对利润目标，第二段按剩余仓位全平
+- 状态：已完成
+- 范围：为 Binance Futures 动量策略增加两段止盈下单能力，支持 `tp1_profit_usdt` / `tp2_profit_usdt` 绝对利润目标；确认第二段止盈语义为“在整笔仓位累计浮盈约 10 USDT 时，把剩余仓位全部平掉”
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `scripts/execution_engine.py`
+  - `tests/test_strategy_v2.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `TradeManagementPlan`，加入 `tp1_profit_usdt` / `tp2_profit_usdt` 字段，保留 `tp1_trigger_price` / `tp2_trigger_price`、`tp1_close_qty` / `tp2_close_qty`、`runner_qty` 运行态契约
+  - 更新 `build_trade_management_plan(...)`，支持绝对利润目标换算触发价：当传入 `tp1_profit_usdt` / `tp2_profit_usdt` 时，按整笔当前持仓 `quantity` 计算达到对应累计浮盈所需的价格
+  - 更新 live execution 下单链路，开仓成功后同时挂：止损保护单、第一段止盈单、第二段止盈单，并把 `tp1_order` / `tp2_order` 回写到交易结果 payload
+  - 明确第二段语义：`tp2_close_qty` 按剩余仓位数量下单，实现“10刀左右剩余仓位全平”
+  - 补 focused regression，固定绝对利润目标与两段止盈下单 contract
+- 验证：
+  - `pytest -q tests/test_strategy_v2.py -k 'build_trade_management_plan_supports_absolute_profit_targets or place_live_trade_places_stop_and_two_take_profit_orders or place_live_trade_scales_quantity_down_to_zero_and_skips_entry_order'` → `3 passed`
+  - `pytest -q tests/test_strategy_v2.py tests/test_strategy_v2_restore_regression.py -k 'trade_management_plan or take_profit or place_live_trade_places_stop_and_two_take_profit_orders or build_trade_management_plan_supports_absolute_profit_targets'` → `7 passed, 181 deselected in 0.20s`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'profit_targets or absolute_profit_targets or preserves_short_side_from_position_side'` → `3 passed, 120 deselected in 0.17s`
+  - `pytest -q tests/test_strategy_v2_restore_regression.py` → `123 passed in 0.81s`
+- 遗留风险：
+  - OKX simulated 下单路径当前仍沿用原先 `tp1_r` / `tp2_r` 入口，后续适合补齐与 Binance live 路径一致的绝对利润参数透传
+  - runtime-state 恢复链路当前已兼容 plan 字段持久化，后续适合继续补一条恢复后识别 `tp1_profit_usdt` / `tp2_profit_usdt` 的专门回归，固定跨重启 contract
+- 对应待办编号：
+  - t2
+
+### 2026-05-11｜修复 Binance Multi-Assets 模式导致的 isolated preflight 卡死
+- 状态：已完成
+- 范围：定位 `binance_execution_preflight_failed` 的真实根因，并让 live execution 在 Binance Futures Multi-Assets 账户下从 isolated 申请自动降级到 crossed，解除持续无法下单的 preflight 卡点
+- 修改文件：
+  - `scripts/execution_engine.py`
+  - `tests/test_execution_module_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 从 `/root/.hermes/binance-futures-momentum-long/runtime-state/events.jsonl` 抽取出持续重复的 `binance_execution_preflight_failed` 明细，根因稳定指向 Binance API `-4168`：`Unable to adjust to isolated-margin mode under the Multi-Assets mode.`
+  - 扩展 `ensure_symbol_margin_type(...)`，当请求 `ISOLATED` 且交易所返回 `-4168` / `Multi-Assets mode` 时，返回可继续执行的降级结果，记录 `actual='CROSSED'`、`multi_assets_mode=True`、`fallback_reason='binance_multi_assets_mode_blocks_isolated'`
+  - 保持原有 `-4046` already-set 路径契约，同时让后续 leverage 设置与下单流程继续执行，避免 preflight 在 marginType 切换阶段直接失败
+  - 新增 focused regression，固定 Multi-Assets 模式下的 crossed fallback contract，防止后续重构把该 live 交易兼容性回归掉
+- 验证：
+  - `pytest -q /root/binan/tests/test_execution_module_regression.py -q` → `14 passed`
+  - `python -m compileall -q scripts/execution_engine.py tests/test_execution_module_regression.py` → 通过
+- 遗留风险：
+  - CLI 默认 `--margin-type` 仍是 `ISOLATED`，当前修复通过 runtime fallback 兼容 Multi-Assets 账户；后续可按账户画像把默认值或 profile 配置显式收敛到 `CROSSED`
+  - 当前 last_cycle 快照里没有收口 margin fallback 统计；后续适合把 `multi_assets_mode` / `fallback_reason` 汇入 cycle summary，便于长期巡检
+- 对应待办编号：
+  - P0-runtime-live-preflight-multi-assets
 
 ### 2026-05-10｜补 runtime_state_risk_helpers 直连 contract 单测
 - 状态：已完成
@@ -67,6 +135,26 @@
   - 当前 helper 仍以内联 `args` 读取配置，后续若继续压缩主脚本依赖面，适合把 refresh / timeout 配置解析进一步收敛为参数对象
 - 对应待办编号：
   - P1-5k
+
+### 2026-05-10｜继续下沉 auto-loop user-data-stream monitor core seam
+- 状态：已完成
+- 范围：继续压缩 `run_auto_loop_user_data_stream_monitor(...)` 的 orchestration 宽度，把 existing-state 调度链路下沉到独立 core helper，并为 payload / persistence / alert seam 补 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `run_auto_loop_user_data_stream_monitor_core(...)`，集中承载 existing `listen_key` 路径下的 `run_user_data_stream_monitor_cycle(...)`、positions 写回、alert 发射，wrapper 只保留 config 构建与 persisted state 装配
+  - 为 `build_user_data_stream_position_payload(...)`、`persist_user_data_stream_monitor_to_positions(...)`、`emit_user_data_stream_alert_if_needed(...)` 增加 focused regression，固定 monitor payload、按 symbol 写回 positions、通知 payload contract
+  - 新增 wrapper / core focused regression，覆盖 explicit config 下的 core 调度 contract、无 `listen_key` 空返回 contract、以及 wrapper 读取 store 后委派 core 的 seam
+- 验证：
+  - `pytest -q tests/test_strategy_v2_restore_regression.py -k 'run_auto_loop_user_data_stream_monitor_core or run_auto_loop_user_data_stream_monitor_wrapper_builds_state_and_delegates or build_user_data_stream_position_payload or persist_user_data_stream_monitor_to_positions or emit_user_data_stream_alert_if_needed or run_auto_loop_user_data_stream_monitor_uses_explicit_config_without_args_namespace'` → `7 passed, 107 deselected in 0.15s`
+  - `pytest -q tests/test_run_loop_smoke.py` → `43 passed in 0.91s`
+- 遗留风险：
+  - user-data-stream 分支的 skipped path 仍留在 wrapper，下一步可继续把 skipped payload builder 独立成更窄 seam
+  - helper 目前仍直接触达 runtime store 写入 positions，后续若继续抽离到模块层，适合把持久化与通知 emitter 一并转成 builder 注入
+- 对应待办编号：
+  - t3
 
 ### 2026-05-10｜下沉 auto-loop book-ticker websocket orchestration helper
 - 状态：已完成
@@ -1207,3 +1295,23 @@
 
 ## 下一步建议
 按顺序执行：先把 monitor / event normalization 里的稳定字段归一化逻辑抽成可复用 helper，减少 execution parity 测试中的局部去抖与重复断言 → 再评估 `binance_futures_momentum_long.py` 中剩余 runtime-state consumer seam 的下沉优先级与收益 → 最后决定是否继续拆出更细的 runtime-state consumer helpers
+
+### 2026-05-11｜放宽 regime 触发阈值
+- 状态：已完成
+- 范围：下调 `derive_regime_entry_thresholds(...)` 在趋势顺风与逆风环境下的 5m 涨跌幅 / 加速度门槛，让 watch/setup 候选更早进入 trigger confirmation 流程
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2.py`
+- 完成内容：
+  - 下调 long risk_on 与 short risk_off 的 `min_5m_change_pct` 从 `0.85x` 到 `0.75x`，`acceleration_ratio` 从 `-0.15` 到 `-0.25` 的放宽幅度
+  - 下调 long risk_off 与 short risk_on 的收紧幅度：`min_5m_change_pct` 从 `1.25x` 收敛到 `1.1x`，`acceleration_ratio` 从 `+0.35` 收敛到 `+0.2`
+  - 保留 caution 档的温和调节，维持 trigger confirmation、crowding guard、high-elastic pullback guard contract 不变
+  - 更新 `test_derive_regime_entry_thresholds_bias_by_regime_and_side` 断言，固定新阈值 contract
+- 验证：
+  - `pytest -q /root/binan/tests/test_strategy_v2.py -k "derive_regime_entry_thresholds_bias_by_regime_and_side or evaluate_trigger_confirmation_requires_two_micro_confirmations or evaluate_trigger_confirmation_blocks_crowded_high_elastic_long_without_pullback"` → `3 passed, 62 deselected in 0.15s`
+  - `pytest -q /root/binan/tests/test_cli_args.py /root/binan/tests/test_strategy_v2.py` → `79 passed in 0.50s`
+- 遗留风险：
+  - 这次调整降低的是 candidate builder 的 regime 门槛，真实触发频率还会受 `watch_breakout_tolerance_pct`、成交量 gate、higher timeframe gate 共同约束
+  - 若后续仍觉得触发偏少，优先评估 near-breakout tolerance 与 setup/watch 阶段的 admission gate，再看是否需要继续放宽 trigger confirmation 本身
+- 对应待办编号：
+  - P1-3 / 策略阈值微调

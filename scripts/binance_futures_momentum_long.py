@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 
 import requests
 
+import candidate_builder as candidate_builder_mod
 from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
@@ -80,6 +81,8 @@ def load_dotenv(path: Optional[Path] = None, override: bool = False) -> Dict[str
 
 
 class BinanceFuturesClient:
+    RECV_WINDOW_MS = 10_000
+
     def __init__(
         self,
         base_url: str,
@@ -134,7 +137,17 @@ class BinanceFuturesClient:
     def _signed_request(self, method: str, path: str, params: Dict[str, Any], timeout: int = 15):
         if not self.api_secret:
             raise BinanceAPIError('api_secret is required for signed requests')
+        try:
+            return self._signed_request_once(method, path, params, timeout=timeout)
+        except BinanceAPIError as exc:
+            if not self._is_recvwindow_error(exc):
+                raise
+            self.sync_server_time(force=True)
+            return self._signed_request_once(method, path, params, timeout=timeout)
+
+    def _signed_request_once(self, method: str, path: str, params: Dict[str, Any], timeout: int = 15):
         payload = dict(params)
+        payload.setdefault('recvWindow', self.RECV_WINDOW_MS)
         payload.setdefault('timestamp', self._timestamp_ms())
         query = urlencode(payload, doseq=True)
         signature = hmac.new(self.api_secret.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -158,7 +171,9 @@ class BinanceFuturesClient:
             self.sync_server_time()
         return int(time.time() * 1000) + int(self._server_time_offset_ms or 0)
 
-    def sync_server_time(self) -> int:
+    def sync_server_time(self, force: bool = False) -> int:
+        if self._server_time_offset_ms is not None and not force:
+            return int(self._server_time_offset_ms or 0)
         try:
             local_before_ms = int(time.time() * 1000)
             response = self.session.get(f'{self.base_url}/fapi/v1/time', timeout=5)
@@ -166,10 +181,15 @@ class BinanceFuturesClient:
             self._raise_for_status(response)
             server_time_ms = int(response.json().get('serverTime'))
             local_midpoint_ms = int((local_before_ms + local_after_ms) / 2)
-            self._server_time_offset_ms = server_time_ms - local_midpoint_ms - 1000
+            self._server_time_offset_ms = server_time_ms - local_midpoint_ms
         except Exception:
             self._server_time_offset_ms = 0
         return int(self._server_time_offset_ms or 0)
+
+    @staticmethod
+    def _is_recvwindow_error(exc: BinanceAPIError) -> bool:
+        message = str(exc)
+        return 'recvWindow' in message or "code': -1021" in message or 'code": -1021' in message
 
     @staticmethod
     def _raise_for_status(response):
@@ -996,6 +1016,8 @@ class TradeManagementPlan:
     tp2_trigger_price: float
     tp2_close_qty: float
     runner_qty: float
+    tp1_profit_usdt: float = 0.0
+    tp2_profit_usdt: float = 0.0
     side: str = TRADE_SIDE_LONG
     position_side: str = POSITION_SIDE_LONG
     breakeven_confirmation_mode: str = 'price_only'
@@ -1463,16 +1485,23 @@ def emit_user_data_stream_alert_if_needed(
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(monitor, dict):
         return None
-    if str(monitor.get('status') or '').strip().lower() not in {'unhealthy', 'disconnected', 'refresh_failed'}:
+    status = str(monitor.get('status') or '').strip().lower()
+    if status not in {'unhealthy', 'disconnected', 'refresh_failed'}:
         return None
+    health = monitor.get('health', {}) if isinstance(monitor.get('health'), dict) else {}
     payload = {
-        'symbol': str(symbol or monitor.get('symbol') or '').upper(),
-        'status': str(monitor.get('status') or '').lower(),
-        'detail': str(monitor.get('detail') or ''),
-        'listen_key': str(monitor.get('listen_key') or ''),
-        'disconnect_count': int(monitor.get('disconnect_count', 0) or 0),
-        'refresh_failure_count': int(monitor.get('refresh_failure_count', 0) or 0),
-        'now_utc': str(monitor.get('now_utc') or _isoformat_utc(_utc_now())),
+        'symbol': str(symbol or health.get('symbol') or monitor.get('symbol') or '').upper(),
+        'status': status,
+        'action': str(monitor.get('action') or status).lower(),
+        'error': str(monitor.get('error') or ''),
+        'detail': str(monitor.get('detail') or health.get('detail') or ''),
+        'listen_key': str(monitor.get('listen_key') or health.get('listen_key') or ''),
+        'disconnect_count': int(monitor.get('disconnect_count', health.get('disconnect_count', 0)) or 0),
+        'refresh_failure_count': int(monitor.get('refresh_failure_count', health.get('refresh_failure_count', 0)) or 0),
+        'reconnect_count': int(monitor.get('reconnect_count', health.get('reconnect_count', 0)) or 0),
+        'started_at': health.get('started_at'),
+        'last_refresh_at': health.get('last_refresh_at'),
+        'updated_at': str(health.get('updated_at') or monitor.get('updated_at') or monitor.get('now_utc') or _isoformat_utc(_utc_now())),
     }
     emit_notification(args, 'user_data_stream_alert', payload)
     return payload
@@ -1742,6 +1771,29 @@ def read_auto_loop_book_ticker_health(
     return health_loader()
 
 
+def run_auto_loop_user_data_stream_monitor_core(
+    client: BinanceFuturesClient,
+    store: RuntimeStateStore,
+    args: argparse.Namespace,
+    existing_uds_state: Any,
+    config: AutoLoopUserDataStreamMonitorConfig,
+) -> Dict[str, Any]:
+    if not (isinstance(existing_uds_state, dict) and existing_uds_state.get('listen_key')):
+        return {'monitor': None, 'alert': None}
+    uds_monitor = run_user_data_stream_monitor_cycle(
+        client=client,
+        store=store,
+        symbol=existing_uds_state.get('symbol'),
+        refresh_interval_minutes=config.refresh_interval_minutes,
+        disconnect_timeout_minutes=config.disconnect_timeout_minutes,
+    )
+    persist_user_data_stream_monitor_to_positions(store, uds_monitor)
+    return {
+        'monitor': uds_monitor,
+        'alert': emit_user_data_stream_alert_if_needed(args, existing_uds_state.get('symbol'), uds_monitor),
+    }
+
+
 def run_auto_loop_user_data_stream_monitor(
     client: BinanceFuturesClient,
     store: RuntimeStateStore,
@@ -1763,20 +1815,13 @@ def run_auto_loop_user_data_stream_monitor(
         store.save_json('user_data_stream', uds_monitor)
         return {'monitor': uds_monitor, 'alert': None}
     existing_uds_state = store.load_json('user_data_stream', {})
-    if not (isinstance(existing_uds_state, dict) and existing_uds_state.get('listen_key')):
-        return {'monitor': None, 'alert': None}
-    uds_monitor = run_user_data_stream_monitor_cycle(
+    return run_auto_loop_user_data_stream_monitor_core(
         client=client,
         store=store,
-        symbol=existing_uds_state.get('symbol'),
-        refresh_interval_minutes=monitor_config.refresh_interval_minutes,
-        disconnect_timeout_minutes=monitor_config.disconnect_timeout_minutes,
+        args=args,
+        existing_uds_state=existing_uds_state,
+        config=monitor_config,
     )
-    persist_user_data_stream_monitor_to_positions(store, uds_monitor)
-    return {
-        'monitor': uds_monitor,
-        'alert': emit_user_data_stream_alert_if_needed(args, existing_uds_state.get('symbol'), uds_monitor),
-    }
 
 
 def summarize_candidate_rejected_events(store: RuntimeStateStore, limit: int = 1000) -> Dict[str, Any]:
@@ -2459,13 +2504,20 @@ def recommend_leverage(entry_price: float, stop_price: float, max_leverage: int 
     return max(1, min(lev, max_leverage))
 
 
-def build_trade_management_plan(entry_price: float, stop_price: float, quantity: float, tp1_r: float, tp1_close_pct: float, tp2_r: float, tp2_close_pct: float, breakeven_r: float = 1.0, atr_stop_distance: Optional[float] = None, side: str = POSITION_SIDE_LONG, breakeven_confirmation_mode: str = 'price_only', breakeven_min_buffer_pct: float = 0.0) -> TradeManagementPlan:
+def build_trade_management_plan(entry_price: float, stop_price: float, quantity: float, tp1_r: float, tp1_close_pct: float, tp2_r: float, tp2_close_pct: float, breakeven_r: float = 1.0, atr_stop_distance: Optional[float] = None, side: str = POSITION_SIDE_LONG, breakeven_confirmation_mode: str = 'price_only', breakeven_min_buffer_pct: float = 0.0, tp1_profit_usdt: float = 0.0, tp2_profit_usdt: float = 0.0) -> TradeManagementPlan:
     side_normalized = normalize_position_side(side)
     direction = 1.0 if side_normalized == POSITION_SIDE_LONG else -1.0
     risk = float(atr_stop_distance) if atr_stop_distance and atr_stop_distance > 0 else abs(entry_price - stop_price)
     tp1_close_qty = round(quantity * tp1_close_pct, 10)
     tp2_close_qty = round(quantity * tp2_close_pct, 10)
     runner_qty = round(max(quantity - tp1_close_qty - tp2_close_qty, 0.0), 10)
+    tp1_trigger_price = entry_price + (direction * risk * tp1_r)
+    tp2_trigger_price = entry_price + (direction * risk * tp2_r)
+    if quantity > 0 and tp1_close_qty > 0 and tp1_profit_usdt > 0:
+        tp1_trigger_price = entry_price + (direction * (float(tp1_profit_usdt) / quantity))
+    tp2_close_effective_qty = tp2_close_qty + runner_qty
+    if quantity > 0 and tp2_close_effective_qty > 0 and tp2_profit_usdt > 0:
+        tp2_trigger_price = entry_price + (direction * (float(tp2_profit_usdt) / quantity))
     return TradeManagementPlan(
         side=position_side_to_trade_side(side_normalized),
         position_side=side_normalized,
@@ -2476,11 +2528,13 @@ def build_trade_management_plan(entry_price: float, stop_price: float, quantity:
         breakeven_trigger_price=entry_price + (direction * risk * breakeven_r),
         breakeven_confirmation_mode=str(breakeven_confirmation_mode or 'price_only'),
         breakeven_min_buffer_pct=max(float(breakeven_min_buffer_pct or 0.0), 0.0),
-        tp1_trigger_price=entry_price + (direction * risk * tp1_r),
+        tp1_trigger_price=tp1_trigger_price,
         tp1_close_qty=tp1_close_qty,
-        tp2_trigger_price=entry_price + (direction * risk * tp2_r),
+        tp2_trigger_price=tp2_trigger_price,
         tp2_close_qty=tp2_close_qty,
         runner_qty=runner_qty,
+        tp1_profit_usdt=max(float(tp1_profit_usdt or 0.0), 0.0),
+        tp2_profit_usdt=max(float(tp2_profit_usdt or 0.0), 0.0),
     )
 
 
@@ -2613,6 +2667,39 @@ def place_stop_market_order(client, symbol: str, stop_price: float, quantity: fl
         return client.signed_post('/fapi/v1/algoOrder', params)
 
 
+def place_take_profit_market_order(client, symbol: str, trigger_price: float, quantity: float, meta: SymbolMeta, side: str = POSITION_SIDE_LONG):
+    position_side = normalize_position_side(side)
+    order_side = 'BUY' if position_side == POSITION_SIDE_SHORT else 'SELL'
+    trigger_price = round_step(trigger_price, meta.tick_size, meta.price_precision)
+    qty = round_step(quantity, meta.step_size, meta.quantity_precision)
+    params = {
+        'symbol': symbol,
+        'side': order_side,
+        'algoType': 'CONDITIONAL',
+        'type': 'TAKE_PROFIT_MARKET',
+        'triggerPrice': format_decimal(trigger_price, meta.price_precision),
+        'quantity': format_decimal(qty, meta.quantity_precision),
+    }
+    if should_send_position_side(client):
+        params['positionSide'] = position_side
+        params['reduceOnly'] = 'true'
+    try:
+        return client.signed_post('/fapi/v1/algoOrder', params)
+    except Exception as exc:
+        if 'reduceOnly' in params and is_reduce_only_not_required_error(exc):
+            params.pop('reduceOnly', None)
+            try:
+                return client.signed_post('/fapi/v1/algoOrder', params)
+            except Exception as retry_exc:
+                exc = retry_exc
+        if not should_send_position_side(client) or not is_position_side_mode_error(exc):
+            raise
+        mark_one_way_position_mode(client)
+        params.pop('positionSide', None)
+        params.pop('reduceOnly', None)
+        return client.signed_post('/fapi/v1/algoOrder', params)
+
+
 def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeManagementState, action: Dict[str, Any], active_stop_order: Optional[Dict[str, Any]]):
     log_payload: Dict[str, Any] = {'action': action['type'], 'symbol': symbol}
     side = normalize_position_side(getattr(state, 'side', POSITION_SIDE_LONG))
@@ -2699,14 +2786,76 @@ def build_trade_management_plan_from_position(position: Dict[str, Any], args: ar
         quantity=quantity,
         tp1_r=float(getattr(args, 'tp1_r', 1.5)),
         tp1_close_pct=float(getattr(args, 'tp1_close_pct', 0.3)),
+        tp1_profit_usdt=float(getattr(args, 'tp1_profit_usdt', 0.0) or 0.0),
         tp2_r=float(getattr(args, 'tp2_r', 2.0)),
         tp2_close_pct=float(getattr(args, 'tp2_close_pct', 0.4)),
+        tp2_profit_usdt=float(getattr(args, 'tp2_profit_usdt', 0.0) or 0.0),
         breakeven_r=float(getattr(args, 'breakeven_r', 1.0)),
         atr_stop_distance=float(position.get('atr_stop_distance') or 0.0),
         side=trade_side,
         breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
         breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
     )
+
+
+def recover_protected_position_trade_management_plan(
+    tracked: Dict[str, Any],
+    protection: Dict[str, Any],
+    args: Optional[argparse.Namespace],
+) -> Dict[str, Any]:
+    tracked = dict(tracked or {})
+    tracked['protection_status'] = 'protected'
+    tracked['protected_recovery_pending'] = True
+    stop_candidates = []
+    stop_order = protection.get('stop_order') if isinstance(protection, dict) else None
+    if isinstance(stop_order, dict):
+        stop_candidates.extend([
+            stop_order.get('stopPrice'),
+            stop_order.get('triggerPrice'),
+            stop_order.get('activatePrice'),
+        ])
+    open_orders = protection.get('open_orders') if isinstance(protection, dict) else None
+    if isinstance(open_orders, list):
+        for order in open_orders:
+            if not isinstance(order, dict):
+                continue
+            stop_candidates.extend([
+                order.get('stopPrice'),
+                order.get('triggerPrice'),
+                order.get('activatePrice'),
+            ])
+    stop_candidates.extend([
+        tracked.get('current_stop_price'),
+        tracked.get('stop_price'),
+    ])
+    
+    recovered_stop_price = 0.0
+    for candidate in stop_candidates:
+        recovered_stop_price = _to_float(candidate)
+        if recovered_stop_price > 0:
+            break
+    if recovered_stop_price > 0:
+        tracked['current_stop_price'] = recovered_stop_price
+        tracked['stop_price'] = recovered_stop_price
+    if args is None:
+        return tracked
+    try:
+        plan = build_trade_management_plan_from_position(tracked, args)
+    except Exception as exc:
+        tracked['recovery_incomplete'] = True
+        tracked['recovery_reason'] = 'missing_valid_stop_distance'
+        tracked['recovery_detail'] = str(exc)
+        tracked['trade_management_plan'] = None
+        tracked['status'] = 'protected_recovery_pending'
+        return tracked
+    if getattr(plan, 'initial_risk_per_unit', 0.0) > 0:
+        tracked['trade_management_plan'] = asdict(plan)
+        tracked['status'] = 'monitoring'
+        tracked['protected_recovery_pending'] = False
+        tracked.pop('recovery_incomplete', None)
+        tracked.pop('recovery_reason', None)
+        tracked.pop('recovery_detail', None)
+    return tracked
 
 
 def manage_okx_simulated_positions(store: RuntimeStateStore, args: argparse.Namespace, okx_client: OKXClient) -> Dict[str, Any]:
@@ -3220,24 +3369,24 @@ def derive_regime_entry_thresholds(side: str, regime_label: str, min_5m_change_p
 
     if trade_side == TRADE_SIDE_LONG:
         if regime == 'risk_on':
-            change_threshold *= 0.85
-            acceleration_threshold = max(1.2, acceleration_threshold - 0.15)
+            change_threshold *= 0.75
+            acceleration_threshold = max(1.15, acceleration_threshold - 0.25)
         elif regime == 'caution':
-            change_threshold *= 1.1
-            acceleration_threshold += 0.15
+            change_threshold *= 1.05
+            acceleration_threshold += 0.1
         elif regime == 'risk_off':
-            change_threshold *= 1.25
-            acceleration_threshold += 0.35
+            change_threshold *= 1.1
+            acceleration_threshold += 0.2
     else:
         if regime == 'risk_off':
-            change_threshold *= 0.85
-            acceleration_threshold = max(1.2, acceleration_threshold - 0.15)
+            change_threshold *= 0.75
+            acceleration_threshold = max(1.15, acceleration_threshold - 0.25)
         elif regime == 'caution':
             change_threshold *= 1.05
             acceleration_threshold += 0.1
         elif regime == 'risk_on':
-            change_threshold *= 1.25
-            acceleration_threshold += 0.35
+            change_threshold *= 1.1
+            acceleration_threshold += 0.2
 
     return {
         'min_5m_change_pct': round(max(change_threshold, 0.0), 4),
@@ -3613,25 +3762,38 @@ def classify_candidate_state(
     return {'state': state, 'state_reasons': state_reasons, 'setup_score': setup_score, 'exhaustion_score': exhaustion_score}
 
 
-def _build_candidate_from_request(request: BuildCandidateRequest) -> Optional[Candidate]:
-    microstructure_inputs = dict(request.legacy_kwargs.pop('microstructure_inputs', {}) or {})
+def prepare_build_candidate_request_inputs(request: BuildCandidateRequest) -> Dict[str, Any]:
+    legacy_kwargs = dict(request.legacy_kwargs or {})
+    microstructure_inputs = dict(legacy_kwargs.pop('microstructure_inputs', {}) or {})
     for key in ('short_bias', 'oi_now', 'oi_5m_ago', 'oi_15m_ago', 'cvd_delta', 'cvd_zscore'):
-        if key in request.legacy_kwargs and key not in microstructure_inputs:
-            microstructure_inputs[key] = request.legacy_kwargs[key]
+        if key in legacy_kwargs and key not in microstructure_inputs:
+            microstructure_inputs[key] = legacy_kwargs[key]
 
     legacy_okx_sentiment = {
-        'okx_sentiment_score': request.legacy_kwargs.pop('okx_sentiment_score', 0.0),
-        'okx_sentiment_acceleration': request.legacy_kwargs.pop('okx_sentiment_acceleration', 0.0),
-        'sector_resonance_score': request.legacy_kwargs.pop('sector_resonance_score', 0.0),
+        'okx_sentiment_score': legacy_kwargs.pop('okx_sentiment_score', 0.0),
+        'okx_sentiment_acceleration': legacy_kwargs.pop('okx_sentiment_acceleration', 0.0),
+        'sector_resonance_score': legacy_kwargs.pop('sector_resonance_score', 0.0),
     }
     okx_sentiment = request.okx_sentiment
     if okx_sentiment is None and any(value for value in legacy_okx_sentiment.values()):
         okx_sentiment = legacy_okx_sentiment
 
-    legacy_smart_money_flow_score = request.legacy_kwargs.pop('smart_money_flow_score', 0.0)
+    legacy_smart_money_flow_score = legacy_kwargs.pop('smart_money_flow_score', 0.0)
     smart_money_context = request.smart_money_context
     if smart_money_context is None and legacy_smart_money_flow_score:
         smart_money_context = {'smart_money_flow_score': legacy_smart_money_flow_score}
+
+    return {
+        'microstructure_inputs': microstructure_inputs,
+        'okx_sentiment': okx_sentiment,
+        'smart_money_context': smart_money_context,
+        'legacy_kwargs': legacy_kwargs,
+    }
+
+
+
+def _build_candidate_from_request(request: BuildCandidateRequest) -> Optional[Candidate]:
+    prepared_inputs = prepare_build_candidate_request_inputs(request)
 
     return build_candidate_impl(
         symbol=request.symbol,
@@ -3653,9 +3815,9 @@ def _build_candidate_from_request(request: BuildCandidateRequest) -> Optional[Ca
         symbol_open_interest_rows_15m=list(request.symbol_open_interest_rows_15m or []),
         market_regime=request.market_regime,
         current_timestamp_ms=request.current_timestamp_ms,
-        okx_sentiment=okx_sentiment,
-        smart_money_context=smart_money_context,
-        microstructure_inputs=microstructure_inputs,
+        okx_sentiment=prepared_inputs['okx_sentiment'],
+        smart_money_context=prepared_inputs['smart_money_context'],
+        microstructure_inputs=prepared_inputs['microstructure_inputs'],
         Candidate=Candidate,
         TRADE_SIDE_LONG=TRADE_SIDE_LONG,
         TRADE_SIDE_SHORT=TRADE_SIDE_SHORT,
@@ -3691,7 +3853,7 @@ def _build_candidate_from_request(request: BuildCandidateRequest) -> Optional[Ca
         classify_alert_tier=classify_alert_tier,
         recommended_position_size_pct=recommended_position_size_pct,
         build_trade_management_plan=build_trade_management_plan,
-        **request.legacy_kwargs,
+        **prepared_inputs['legacy_kwargs'],
     )
 
 
@@ -3745,6 +3907,7 @@ def build_candidate(
             legacy_kwargs=dict(legacy_kwargs),
         )
     )
+
 
 def parse_okx_sentiment_payload(raw_text: str) -> Dict[str, Dict[str, float]]:
     payload: Dict[str, Dict[str, float]] = {}
@@ -5261,8 +5424,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--profile', default='default')
     parser.add_argument('--tp1-r', type=float, default=1.5)
     parser.add_argument('--tp1-close-pct', type=float, default=0.3)
+    parser.add_argument('--tp1-profit-usdt', type=float, default=0.0)
     parser.add_argument('--tp2-r', type=float, default=2.0)
     parser.add_argument('--tp2-close-pct', type=float, default=0.4)
+    parser.add_argument('--tp2-profit-usdt', type=float, default=0.0)
     parser.add_argument('--breakeven-r', type=float, default=1.0)
     parser.add_argument('--breakeven-confirmation-mode', choices=['price_only', 'ema_support'], default='ema_support')
     parser.add_argument('--breakeven-min-buffer-pct', type=float, default=0.001)
@@ -5894,18 +6059,7 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         else:
             tracked['protection_status'] = 'protected'
             if tracked.get('status') == 'protected_recovery_pending':
-                tracked['protected_recovery_pending'] = True
-                if args is not None:
-                    try:
-                        plan = build_trade_management_plan_from_position(tracked, args)
-                    except Exception:
-                        plan = None
-                    if plan and getattr(plan, 'initial_risk_per_unit', 0.0) > 0:
-                        tracked['trade_management_plan'] = asdict(plan)
-                        tracked['status'] = 'monitoring'
-                        tracked['protected_recovery_pending'] = False
-                        tracked.pop('recovery_incomplete', None)
-                        tracked.pop('recovery_reason', None)
+                tracked = recover_protected_position_trade_management_plan(tracked, protection, args)
             positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
     sync_result = sync_tracked_positions_with_exchange(store, exchange_positions, protected_symbols=protected_symbols)
@@ -6173,6 +6327,7 @@ def place_live_trade(client: BinanceFuturesClient, candidate: Candidate, leverag
         fetch_open_orders=fetch_open_orders,
         fetch_open_algo_orders=fetch_open_algo_orders,
         place_stop_market_order=place_stop_market_order,
+        place_take_profit_market_order=place_take_profit_market_order,
         resolve_position_protection_status=resolve_position_protection_status,
         recover_unknown_entry_order=recover_unknown_entry_order,
         query_order=query_order,
@@ -6437,6 +6592,8 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             config=book_ticker_config,
         )
         cycle['book_ticker_websocket'] = dict(book_ticker_result.get('summary', {}), health=book_ticker_result.get('health', {}))
+        if cycle['book_ticker_websocket'].get('status') == 'unavailable' and not cycle['book_ticker_websocket'].get('health'):
+            cycle['book_ticker_websocket'].pop('health', None)
         user_data_stream_result = run_auto_loop_user_data_stream_monitor(
             client=client,
             store=store,

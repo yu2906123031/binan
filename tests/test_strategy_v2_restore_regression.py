@@ -134,6 +134,394 @@ def build_candidate_from_request(**overrides):
     return mod._build_candidate_from_request(make_candidate_request(**overrides))
 
 
+def test_prepare_build_candidate_request_inputs_merges_legacy_fields_without_mutating_request():
+    request = make_candidate_request(
+        okx_sentiment=None,
+        smart_money_context=None,
+        legacy_kwargs={
+            'microstructure_inputs': {'short_bias': 0.66, 'cvd_delta': 180000.0},
+            'short_bias': 0.78,
+            'oi_now': 1_450_000.0,
+            'oi_5m_ago': 1_200_000.0,
+            'oi_15m_ago': 1_050_000.0,
+            'cvd_delta': 240000.0,
+            'cvd_zscore': 3.2,
+            'okx_sentiment_score': 0.28,
+            'okx_sentiment_acceleration': 0.42,
+            'sector_resonance_score': 0.64,
+            'smart_money_flow_score': 0.45,
+            'risk_usdt': 10.0,
+        },
+    )
+    original_legacy = dict(request.legacy_kwargs)
+
+    prepared = mod.prepare_build_candidate_request_inputs(request)
+
+    assert prepared['microstructure_inputs'] == {
+        'short_bias': 0.66,
+        'cvd_delta': 180000.0,
+        'oi_now': 1_450_000.0,
+        'oi_5m_ago': 1_200_000.0,
+        'oi_15m_ago': 1_050_000.0,
+        'cvd_zscore': 3.2,
+    }
+    assert prepared['okx_sentiment'] == {
+        'okx_sentiment_score': 0.28,
+        'okx_sentiment_acceleration': 0.42,
+        'sector_resonance_score': 0.64,
+    }
+    assert prepared['smart_money_context'] == {'smart_money_flow_score': 0.45}
+    assert prepared['legacy_kwargs']['risk_usdt'] == 10.0
+    assert prepared['legacy_kwargs']['funding_rate_threshold'] == original_legacy['funding_rate_threshold']
+    assert prepared['legacy_kwargs']['funding_rate_avg_threshold'] == original_legacy['funding_rate_avg_threshold']
+    for extracted_key in (
+        'microstructure_inputs',
+        'okx_sentiment_score',
+        'okx_sentiment_acceleration',
+        'sector_resonance_score',
+        'smart_money_flow_score',
+    ):
+        assert extracted_key not in prepared['legacy_kwargs']
+    assert request.legacy_kwargs == original_legacy
+
+
+def test_build_candidate_runtime_inputs_copies_sequences_and_injects_dependencies(monkeypatch):
+    request = make_candidate_request(
+        klines_5m=[{'close': '1'}],
+        klines_15m=[{'close': '2'}],
+        klines_1h=[{'close': '3'}],
+        klines_4h=[{'close': '4'}],
+        open_interest_rows=[{'sumOpenInterestValue': '10'}],
+        taker_long_short_ratio_rows=[{'buySellRatio': '1.1'}],
+        top_long_short_position_ratio_rows=[{'longShortRatio': '1.2'}],
+        top_long_short_account_ratio_rows=[{'longShortRatio': '1.3'}],
+        symbol_open_interest_rows_5m=[{'sumOpenInterestValue': '11'}],
+        symbol_open_interest_rows_15m=[{'sumOpenInterestValue': '12'}],
+    )
+    prepared = {
+        'microstructure_inputs': {'short_bias': 0.66},
+        'okx_sentiment': {'okx_sentiment_score': 0.28},
+        'smart_money_context': {'smart_money_flow_score': 0.45},
+        'legacy_kwargs': {'risk_usdt': 10.0},
+    }
+    captured = {}
+
+    monkeypatch.setattr(mod, 'prepare_build_candidate_request_inputs', lambda request_arg: prepared)
+    monkeypatch.setattr(mod, 'build_candidate_impl', lambda **kwargs: captured.update(kwargs) or 'candidate')
+
+    result = mod._build_candidate_from_request(request)
+
+    assert result == 'candidate'
+    assert captured['klines_5m'] == [{'close': '1'}]
+    assert captured['klines_15m'] == [{'close': '2'}]
+    assert captured['klines_1h'] == [{'close': '3'}]
+    assert captured['klines_4h'] == [{'close': '4'}]
+    assert captured['open_interest_rows'] == [{'sumOpenInterestValue': '10'}]
+    assert captured['taker_long_short_ratio_rows'] == [{'buySellRatio': '1.1'}]
+    assert captured['top_long_short_position_ratio_rows'] == [{'longShortRatio': '1.2'}]
+    assert captured['top_long_short_account_ratio_rows'] == [{'longShortRatio': '1.3'}]
+    assert captured['symbol_open_interest_rows_5m'] == [{'sumOpenInterestValue': '11'}]
+    assert captured['symbol_open_interest_rows_15m'] == [{'sumOpenInterestValue': '12'}]
+    assert captured['microstructure_inputs'] == {'short_bias': 0.66}
+    assert captured['okx_sentiment'] == {'okx_sentiment_score': 0.28}
+    assert captured['smart_money_context'] == {'smart_money_flow_score': 0.45}
+    assert captured['risk_usdt'] == 10.0
+    assert captured['Candidate'] is mod.Candidate
+    assert captured['TRADE_SIDE_LONG'] == mod.TRADE_SIDE_LONG
+    assert captured['TRADE_SIDE_SHORT'] == mod.TRADE_SIDE_SHORT
+    assert captured['normalize_trade_side'] is mod.normalize_trade_side
+    assert captured['trade_side_to_position_side'] is mod.trade_side_to_position_side
+    assert captured['compute_control_risk_score'] is mod.compute_control_risk_score
+    assert captured['classify_candidate_state'] is mod.classify_candidate_state
+    assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
+
+    request.klines_5m.append({'close': 'mutated'})
+    request.symbol_open_interest_rows_5m.append({'sumOpenInterestValue': '99'})
+    assert captured['klines_5m'] == [{'close': '1'}]
+    assert captured['symbol_open_interest_rows_5m'] == [{'sumOpenInterestValue': '11'}]
+
+
+def test_build_candidate_runtime_inputs_injects_candidate_construction_tail_dependencies(monkeypatch):
+    request = make_candidate_request()
+    prepared = {
+        'microstructure_inputs': {'short_bias': 0.66},
+        'okx_sentiment': {'okx_sentiment_score': 0.28},
+        'smart_money_context': {'smart_money_flow_score': 0.45},
+        'legacy_kwargs': {'risk_usdt': 10.0},
+    }
+    captured = {}
+
+    monkeypatch.setattr(mod, 'prepare_build_candidate_request_inputs', lambda request_arg: prepared)
+    monkeypatch.setattr(mod, 'build_candidate_impl', lambda **kwargs: captured.update(kwargs) or 'candidate')
+
+    mod._build_candidate_from_request(request)
+
+    assert captured['merge_smart_money_scores'] is mod.merge_smart_money_scores
+    assert captured['compute_relative_oi_features'] is mod.compute_relative_oi_features
+    assert captured['compute_squeeze_signal'] is mod.compute_squeeze_signal
+    assert captured['compute_control_risk_score'] is mod.compute_control_risk_score
+    assert captured['classify_candidate_state'] is mod.classify_candidate_state
+    assert captured['recommend_leverage'] is mod.recommend_leverage
+    assert captured['evaluate_trigger_confirmation'] is mod.evaluate_trigger_confirmation
+    assert captured['clamp'] is mod.clamp
+    assert captured['classify_alert_tier'] is mod.classify_alert_tier
+    assert captured['recommended_position_size_pct'] is mod.recommended_position_size_pct
+    assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
+
+
+def test_build_candidate_request_path_preserves_trade_management_plan_fields(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def fake_build_candidate_impl(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(mod, 'build_candidate_impl', fake_build_candidate_impl)
+
+    candidate = build_candidate_from_request()
+
+    assert candidate is sentinel
+    assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
+    assert captured['risk_usdt'] == 10.0
+    assert captured['lookback_bars'] == 12
+    assert captured['swing_bars'] == 6
+    assert captured['funding_rate_threshold'] == 0.0005
+    assert captured['funding_rate_avg_threshold'] == 0.0003
+    assert captured['max_distance_from_vwap_pct'] == 12.0
+    assert captured['max_leverage'] == 5
+    assert captured['market_regime']['label'] == 'risk_on'
+
+
+def test_finalize_candidate_construction_appends_tail_fields_and_flags():
+    candidate = mod.candidate_builder_mod.finalize_candidate_construction(
+        Candidate=mod.Candidate,
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=12.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0014,
+        funding_rate_avg=-0.0008,
+        recent_5m_change_pct=2.3,
+        acceleration_ratio=1.8,
+        breakout_level=131.0,
+        recent_swing_low=127.0,
+        stop_price=129.5,
+        quantity=1.25,
+        risk_per_unit=2.0,
+        recommended_leverage=4,
+        rsi_5m=68.0,
+        volume_multiple=2.4,
+        distance_from_ema20_5m_pct=1.2,
+        distance_from_vwap_15m_pct=0.8,
+        trend_1h={'allowed': True},
+        trend_4h={'allowed': True},
+        score=187.4,
+        reasons=['tail_refactor_sentinel'],
+        trade_side=mod.TRADE_SIDE_LONG,
+        position_side='LONG',
+        higher_timeframe_bias='long',
+        oi_features={
+            'oi_change_pct_5m': 8.0,
+            'oi_change_pct_15m': 15.0,
+            'oi_acceleration_ratio': 1.9,
+            'taker_buy_ratio': 0.62,
+            'oi_zscore_5m': 4.1,
+            'volume_zscore_5m': 3.7,
+            'bollinger_bandwidth_pct': 2.2,
+            'price_above_vwap': True,
+            'funding_rate_percentile_hint': 'low',
+            'cvd_delta': 240000.0,
+            'cvd_zscore': 3.2,
+        },
+        microstructure_inputs={
+            'long_short_ratio': 0.88,
+            'short_bias': 0.78,
+        },
+        atr_stop_distance=1.4,
+        stop_model='atr',
+        stop_distance_pct=1.06,
+        stop_too_tight_flag=False,
+        stop_too_wide_flag=False,
+        state_payload={
+            'state': 'launch',
+            'state_reasons': ['launch_short_squeeze'],
+            'setup_score': 18.5,
+            'exhaustion_score': 1.2,
+        },
+        okx_sentiment_score=0.28,
+        okx_sentiment_acceleration=0.42,
+        sector_resonance_score=0.64,
+        smart_money_effective=0.45,
+        leading_payload={'score': 10.0},
+        squeeze_payload={'score': 14.0},
+        control_risk_payload={'score': 0.0, 'veto': False, 'veto_reason': ''},
+        initial_alert_tier='critical',
+        initial_position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.1,
+        onchain_smart_money_score=0.25,
+        smart_money_merge={'veto': False, 'veto_reason': '', 'sources': ['exchange_flow']},
+        entry_distance_from_breakout_pct=0.7634,
+        entry_distance_from_vwap_pct=0.8,
+        overextension_flag=False,
+        setup_ready=False,
+        trigger_fired=False,
+        expected_slippage_pct=0.2672,
+        book_depth_fill_ratio=0.8664,
+        loser_rank=None,
+        trigger_confirmation={
+            'flags': {
+                'breakout_close_confirmed': True,
+                'high_elastic_long_pullback_confirmed': False,
+                'long_crowding_ok': True,
+            },
+            'confirmation_count': 3,
+            'min_confirmations': 2,
+        },
+        legacy_kwargs={'oi_hard_reversal_threshold_pct': 0.8},
+        waiting_breakout=True,
+    )
+
+    assert candidate.state == 'launch'
+    assert candidate.state_reasons == ['launch_short_squeeze']
+    assert candidate.alert_tier == 'critical'
+    assert candidate.position_size_pct == 3.3
+    assert candidate.squeeze_score == 14.0
+    assert candidate.control_risk_score == 0.0
+    assert candidate.expected_slippage_pct == 0.2672
+    assert candidate.book_depth_fill_ratio == 0.8664
+    assert candidate.trigger_confirmation_count == 3
+    assert candidate.trigger_confirmation_flags['breakout_close_confirmed'] is True
+    assert candidate.must_pass_flags['setup_ready'] is False
+    assert candidate.must_pass_flags['trigger_fired'] is False
+    assert candidate.must_pass_flags['long_crowding_ok'] is True
+    assert candidate.reasons[-4:] == [
+        'trigger_confirmation_count=3',
+        'trigger_min_confirmations=2',
+        'waiting_breakout',
+        'alert_tier=critical',
+    ] or candidate.reasons[-5:] == [
+        'trigger_confirmation_count=3',
+        'trigger_min_confirmations=2',
+        'waiting_breakout',
+        'alert_tier=critical',
+        'position_size_pct=3.3',
+    ]
+    assert 'position_size_pct=3.3' in candidate.reasons
+
+
+def test_build_candidate_request_path_preserves_tail_outputs_after_candidate_construction_refactor(monkeypatch):
+    sentinel_candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=12.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0014,
+        funding_rate_avg=-0.0008,
+        recent_5m_change_pct=2.3,
+        acceleration_ratio_5m_vs_15m=1.8,
+        breakout_level=131.0,
+        recent_swing_low=127.0,
+        stop_price=129.5,
+        quantity=1.25,
+        risk_per_unit=2.0,
+        recommended_leverage=4,
+        rsi_5m=68.0,
+        volume_multiple=2.4,
+        distance_from_ema20_5m_pct=1.2,
+        distance_from_vwap_15m_pct=0.8,
+        higher_tf_summary={'1h': {'allowed': True}, '4h': {'allowed': True}},
+        score=187.4,
+        reasons=['tail_refactor_sentinel'],
+        side=mod.TRADE_SIDE_LONG,
+        position_side='LONG',
+        trigger_type='breakout',
+        higher_timeframe_bias='long',
+        oi_change_pct_5m=8.0,
+        oi_change_pct_15m=15.0,
+        oi_acceleration_ratio=1.9,
+        taker_buy_ratio=0.62,
+        long_short_ratio=0.88,
+        short_bias=0.78,
+        oi_zscore_5m=4.1,
+        volume_zscore_5m=3.7,
+        bollinger_bandwidth_pct=2.2,
+        price_above_vwap=True,
+        funding_rate_percentile_hint='low',
+        cvd_delta=240000.0,
+        cvd_zscore=3.2,
+        atr_stop_distance=1.4,
+        stop_model='atr',
+        stop_distance_pct=1.06,
+        stop_too_tight_flag=False,
+        stop_too_wide_flag=False,
+        state='launch',
+        state_reasons=['launch_short_squeeze'],
+        setup_score=18.5,
+        exhaustion_score=1.2,
+        okx_sentiment_score=0.28,
+        okx_sentiment_acceleration=0.42,
+        sector_resonance_score=0.64,
+        smart_money_flow_score=0.45,
+        leading_sentiment_delta=10.0,
+        squeeze_score=14.0,
+        control_risk_score=0.0,
+        alert_tier='critical',
+        position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.1,
+        onchain_smart_money_score=0.25,
+        smart_money_veto=False,
+        smart_money_veto_reason='',
+        smart_money_sources=['exchange_flow'],
+        entry_distance_from_breakout_pct=0.7634,
+        entry_distance_from_vwap_pct=0.8,
+        overextension_flag=False,
+        setup_ready=False,
+        trigger_fired=False,
+        expected_slippage_pct=0.2672,
+        book_depth_fill_ratio=0.8664,
+        loser_rank=None,
+        trigger_confirmation_flags={
+            'breakout_close_confirmed': True,
+            'high_elastic_long_pullback_confirmed': False,
+            'long_crowding_ok': True,
+        },
+        trigger_confirmation_count=3,
+        trigger_min_confirmations=2,
+        oi_hard_reversal_threshold_pct=0.8,
+        portfolio_narrative_bucket='',
+        portfolio_correlation_group='',
+    )
+    sentinel_candidate.must_pass_flags = {
+        'breakout_close_confirmed': True,
+        'setup_ready': False,
+        'trigger_fired': False,
+    }
+
+    monkeypatch.setattr(mod, 'build_candidate_impl', lambda **kwargs: sentinel_candidate)
+
+    candidate = build_candidate_from_request()
+
+    assert candidate is sentinel_candidate
+    assert candidate.state == 'launch'
+    assert candidate.state_reasons == ['launch_short_squeeze']
+    assert candidate.alert_tier == 'critical'
+    assert candidate.position_size_pct == 3.3
+    assert candidate.squeeze_score == 14.0
+    assert candidate.control_risk_score == 0.0
+    assert candidate.expected_slippage_pct == 0.2672
+    assert candidate.book_depth_fill_ratio == 0.8664
+    assert candidate.trigger_confirmation_count == 3
+    assert candidate.trigger_confirmation_flags['breakout_close_confirmed'] is True
+    assert candidate.must_pass_flags['setup_ready'] is False
+
+
 def test_compute_leading_sentiment_signal_rewards_early_turn_and_penalizes_overheated_sentiment():
     payload = mod.compute_leading_sentiment_signal(okx_sentiment_score=0.2, okx_sentiment_acceleration=0.4)
     assert payload['score'] > 8
@@ -909,6 +1297,206 @@ def test_run_auto_loop_user_data_stream_monitor_uses_explicit_config_without_arg
     assert recorded['disconnect_timeout_minutes'] == 44.0
     assert result['monitor']['symbol'] == 'TESTUSDT'
     assert result['alert'] is None
+
+
+def test_build_user_data_stream_position_payload_keeps_monitor_contract():
+    payload = mod.build_user_data_stream_position_payload({
+        'status': 'refresh_failed',
+        'listen_key': 'lk-1',
+        'health': {'symbol': 'TESTUSDT', 'disconnect_count': 2},
+        'action': 'refresh_failed',
+        'now_utc': '2026-05-10T11:31:00+00:00',
+        'ignored': 'value',
+    })
+
+    assert payload == {
+        'status': 'refresh_failed',
+        'listen_key': 'lk-1',
+        'health': {'symbol': 'TESTUSDT', 'disconnect_count': 2},
+        'action': 'refresh_failed',
+        'now_utc': '2026-05-10T11:31:00+00:00',
+    }
+
+
+def test_persist_user_data_stream_monitor_to_positions_updates_only_matching_symbol_records(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'TESTUSDT:LONG': {
+            'symbol': 'TESTUSDT',
+            'position_side': 'LONG',
+            'status': 'monitoring',
+        },
+        'BTCUSDT:LONG': {
+            'symbol': 'BTCUSDT',
+            'position_side': 'LONG',
+            'status': 'monitoring',
+        },
+    })
+    monitor = {
+        'status': 'refresh_failed',
+        'listen_key': 'lk-1',
+        'action': 'refresh_failed',
+        'now_utc': '2026-05-10T11:31:00+00:00',
+        'health': {
+            'symbol': 'TESTUSDT',
+            'disconnect_count': 2,
+        },
+    }
+
+    result = mod.persist_user_data_stream_monitor_to_positions(store, monitor)
+
+    assert result['TESTUSDT:LONG']['user_data_stream'] == mod.build_user_data_stream_position_payload(monitor)
+    assert 'user_data_stream' not in result['BTCUSDT:LONG']
+    assert store.load_json('positions', {}) == result
+
+
+def test_emit_user_data_stream_alert_if_needed_builds_notification_payload(monkeypatch):
+    notifications = []
+    args = argparse.Namespace(disable_notify=False, notify_target='telegram:test')
+
+    monkeypatch.setattr(
+        mod,
+        'emit_notification',
+        lambda args, event_type, payload: notifications.append((event_type, payload)) or {'ok': True},
+    )
+
+    payload = mod.emit_user_data_stream_alert_if_needed(
+        args=args,
+        symbol='TESTUSDT',
+        monitor={
+            'status': 'refresh_failed',
+            'action': 'refresh_failed',
+            'listen_key': 'lk-1',
+            'error': 'boom',
+            'now_utc': '2026-05-10T11:31:00+00:00',
+            'health': {
+                'symbol': 'TESTUSDT',
+                'detail': 'boom',
+                'disconnect_count': 2,
+                'refresh_failure_count': 3,
+                'reconnect_count': 4,
+                'started_at': '2026-05-10T11:00:00+00:00',
+                'last_refresh_at': '2026-05-10T11:30:00+00:00',
+                'updated_at': '2026-05-10T11:31:00+00:00',
+            },
+        },
+    )
+
+    assert payload == {
+        'symbol': 'TESTUSDT',
+        'status': 'refresh_failed',
+        'action': 'refresh_failed',
+        'error': 'boom',
+        'detail': 'boom',
+        'listen_key': 'lk-1',
+        'disconnect_count': 2,
+        'refresh_failure_count': 3,
+        'reconnect_count': 4,
+        'started_at': '2026-05-10T11:00:00+00:00',
+        'last_refresh_at': '2026-05-10T11:30:00+00:00',
+        'updated_at': '2026-05-10T11:31:00+00:00',
+    }
+    assert notifications == [('user_data_stream_alert', payload)]
+
+
+def test_run_auto_loop_user_data_stream_monitor_core_runs_cycle_persist_and_alert(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    existing_state = {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'}
+    monitor = {'status': 'healthy', 'health': {'symbol': 'TESTUSDT'}}
+    calls = []
+
+    monkeypatch.setattr(
+        mod,
+        'run_user_data_stream_monitor_cycle',
+        lambda **kwargs: calls.append(('cycle', kwargs)) or monitor,
+    )
+    monkeypatch.setattr(
+        mod,
+        'persist_user_data_stream_monitor_to_positions',
+        lambda store_arg, monitor_arg: calls.append(('persist', store_arg, monitor_arg)),
+    )
+    monkeypatch.setattr(
+        mod,
+        'emit_user_data_stream_alert_if_needed',
+        lambda args, symbol, monitor_arg: calls.append(('alert', args, symbol, monitor_arg)) or {'sent': True},
+    )
+
+    result = mod.run_auto_loop_user_data_stream_monitor_core(
+        client='client',
+        store=store,
+        args='args',
+        existing_uds_state=existing_state,
+        config=mod.AutoLoopUserDataStreamMonitorConfig(
+            okx_simulated_trading=False,
+            refresh_interval_minutes=22.0,
+            disconnect_timeout_minutes=44.0,
+        ),
+    )
+
+    assert result == {'monitor': monitor, 'alert': {'sent': True}}
+    assert calls == [
+        ('cycle', {
+            'client': 'client',
+            'store': store,
+            'symbol': 'TESTUSDT',
+            'refresh_interval_minutes': 22.0,
+            'disconnect_timeout_minutes': 44.0,
+        }),
+        ('persist', store, monitor),
+        ('alert', 'args', 'TESTUSDT', monitor),
+    ]
+
+
+def test_run_auto_loop_user_data_stream_monitor_core_returns_empty_result_without_listen_key(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    result = mod.run_auto_loop_user_data_stream_monitor_core(
+        client='client',
+        store=store,
+        args='args',
+        existing_uds_state={'symbol': 'TESTUSDT'},
+        config=mod.AutoLoopUserDataStreamMonitorConfig(
+            okx_simulated_trading=False,
+            refresh_interval_minutes=22.0,
+            disconnect_timeout_minutes=44.0,
+        ),
+    )
+
+    assert result == {'monitor': None, 'alert': None}
+
+
+def test_run_auto_loop_user_data_stream_monitor_wrapper_builds_state_and_delegates(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('user_data_stream', {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'})
+    captured = {}
+    config = mod.AutoLoopUserDataStreamMonitorConfig(
+        okx_simulated_trading=False,
+        refresh_interval_minutes=22.0,
+        disconnect_timeout_minutes=44.0,
+    )
+
+    monkeypatch.setattr(mod, 'build_auto_loop_user_data_stream_monitor_config', lambda args: config)
+
+    def fake_core(**kwargs):
+        captured.update(kwargs)
+        return {'monitor': {'status': 'healthy'}, 'alert': None}
+
+    monkeypatch.setattr(mod, 'run_auto_loop_user_data_stream_monitor_core', fake_core)
+
+    result = mod.run_auto_loop_user_data_stream_monitor(
+        client='client',
+        store=store,
+        args='args',
+    )
+
+    assert result == {'monitor': {'status': 'healthy'}, 'alert': None}
+    assert captured == {
+        'client': 'client',
+        'store': store,
+        'args': 'args',
+        'existing_uds_state': {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'},
+        'config': config,
+    }
 
 
 def test_build_auto_loop_book_ticker_monitor_optional_store_seams_wires_loader_and_emitter(monkeypatch, tmp_path):
@@ -2708,6 +3296,74 @@ def test_reconcile_runtime_state_rebuilds_plan_for_protected_recovered_short(mon
     assert 'recovery_reason' not in tracked
 
 
+def test_reconcile_runtime_state_recovers_plan_from_protection_open_order_stop(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'ZECUSDT:SHORT': {
+            'symbol': 'ZECUSDT',
+            'side': 'SHORT',
+            'status': 'protected_recovery_pending',
+            'quantity': 0.034,
+            'remaining_quantity': 0.034,
+            'entry_price': 584.7605882353,
+            'stop_price': 584.7605882353,
+            'current_stop_price': 584.7605882353,
+            'protection_status': 'protected',
+            'trade_management_plan': None,
+            'recovery_incomplete': True,
+            'recovery_reason': 'missing_valid_stop_distance',
+        },
+    })
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{
+        'symbol': 'ZECUSDT',
+        'positionAmt': '-0.034',
+        'positionSide': 'SHORT',
+        'entryPrice': '584.7605882353',
+        'currentPrice': '569.01',
+        'markPrice': '569.01',
+        'unRealizedProfit': '0.53551999',
+        'notional': '-19.34634',
+        'leverage': '5',
+        'isolatedMargin': '3.869268',
+    }])
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *args, **kwargs: {
+        'status': 'protected',
+        'active_position': {'symbol': 'ZECUSDT', 'positionAmt': '-0.034', 'positionSide': 'SHORT'},
+        'expected_order_id': None,
+        'open_orders': [{'orderId': 654, 'type': 'STOP_MARKET', 'stopPrice': '589.8'}],
+    })
+
+    result = mod.reconcile_runtime_state(
+        client=object(),
+        store=store,
+        halt_on_orphan_position=False,
+        repair_missing_protection_enabled=True,
+        args=argparse.Namespace(
+            tp1_r=1.5,
+            tp1_close_pct=0.3,
+            tp2_r=2.0,
+            tp2_close_pct=0.4,
+            breakeven_r=1.0,
+            breakeven_confirmation_mode='ema_support',
+            breakeven_min_buffer_pct=0.001,
+        ),
+    )
+
+    positions = store.load_json('positions', {})
+    tracked = positions['ZECUSDT:SHORT']
+    assert result['positions_missing_protection'] == []
+    assert tracked['protection_status'] == 'protected'
+    assert tracked['status'] == 'monitoring'
+    assert tracked['protected_recovery_pending'] is False
+    assert tracked['current_stop_price'] == 589.8
+    assert tracked['stop_price'] == 589.8
+    assert tracked['trade_management_plan']['stop_price'] == 589.8
+    assert tracked['trade_management_plan']['initial_risk_per_unit'] > 0
+    assert 'recovery_incomplete' not in tracked
+    assert 'recovery_reason' not in tracked
+
+
 def test_resolve_position_protection_status_requires_matching_algo_identity(monkeypatch):
     monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'DOGEUSDT', 'positionAmt': '5', 'positionSide': 'LONG'}])
     monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
@@ -3014,6 +3670,8 @@ def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unkno
         tp1_close_pct=0.3,
         tp2_r=2.0,
         tp2_close_pct=0.4,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
         breakeven_r=1.0,
         profile='test',
     )
@@ -3051,6 +3709,7 @@ def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unkno
     monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: events.append((event_type, dict(payload))))
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
     monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 999, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 1001, 'clientOrderId': 'tp-1'})
     monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 999})
     monkeypatch.setattr(mod, 'query_order', lambda client, symbol, order_id=None, client_order_id=None: {
         'orderId': 12345,
@@ -3410,7 +4069,15 @@ def test_runtime_store_load_json_repairs_corrupted_short_plan_side(tmp_path):
 
 
 def test_build_trade_management_plan_from_position_preserves_short_side_from_position_side():
-    args = argparse.Namespace(tp1_r=1.5, tp1_close_pct=0.3, tp2_r=2.0, tp2_close_pct=0.4, breakeven_r=1.0)
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+        breakeven_r=1.0,
+    )
 
     plan = mod.build_trade_management_plan_from_position({
         'symbol': 'GIGGLEUSDT',
@@ -3427,8 +4094,10 @@ def test_build_trade_management_plan_from_position_preserves_short_side_from_pos
             'breakeven_trigger_price': 36.2,
             'tp1_trigger_price': 36.0,
             'tp1_close_qty': 0.4,
+            'tp1_profit_usdt': 5.0,
             'tp2_trigger_price': 35.5,
             'tp2_close_qty': 0.5,
+            'tp2_profit_usdt': 10.0,
             'runner_qty': 0.38,
             'side': 'long',
             'position_side': 'LONG',
@@ -3437,6 +4106,8 @@ def test_build_trade_management_plan_from_position_preserves_short_side_from_pos
 
     assert plan.side == mod.TRADE_SIDE_SHORT
     assert plan.position_side == mod.POSITION_SIDE_SHORT
+    assert plan.tp1_profit_usdt == 5.0
+    assert plan.tp2_profit_usdt == 10.0
 
 
 def test_build_trade_management_plan_from_position_derives_short_side_without_position_side():
@@ -3516,6 +4187,43 @@ def test_build_trade_management_plan_from_position_falls_back_when_persisted_pla
     assert plan.stop_price == 38.6
     assert plan.breakeven_confirmation_mode == 'ema_support'
     assert plan.breakeven_min_buffer_pct == 0.001
+
+
+def test_build_trade_management_plan_from_position_uses_profit_targets_from_args_when_rebuilding():
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+        breakeven_r=1.0,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.001,
+    )
+
+    plan = mod.build_trade_management_plan_from_position({
+        'symbol': 'GIGGLEUSDT',
+        'position_side': 'SHORT',
+        'entry_price': 37.4,
+        'stop_price': 38.6,
+        'quantity': 1.28,
+        'trade_management_plan': None,
+    }, args)
+
+    assert plan.tp1_profit_usdt == 5.0
+    assert plan.tp2_profit_usdt == 10.0
+    assert plan.tp1_close_qty == pytest.approx(0.384)
+    assert plan.tp2_close_qty == pytest.approx(0.512)
+
+
+def test_build_parser_accepts_absolute_profit_targets():
+    parser = mod.build_parser()
+
+    args = parser.parse_args(['--tp1-profit-usdt', '5', '--tp2-profit-usdt', '10'])
+
+    assert args.tp1_profit_usdt == 5.0
+    assert args.tp2_profit_usdt == 10.0
 
 
 def test_restore_position_lifecycle_fields_marks_zero_risk_plan_as_recovery_incomplete():
