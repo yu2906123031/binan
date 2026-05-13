@@ -1,0 +1,13 @@
+{
+  "halted": false,
+  "halt_reason": "",
+  "consecutive_losses": 0,
+  "daily_realized_pnl_usdt": 0.0,
+  "symbol_cooldowns": {},
+  "portfolio_exposure_pct_by_theme": {},
+  "portfolio_exposure_pct_by_correlation": {},
+  "portfolio_heat_open_r": 0.0,
+  "portfolio_heat_pending_r": 0.0,
+  "portfolio_heat_r_by_theme": {},
+  "portfolio_heat_r_by_correlation": {}
+}
