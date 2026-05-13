@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 import requests
 
 import candidate_builder as candidate_builder_mod
-from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
+from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
@@ -2550,8 +2550,8 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
         if plan.breakeven_confirmation_mode == 'ema_support':
             breakeven_confirmed = breakeven_confirmed and current_price <= ema5m and ema5m <= plan.entry_price
         tp1_will_hit = (not state.tp1_hit) and current_price <= plan.tp1_trigger_price and plan.tp1_close_qty > 0
-        if not state.moved_to_breakeven and breakeven_confirmed:
-            actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(plan.entry_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
+        if (not state.moved_to_breakeven) and breakeven_confirmed:
+            actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(breakeven_buffer_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
         if tp1_will_hit:
             actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(min(plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
         if (state.tp1_hit or tp1_will_hit) and not state.tp2_hit and current_price <= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
@@ -2568,8 +2568,15 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
     if plan.breakeven_confirmation_mode == 'ema_support':
         breakeven_confirmed = breakeven_confirmed and current_price >= ema5m and ema5m >= plan.entry_price
     tp1_will_hit = (not state.tp1_hit) and current_price >= plan.tp1_trigger_price and plan.tp1_close_qty > 0
-    if not state.moved_to_breakeven and breakeven_confirmed:
-        actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(plan.entry_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
+    if (not state.moved_to_breakeven) and breakeven_confirmed:
+        if state.tp1_hit:
+            actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(breakeven_buffer_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
+        elif tp1_will_hit and plan.breakeven_trigger_price > plan.tp1_trigger_price:
+            actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(max(state.current_stop_price or plan.entry_price, plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
+            actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(breakeven_buffer_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
+            tp1_will_hit = False
+        else:
+            actions.append({'type': 'move_stop_to_breakeven', 'new_stop_price': round(breakeven_buffer_price, 10), 'confirmation_mode': plan.breakeven_confirmation_mode})
     if tp1_will_hit:
         actions.append({'type': 'take_profit_1', 'close_qty': plan.tp1_close_qty, 'new_stop_price': round(max(state.current_stop_price or plan.entry_price, plan.entry_price, ema5m), 10), 'exit_reason': 'tp1'})
     if (state.tp1_hit or tp1_will_hit) and not state.tp2_hit and current_price >= plan.tp2_trigger_price and plan.tp2_close_qty > 0:
@@ -4842,7 +4849,8 @@ def apply_hard_veto_filters(candidate: Candidate) -> Optional[str]:
     oi_hard_reversal_threshold = abs(_to_float(getattr(candidate, 'oi_hard_reversal_threshold_pct', 0.8), default=0.8))
     if candidate.oi_change_pct_5m <= -oi_hard_reversal_threshold:
         return 'oi_reversal_veto'
-    if candidate.price_change_pct_24h >= 15.0 and candidate.state in {'chase', 'momentum_extension', 'overheated'}:
+    extended_chase_threshold = abs(_to_float(getattr(candidate, 'extended_chase_threshold_pct', 15.0), default=15.0))
+    if candidate.price_change_pct_24h >= extended_chase_threshold and candidate.state in {'chase', 'momentum_extension', 'overheated'}:
         return 'extended_chase_veto'
     hard_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_hard_veto_r', 0.25), default=0.25), 0.0)
     if execution_slippage_r > hard_slippage_r:
@@ -5223,8 +5231,10 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                 watch_breakout_tolerance_pct=float(getattr(args, 'watch_breakout_tolerance_pct', 0.0) or 0.0),
                 setup_breakout_tolerance_pct=float(getattr(args, 'setup_breakout_tolerance_pct', 0.0) or 0.0),
                 oi_hard_reversal_threshold_pct=float(getattr(args, 'oi_hard_reversal_threshold_pct', 0.8) or 0.8),
+                extended_chase_threshold_pct=float(getattr(args, 'extended_chase_threshold_pct', 15.0) or 15.0),
                 execution_slippage_hard_veto_r=float(getattr(args, 'execution_slippage_hard_veto_r', 0.25) or 0.25),
                 execution_slippage_risk_threshold_r=float(getattr(args, 'execution_slippage_risk_threshold_r', 0.15) or 0.15),
+                trigger_min_confirmations=int(getattr(args, 'trigger_min_confirmations', 2) or 2),
                 side=candidate_side,
                 early_reject_stats=early_reject_stats,
                 **micro,
@@ -5409,12 +5419,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--watch-breakout-tolerance-pct', type=float, default=0.0, help='Allow near-breakout watch candidates within this percent into candidate scoring.')
     parser.add_argument('--setup-breakout-tolerance-pct', type=float, default=0.0, help='Treat near-breakout candidates within this percent as eligible for setup readiness; execution still requires trigger confirmation.')
     parser.add_argument('--oi-hard-reversal-threshold-pct', type=float, default=0.8, help='Directional 5m OI reversal threshold that remains a hard veto.')
+    parser.add_argument('--extended-chase-threshold-pct', type=float, default=15.0, help='24h change threshold above which chase/momentum_extension/overheated states are vetoed.')
     parser.add_argument('--sim-probe-entry-enabled', action='store_true', help='Allow OKX simulated trading to submit a small probe when setup is ready but full trigger has not fired.')
     parser.add_argument('--sim-probe-size-ratio', type=float, default=0.2)
     parser.add_argument('--sim-probe-min-score', type=float, default=62.0)
     parser.add_argument('--sim-probe-max-breakout-distance-pct', type=float, default=0.35)
     parser.add_argument('--execution-slippage-hard-veto-r', type=float, default=0.25)
     parser.add_argument('--execution-slippage-risk-threshold-r', type=float, default=0.15)
+    parser.add_argument('--trigger-min-confirmations', type=int, default=2, help='Minimum trigger confirmations required after setup readiness.')
     parser.add_argument('--max-funding-rate', type=float, default=0.0005)
     parser.add_argument('--max-funding-rate-avg', type=float, default=0.0003)
     parser.add_argument('--leverage', type=int, default=5)
@@ -5571,8 +5583,10 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'watch_breakout_tolerance_pct': 0.8,
             'setup_breakout_tolerance_pct': 0.35,
             'oi_hard_reversal_threshold_pct': 1.0,
+            'extended_chase_threshold_pct': 18.0,
             'execution_slippage_hard_veto_r': 0.4,
             'execution_slippage_risk_threshold_r': 0.25,
+            'trigger_min_confirmations': 1,
             'max_distance_from_ema_pct': 8.0,
             'max_distance_from_vwap_pct': 7.0,
             'max_funding_rate': 0.0008,
@@ -6305,6 +6319,33 @@ def ensure_symbol_margin_type(client: BinanceFuturesClient, symbol: str, margin_
         symbol,
         binance_api_error=BinanceAPIError,
         margin_type=margin_type,
+    )
+
+
+def place_initial_stop_with_retries(
+    client: BinanceFuturesClient,
+    candidate: Candidate,
+    meta: SymbolMeta,
+    args: argparse.Namespace,
+    *,
+    filled_quantity: float,
+    position_side: str,
+) -> Dict[str, Any]:
+    return execution_place_initial_stop_with_retries(
+        client=client,
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=filled_quantity,
+        position_side=position_side,
+        fetch_open_positions=fetch_open_positions,
+        position_row_matches_symbol_side=position_row_matches_symbol_side,
+        place_stop_market_order=place_stop_market_order,
+        log_runtime_event=log_runtime_event,
+        emit_notification=emit_notification,
+        binance_api_error=BinanceAPIError,
+        _to_float=_to_float,
+        time_module=time,
     )
 
 

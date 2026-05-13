@@ -1197,6 +1197,7 @@ def test_run_user_data_stream_monitor_cycle_restarts_when_listen_key_missing(mon
     monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: runtime_events.append((event_type, payload)))
     monkeypatch.setattr(mod, 'emit_notification', lambda args, event_type, payload, post_func=None: notifications.append((event_type, payload)) or {'ok': True})
     monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 54321, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
     monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321})
 
     result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
@@ -1208,7 +1209,8 @@ def test_run_user_data_stream_monitor_cycle_restarts_when_listen_key_missing(mon
     assert calls[2][1]['quantity'] == '12.7'
     assert runtime_events[0][0] == 'entry_filled'
     assert notifications[0][0] == 'entry_filled'
-    assert runtime_events[1][0] == 'initial_stop_placed'
+    assert runtime_events[1][0] == 'initial_stop_place_attempt_succeeded'
+    assert runtime_events[2][0] == 'initial_stop_placed'
     assert notifications[1][0] == 'initial_stop_placed'
     assert result['entry_price'] == 0.1365
     assert result['filled_quantity'] == 12.7
@@ -1397,6 +1399,236 @@ def test_run_loop_background_buy_fill_confirmed_persists_short_position_key_and_
     assert buy_fill['entry_order_id'] == 12345
     assert buy_fill['entry_client_order_id'] == 'entry-order-1'
     assert buy_fill['entry_order_status'] == 'FILLED'
+
+
+def test_place_live_trade_retries_initial_stop_with_live_position_quantity(monkeypatch):
+    mod = load_module()
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=0.1365,
+        price_change_pct_24h=8.4,
+        quote_volume_24h=75_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0002,
+        funding_rate_avg=-0.0001,
+        recent_5m_change_pct=1.8,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=0.14,
+        recent_swing_low=0.1234,
+        stop_price=0.1234,
+        quantity=12.5,
+        risk_per_unit=0.0131,
+        recommended_leverage=5,
+        rsi_5m=68.0,
+        volume_multiple=2.2,
+        distance_from_ema20_5m_pct=1.1,
+        distance_from_vwap_15m_pct=0.8,
+        higher_tf_summary={'1h': 'trend_up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        side='LONG',
+        position_side='LONG',
+        state='launch',
+        state_reasons=['launch_breakout'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.0,
+        side_risk_multiplier=1.0,
+        quality_score=18.2,
+        execution_priority_score=9.1,
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='launch',
+        expected_slippage_pct=0.04,
+        book_depth_fill_ratio=0.92,
+        spread_bps=2.1,
+        orderbook_slope=1.3,
+        cancel_rate=0.04,
+        portfolio_narrative_bucket='meme',
+        portfolio_correlation_group='dog-family',
+    )
+    meta = SimpleNamespace(
+        symbol='DOGEUSDT',
+        price_precision=4,
+        quantity_precision=1,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+    )
+    args = make_args(initial_stop_max_attempts=3, initial_stop_retry_sleep_sec=0.0)
+    runtime_events = []
+    notifications = []
+    stop_calls = []
+    position_snapshots = [
+        [],
+        [{'symbol': 'DOGEUSDT', 'positionSide': 'LONG', 'positionAmt': '12.7', 'entryPrice': '0.1365'}],
+        [{'symbol': 'DOGEUSDT', 'positionSide': 'LONG', 'positionAmt': '12.8', 'entryPrice': '0.1365'}],
+    ]
+    fetch_positions_calls = {'count': 0}
+
+    class Client:
+        def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'DOGEUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '0.1365',
+                    'executedQty': '12.7',
+                    'cumQuote': '1.73355',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    def fake_fetch_open_positions(client):
+        idx = min(fetch_positions_calls['count'], len(position_snapshots) - 1)
+        fetch_positions_calls['count'] += 1
+        return position_snapshots[idx]
+
+    def fake_place_stop_market_order(client, symbol, stop_price, quantity, meta, side=None):
+        stop_calls.append({'symbol': symbol, 'stop_price': stop_price, 'quantity': quantity, 'side': side})
+        if len(stop_calls) == 1:
+            raise mod.BinanceAPIError('APIError(code=-5021): exchange busy')
+        return {'orderId': 54321, 'clientOrderId': 'stop-1'}
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', fake_fetch_open_positions)
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: runtime_events.append((event_type, dict(payload))))
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event_type, payload, post_func=None: notifications.append((event_type, dict(payload))) or {'ok': True})
+    monkeypatch.setattr(mod, 'place_stop_market_order', fake_place_stop_market_order)
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 60001})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321})
+    monkeypatch.setattr(mod.time, 'sleep', lambda *_a, **_k: None)
+
+    result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert [call['quantity'] for call in stop_calls] == [12.7, 12.8]
+    assert runtime_events[1][0] == 'initial_stop_place_attempt_failed'
+    assert runtime_events[1][1]['attempt'] == 1
+    assert runtime_events[1][1]['quantity'] == 12.7
+    assert runtime_events[2][0] == 'initial_stop_place_attempt_succeeded'
+    assert runtime_events[2][1]['attempt'] == 2
+    assert runtime_events[2][1]['quantity'] == 12.8
+    assert notifications[1][0] == 'initial_stop_place_attempt_failed'
+    assert notifications[2][0] == 'initial_stop_place_attempt_succeeded'
+    assert runtime_events[3][0] == 'initial_stop_placed'
+    assert result['stop_order']['orderId'] == 54321
+
+
+def test_place_live_trade_raises_after_initial_stop_retries_exhausted(monkeypatch):
+    mod = load_module()
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=0.1365,
+        price_change_pct_24h=8.4,
+        quote_volume_24h=75_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0002,
+        funding_rate_avg=-0.0001,
+        recent_5m_change_pct=1.8,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=0.14,
+        recent_swing_low=0.1234,
+        stop_price=0.1234,
+        quantity=12.5,
+        risk_per_unit=0.0131,
+        recommended_leverage=5,
+        rsi_5m=68.0,
+        volume_multiple=2.2,
+        distance_from_ema20_5m_pct=1.1,
+        distance_from_vwap_15m_pct=0.8,
+        higher_tf_summary={'1h': 'trend_up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        side='LONG',
+        position_side='LONG',
+        state='launch',
+        state_reasons=['launch_breakout'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.0,
+        side_risk_multiplier=1.0,
+        quality_score=18.2,
+        execution_priority_score=9.1,
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='launch',
+        expected_slippage_pct=0.04,
+        book_depth_fill_ratio=0.92,
+        spread_bps=2.1,
+        orderbook_slope=1.3,
+        cancel_rate=0.04,
+        portfolio_narrative_bucket='meme',
+        portfolio_correlation_group='dog-family',
+    )
+    meta = SimpleNamespace(
+        symbol='DOGEUSDT',
+        price_precision=4,
+        quantity_precision=1,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+    )
+    args = make_args(initial_stop_max_attempts=3, initial_stop_retry_sleep_sec=0.0)
+    runtime_events = []
+    notifications = []
+    stop_calls = []
+
+    class Client:
+        def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'DOGEUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '0.1365',
+                    'executedQty': '12.7',
+                    'cumQuote': '1.73355',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'DOGEUSDT', 'positionSide': 'LONG', 'positionAmt': '12.9', 'entryPrice': '0.1365'}] if stop_calls else [])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: runtime_events.append((event_type, dict(payload))))
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event_type, payload, post_func=None: notifications.append((event_type, dict(payload))) or {'ok': True})
+    monkeypatch.setattr(mod.time, 'sleep', lambda *_a, **_k: None)
+
+    def always_fail_stop(client, symbol, stop_price, quantity, meta, side=None):
+        stop_calls.append({'symbol': symbol, 'quantity': quantity, 'side': side})
+        raise mod.BinanceAPIError('APIError(code=-5021): exchange busy')
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', always_fail_stop)
+
+    with pytest.raises(mod.BinanceAPIError, match='开仓成功，但初始止损重挂全部失败'):
+        mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert [call['quantity'] for call in stop_calls] == [12.7, 12.9, 12.9]
+    assert [event_type for event_type, _ in runtime_events] == [
+        'entry_filled',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_retry_exhausted',
+    ]
+    assert notifications[-1][0] == 'initial_stop_retry_exhausted'
+    assert runtime_events[-1][1]['max_attempts'] == 3
 
 
 def test_run_loop_live_skips_when_short_position_already_open(monkeypatch, tmp_path):

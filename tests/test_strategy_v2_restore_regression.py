@@ -2710,8 +2710,8 @@ def test_apply_management_action_confirms_breakeven_stop_replacement(monkeypatch
     assert calls == [('cancel', 'TESTUSDT', 77), ('stop', 'TESTUSDT', 100.0, 1.0, 'LONG')]
 
 
-def test_evaluate_management_actions_requires_breakeven_confirmation_buffer():
-    state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=1.0)
+def test_evaluate_management_actions_requires_breakeven_confirmation_buffer_after_tp1():
+    state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=0.5, tp1_hit=True)
     plan = mod.TradeManagementPlan(
         entry_price=100.0,
         stop_price=95.0,
@@ -2746,10 +2746,143 @@ def test_evaluate_management_actions_requires_breakeven_confirmation_buffer():
         trailing_buffer_pct=0.02,
     )
     assert actions[0]['type'] == 'move_stop_to_breakeven'
-    assert actions[0]['confirmation_mode'] == 'ema_support'
+    assert actions[0]['new_stop_price'] == 102.0
 
 
-def test_evaluate_management_actions_tp1_raises_stop_using_current_stop_floor_for_long():
+def test_evaluate_management_actions_hits_tp1_before_breakeven_for_long():
+    state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=1.0)
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=106.75,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.45,
+        tp2_trigger_price=111.0,
+        tp2_close_qty=0.30,
+        runner_qty=0.25,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.0015,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=105.1,
+        ema5m=104.8,
+        trailing_reference=105.4,
+        trailing_buffer_pct=0.025,
+    )
+
+    assert [action['type'] for action in actions] == ['take_profit_1']
+    assert actions[0]['close_qty'] == 0.45
+
+
+def test_evaluate_management_actions_moves_long_stop_to_buffered_breakeven_after_tp1():
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.55,
+        tp1_hit=True,
+    )
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=106.75,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.45,
+        tp2_trigger_price=111.0,
+        tp2_close_qty=0.30,
+        runner_qty=0.25,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.0015,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=106.9,
+        ema5m=100.2,
+        trailing_reference=107.2,
+        trailing_buffer_pct=0.025,
+    )
+
+    assert actions[0]['type'] == 'move_stop_to_breakeven'
+    assert actions[0]['new_stop_price'] == 100.15
+
+
+def test_evaluate_management_actions_moves_short_stop_to_buffered_breakeven_after_tp1():
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.55,
+        side='short',
+        position_side='SHORT',
+        tp1_hit=True,
+    )
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=105.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=93.25,
+        tp1_trigger_price=95.0,
+        tp1_close_qty=0.45,
+        tp2_trigger_price=89.0,
+        tp2_close_qty=0.30,
+        runner_qty=0.25,
+        side='short',
+        position_side='SHORT',
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.0015,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=93.1,
+        ema5m=99.8,
+        trailing_reference=92.7,
+        trailing_buffer_pct=0.025,
+    )
+
+    assert actions[0]['type'] == 'move_stop_to_breakeven'
+    assert actions[0]['new_stop_price'] == 99.85
+
+
+def test_evaluate_management_actions_requires_tp1_before_breakeven_for_long():
+    state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=1.0)
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=106.75,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.45,
+        tp2_trigger_price=111.0,
+        tp2_close_qty=0.30,
+        runner_qty=0.25,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.0015,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=106.9,
+        ema5m=100.2,
+        trailing_reference=107.2,
+        trailing_buffer_pct=0.025,
+    )
+
+    assert [action['type'] for action in actions] == ['take_profit_1', 'move_stop_to_breakeven']
+    assert actions[1]['new_stop_price'] == 100.15
+
+
     state = mod.TradeManagementState(
         symbol='TESTUSDT',
         initial_quantity=1.0,

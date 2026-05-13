@@ -1,9 +1,11 @@
 import argparse
+import copy
 import dataclasses
 import importlib.util
 import json
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -2750,6 +2752,526 @@ def test_place_live_trade_scales_quantity_down_to_zero_and_skips_entry_order(mon
     assert calls == [
         ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
         ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
+    ]
+
+
+def test_place_initial_stop_with_retries_refreshes_live_quantity_and_emits_events(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    args = argparse.Namespace(profile='test-profile', initial_stop_max_attempts=2, initial_stop_retry_sleep_sec=0)
+    script_events = []
+    notifications = []
+    stop_attempts = []
+    positions = iter([
+        [],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+    ])
+
+    def place_stop(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        if len(stop_attempts) == 1:
+            raise RuntimeError('stop rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda _client: copy.deepcopy(next(positions)))
+    monkeypatch.setattr(mod, 'place_stop_market_order', place_stop)
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event, payload: script_events.append((event, payload)))
+    monkeypatch.setattr(
+        mod,
+        'emit_notification',
+        lambda _args, event, payload: notifications.append((event, payload)) or {'ok': True},
+    )
+
+    result = mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=make_meta(),
+        args=args,
+        filled_quantity=6.5,
+        position_side='LONG',
+    )
+
+    assert result['orderId'] == 54321
+    assert stop_attempts == [
+        ('TESTUSDT', 98.0, 6.5, 'LONG'),
+        ('TESTUSDT', 98.0, 1.9, 'LONG'),
+    ]
+    assert [event for event, _payload in script_events] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert [event for event, _payload in notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+
+
+def test_place_initial_stop_with_retries_supports_short_side_and_sleep(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=101.0,
+        recent_swing_low=97.0,
+        stop_price=102.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=32.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        side='SHORT',
+        position_side='SHORT',
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    args = argparse.Namespace(profile='test-profile', initial_stop_max_attempts=3, initial_stop_retry_sleep_sec=0.25)
+    script_events = []
+    notifications = []
+    stop_attempts = []
+    sleep_calls = []
+    positions = iter([
+        [],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '-2.4', 'positionSide': 'SHORT', 'entryPrice': '100.0'}],
+    ])
+
+    def place_stop(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        if len(stop_attempts) == 1:
+            raise RuntimeError('stop rejected')
+        return {'orderId': 98765, 'clientOrderId': 'stop-short-2'}
+
+    class FakeTimeModule:
+        @staticmethod
+        def sleep(seconds):
+            sleep_calls.append(seconds)
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda _client: copy.deepcopy(next(positions)))
+    monkeypatch.setattr(mod, 'place_stop_market_order', place_stop)
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event, payload: script_events.append((event, payload)))
+    monkeypatch.setattr(
+        mod,
+        'emit_notification',
+        lambda _args, event, payload: notifications.append((event, payload)) or {'ok': True},
+    )
+    monkeypatch.setattr(mod, 'time', FakeTimeModule)
+
+    result = mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=make_meta(),
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+    )
+
+    assert result['orderId'] == 98765
+    assert stop_attempts == [
+        ('TESTUSDT', 102.0, 6.5, 'SHORT'),
+        ('TESTUSDT', 102.0, 2.4, 'SHORT'),
+    ]
+    assert sleep_calls == [0.25]
+    assert [event for event, _payload in script_events] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert [event for event, _payload in notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+
+
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    meta = make_meta()
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        profile='test-profile',
+        margin_type='ISOLATED',
+        initial_stop_max_attempts=3,
+        initial_stop_retry_sleep_sec=0,
+    )
+    calls = []
+    stop_attempts = []
+    notifications = []
+
+    class Client:
+        def signed_post(self, path, params):
+            calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'TESTUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '100.0',
+                    'executedQty': '6.5',
+                    'cumQuote': '650.0',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event, payload: notifications.append((event, payload)) or {'ok': True})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
+
+    live_positions = iter([
+        [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+    ])
+
+    def fake_fetch_open_positions(_client):
+        if stop_attempts:
+            return next(live_positions)
+        return []
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', fake_fetch_open_positions)
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+
+    def fake_place_stop_market_order(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        if len(stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', fake_place_stop_market_order)
+    monkeypatch.setattr(
+        mod,
+        'resolve_position_protection_status',
+        lambda *a, **k: next(live_positions) and {'status': 'protected'},
+    )
+
+    result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert result['filled_quantity'] == 6.5
+    assert result['trade_management_plan']['quantity'] == 6.5
+    assert result['stop_order']['orderId'] == 54321
+    assert stop_attempts == [
+        ('TESTUSDT', 98.0, 6.5, 'LONG'),
+        ('TESTUSDT', 98.0, 1.9, 'LONG'),
+    ]
+    assert [event for event, _payload in notifications] == [
+        'entry_filled',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+        'initial_stop_placed',
+    ]
+    assert calls == [
+        ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
+        ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
+        ('/fapi/v1/order', {'symbol': 'TESTUSDT', 'side': 'BUY', 'type': 'MARKET', 'quantity': '6.5', 'newOrderRespType': 'RESULT', 'positionSide': 'LONG'}),
+    ]
+
+
+def test_place_live_trade_handles_long_retry_chain_before_stop_success(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    meta = make_meta()
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        profile='test-profile',
+        margin_type='ISOLATED',
+        initial_stop_max_attempts=4,
+        initial_stop_retry_sleep_sec=0,
+    )
+    calls = []
+    stop_attempts = []
+    notifications = []
+
+    class Client:
+        def signed_post(self, path, params):
+            calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'TESTUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '100.0',
+                    'executedQty': '6.5',
+                    'cumQuote': '650.0',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event, payload: notifications.append((event, payload)) or {'ok': True})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
+
+    live_positions = iter([
+        [{'symbol': 'TESTUSDT', 'positionAmt': '4.8', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '3.1', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '1.4', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '1.4', 'positionSide': 'LONG', 'entryPrice': '100.0'}],
+    ])
+
+    def fake_fetch_open_positions(_client):
+        if stop_attempts:
+            return next(live_positions)
+        return []
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', fake_fetch_open_positions)
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+
+    def fake_place_stop_market_order(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        if len(stop_attempts) < 4:
+            raise RuntimeError(f'reduceOnly rejected #{len(stop_attempts)}')
+        return {'orderId': 98765, 'clientOrderId': 'stop-4'}
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', fake_place_stop_market_order)
+    monkeypatch.setattr(
+        mod,
+        'resolve_position_protection_status',
+        lambda *a, **k: next(live_positions) and {'status': 'protected'},
+    )
+
+    result = mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert result['stop_order']['orderId'] == 98765
+    assert stop_attempts == [
+        ('TESTUSDT', 98.0, 6.5, 'LONG'),
+        ('TESTUSDT', 98.0, 4.8, 'LONG'),
+        ('TESTUSDT', 98.0, 3.1, 'LONG'),
+        ('TESTUSDT', 98.0, 1.4, 'LONG'),
+    ]
+    assert [event for event, _payload in notifications] == [
+        'entry_filled',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+        'initial_stop_placed',
+    ]
+
+
+def test_place_live_trade_raises_when_initial_stop_retries_exhausted(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    meta = make_meta()
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        profile='test-profile',
+        margin_type='ISOLATED',
+        initial_stop_max_attempts=2,
+        initial_stop_retry_sleep_sec=0,
+    )
+    notifications = []
+    stop_attempts = []
+
+    class Client:
+        def signed_post(self, path, params):
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'symbol': 'TESTUSDT',
+                    'orderId': 12345,
+                    'status': 'FILLED',
+                    'avgPrice': '100.0',
+                    'executedQty': '6.5',
+                    'cumQuote': '650.0',
+                    'updateTime': 1710000000123,
+                    'clientOrderId': 'entry-order-1',
+                }
+            raise AssertionError(f'unexpected path: {path}')
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda args, event, payload: notifications.append((event, payload)) or {'ok': True})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'TESTUSDT', 'positionAmt': '0', 'positionSide': 'LONG', 'entryPrice': '100.0'}])
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
+
+    def always_fail_stop(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        raise RuntimeError('stop rejected')
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', always_fail_stop)
+
+    with pytest.raises(mod.BinanceAPIError, match='初始止损重挂全部失败'):
+        mod.place_live_trade(Client(), candidate, leverage=5, meta=meta, args=args)
+
+    assert stop_attempts == [
+        ('TESTUSDT', 98.0, 6.5, 'LONG'),
+        ('TESTUSDT', 98.0, 6.5, 'LONG'),
+    ]
+    assert [event for event, _payload in notifications] == [
+        'entry_filled',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_retry_exhausted',
     ]
 
 

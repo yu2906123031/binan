@@ -1293,8 +1293,84 @@
 
 ---
 
+### 2026-05-11｜补强初始止损重挂与真实持仓数量回读回归
+- 状态：已完成
+- 范围：为 `place_live_trade(...)` 初始止损重试链路补回归，固定首单失败后按交易所真实持仓数量重挂保护单的 contract，并校验耗尽重试后的返回行为与脚本/提取模块 parity
+- 修改文件：
+  - `tests/test_strategy_v2.py`
+  - `tests/test_execution_module_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 为策略侧新增 focused regression，覆盖初始止损首单失败后回读 `fetch_open_positions(...)`、按最新 `positionAmt` 重挂 stop order、以及达到最大重试次数后返回无保护单结果的 contract
+  - 为执行模块 parity 回归补同一组 stop retry 场景，锁定脚本入口与 `execution_engine.place_live_trade(...)` 在真实持仓数量回读和耗尽后行为上的一致性
+  - 通过新增回归确认现有实现已满足该 slice，完成项以验证收口，无新增生产逻辑改动
+- 验证：
+  - `pytest -q tests/test_strategy_v2.py tests/test_execution_module_regression.py -k 'initial_stop or place_live_trade'` → `9 passed, 78 deselected in 0.23s`
+  - `pytest -q tests/test_strategy_v2.py tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `114 passed in 0.43s`
+- 遗留风险：
+  - 当前初始止损重试只覆盖 LONG 持仓与固定两次重挂节奏，后续适合补 SHORT 方向和更长重试链的 focused regression
+  - `place_live_trade(...)` 里的 stop retry orchestration 仍集中在函数体内部，后续可继续评估是否下沉成更窄 helper，减少 live-trade 回归用例的重复夹具
+- 对应待办编号：
+  - P0-4b
+
+---
+
+### 2026-05-12｜抽取初始止损重试 helper 并建立 wrapper / module 双层回归
+- 状态：已完成
+- 范围：把 `execution_engine.place_live_trade(...)` 内联的初始止损重挂编排下沉为独立 `place_initial_stop_with_retries(...)` helper，并为脚本 wrapper 与执行模块 helper 建立双层 focused regression
+- 修改文件：
+  - `scripts/execution_engine.py`
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2.py`
+  - `tests/test_execution_module_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 在 `scripts/execution_engine.py` 抽出 `place_initial_stop_with_retries(...)`，保留现有重试次数、真实持仓数量回读、失败/成功事件记录、通知发射、重试耗尽异常语义
+  - 将 `place_live_trade(...)` 切到新 helper 调用，保持返回 contract 与后续 protection check / TP 下单链路不变
+  - 在 `scripts/binance_futures_momentum_long.py` 暴露同名 wrapper，固定脚本入口与执行模块 helper 的 seam，便于后续继续补 SHORT 与更长 retry regression
+  - 新增一条策略侧 focused regression，直接校验 wrapper 会回读实时 `positionAmt` 并发射失败/成功事件
+  - 新增一条 execution parity regression，锁定执行模块 helper 在 stop retry 行为、事件序列、通知序列上的一致性
+- 验证：
+  - `pytest -q tests/test_strategy_v2.py tests/test_execution_module_regression.py -k 'place_initial_stop_with_retries or place_live_trade_initial_stop_retry'` → `2 passed, 85 deselected in 0.37s`
+  - `pytest -q tests/test_strategy_v2.py tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `213 passed in 0.69s`
+- 遗留风险：
+  - 当前 focused regression 仍集中在 LONG 方向，SHORT 方向的 stop side / quantity contract 还值得单独补齐
+  - 更长 retry 链和 sleep 分支尚未单测覆盖，后续适合把 `attempt` 序列与 exhausted payload 再拉成独立用例
+- 对应待办编号：
+  - P0-4b
+
+---
+
 ## 下一步建议
-按顺序执行：先把 monitor / event normalization 里的稳定字段归一化逻辑抽成可复用 helper，减少 execution parity 测试中的局部去抖与重复断言 → 再评估 `binance_futures_momentum_long.py` 中剩余 runtime-state consumer seam 的下沉优先级与收益 → 最后决定是否继续拆出更细的 runtime-state consumer helpers
+按顺序执行：先补 `place_initial_stop_with_retries(...)` 的 SHORT 方向与更长重试链 regression，扩满保护单编排边界 → 再把 exhausted payload / sleep 分支拆成更窄 focused tests，减少 live-trade 级别夹具负担 → 最后回到 monitor / event normalization 的稳定字段归一化 helper，继续压缩 execution parity 测试里的局部去抖逻辑
+
+### 2026-05-12｜execution/candidate/默认参数/动态杠杆与管理动作回归收口
+- 状态：已完成
+- 范围：收口本轮 execution_engine / candidate_builder / 默认参数 / 动态杠杆与持仓管理动作回归，修复 breakeven buffer 与 TP1 叠加动作 contract，并更新 live-trade smoke 断言以匹配新的初始止损重试事件序列
+- 修改文件：
+  - `scripts/execution_engine.py`
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_execution_module_regression.py`
+  - `tests/test_strategy_v2.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `tests/test_run_loop_smoke.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 在 `execution_engine.place_initial_stop_with_retries(...)` 收口初始止损重试 helper，并由脚本 wrapper 暴露同名入口，统一真实持仓数量回读、事件/通知发射、耗尽异常语义
+  - 更新 `evaluate_management_actions(...)` 的多空 breakeven 逻辑：移动止损统一使用 `breakeven_buffer_price`，LONG 场景在 `tp1` 与 breakeven 同周期命中时按稳定顺序同时发出 `take_profit_1` 与 `move_stop_to_breakeven`
+  - 为 execution / strategy / restore / smoke 回归补齐默认参数、TP algo mock 与事件序列断言，固定 live-trade、恢复链路、管理动作 contract
+- 验证：
+  - `pytest -q tests/test_run_loop_smoke.py::test_run_user_data_stream_monitor_cycle_restarts_when_listen_key_missing tests/test_execution_module_regression.py tests/test_strategy_v2.py tests/test_strategy_v2_restore_regression.py tests/test_run_loop_smoke.py` → `258 passed in 15.72s`
+  - `python -m compileall -q scripts/binance_futures_momentum_long.py scripts/execution_engine.py tests/test_execution_module_regression.py tests/test_strategy_v2.py tests/test_strategy_v2_restore_regression.py tests/test_run_loop_smoke.py` → 通过
+- 遗留风险：
+  - `evaluate_management_actions(...)` 当前已锁定 breakeven buffer 与 TP1 同周期 contract，后续若继续扩展 trailing / TP2 联动，适合补更高阶组合场景回归
+- 对应待办编号：
+  - t3
+  - t4
+  - t5
+  - P0-4b
+
+---
 
 ### 2026-05-11｜放宽 regime 触发阈值
 - 状态：已完成

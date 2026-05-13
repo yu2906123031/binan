@@ -54,6 +54,16 @@ class Client:
                 'updateTime': 1710000000123,
                 'clientOrderId': 'entry-order-1',
             }
+        if path == '/fapi/v1/algoOrder':
+            return {
+                'symbol': params['symbol'],
+                'orderId': len([call for call in self.calls if call[0] == path]),
+                'clientAlgoId': f"algo-{len([call for call in self.calls if call[0] == path])}",
+                'triggerPrice': params.get('triggerPrice'),
+                'quantity': params.get('quantity'),
+                'side': params.get('side'),
+                'positionSide': params.get('positionSide'),
+            }
         raise AssertionError(f'unexpected path: {path}')
 
 
@@ -113,6 +123,8 @@ def make_args():
         tp1_close_pct=0.3,
         tp2_r=2.0,
         tp2_close_pct=0.4,
+        tp1_profit_usdt=0.0,
+        tp2_profit_usdt=0.0,
         breakeven_r=1.0,
         profile='test-profile',
         margin_type='ISOLATED',
@@ -121,6 +133,8 @@ def make_args():
         max_monitor_cycles=1,
         monitor_poll_interval_sec=0,
         trailing_buffer_pct=0.01,
+        initial_stop_max_attempts=3,
+        initial_stop_retry_sleep_sec=0,
     )
 
 
@@ -325,6 +339,7 @@ def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
     monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 54321, 'clientOrderId': 'stop-1'})
     monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
 
     script_client = Client()
     extracted_client = Client()
@@ -353,6 +368,7 @@ def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
         fetch_open_orders=mod.fetch_open_orders,
         fetch_open_algo_orders=mod.fetch_open_algo_orders,
         place_stop_market_order=mod.place_stop_market_order,
+        place_take_profit_market_order=mod.place_take_profit_market_order,
         resolve_position_protection_status=mod.resolve_position_protection_status,
         recover_unknown_entry_order=mod.recover_unknown_entry_order,
         query_order=mod.query_order,
@@ -454,6 +470,426 @@ def test_execution_module_matches_script_repair_missing_protection(monkeypatch):
     assert script_result == extracted_result
     assert extracted_result['ok'] is True
     assert extracted_result['stop_order']['orderId'] == 777
+
+
+def test_execution_module_matches_script_place_initial_stop_with_retries(monkeypatch):
+    candidate = make_candidate()
+    args = make_args()
+    meta = make_meta()
+
+    script_events = []
+    extracted_events = []
+    script_notifications = []
+    extracted_notifications = []
+    script_stop_attempts = []
+    extracted_stop_attempts = []
+
+    def build_positions():
+        return iter([
+            [],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+        ])
+
+    script_positions = build_positions()
+    extracted_positions = build_positions()
+
+    def script_fetch_open_positions(_client):
+        return copy.deepcopy(next(script_positions))
+
+    def extracted_fetch_open_positions(_client):
+        return copy.deepcopy(next(extracted_positions))
+
+    def script_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        script_stop_attempts.append((quantity, side))
+        if len(script_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    def extracted_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        extracted_stop_attempts.append((quantity, side))
+        if len(extracted_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    script_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='LONG',
+        fetch_open_positions=script_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=script_stop,
+        log_runtime_event=lambda event, payload: script_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: script_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    extracted_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='LONG',
+        fetch_open_positions=extracted_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=extracted_stop,
+        log_runtime_event=lambda event, payload: extracted_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: extracted_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    assert script_result == extracted_result == {'orderId': 54321, 'clientOrderId': 'stop-2'}
+    assert script_stop_attempts == extracted_stop_attempts == [(6.5, 'LONG'), (1.9, 'LONG')]
+    assert script_events == extracted_events
+    assert [event for event, _payload in extracted_notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert script_notifications == extracted_notifications
+
+
+def test_execution_module_matches_script_place_initial_stop_with_retries_for_short_side_and_sleep(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=101.0,
+        recent_swing_low=97.0,
+        stop_price=102.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=32.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        side='SHORT',
+        position_side='SHORT',
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    args = make_args()
+    args.initial_stop_max_attempts = 3
+    args.initial_stop_retry_sleep_sec = 0.25
+    meta = make_meta()
+
+    script_events = []
+    extracted_events = []
+    script_notifications = []
+    extracted_notifications = []
+    script_stop_attempts = []
+    extracted_stop_attempts = []
+    script_sleep_calls = []
+    extracted_sleep_calls = []
+
+    def build_positions():
+        return iter([
+            [],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '-2.4', 'positionSide': 'SHORT', 'entryPrice': '100.2'}],
+        ])
+
+    script_positions = build_positions()
+    extracted_positions = build_positions()
+
+    def script_fetch_open_positions(_client):
+        return copy.deepcopy(next(script_positions))
+
+    def extracted_fetch_open_positions(_client):
+        return copy.deepcopy(next(extracted_positions))
+
+    def script_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        script_stop_attempts.append((quantity, side))
+        if len(script_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    def extracted_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        extracted_stop_attempts.append((quantity, side))
+        if len(extracted_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    class ScriptTimeModule:
+        @staticmethod
+        def sleep(seconds):
+            script_sleep_calls.append(seconds)
+
+    class ExtractedTimeModule:
+        @staticmethod
+        def sleep(seconds):
+            extracted_sleep_calls.append(seconds)
+
+    script_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+        fetch_open_positions=script_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=script_stop,
+        log_runtime_event=lambda event, payload: script_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: script_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=ScriptTimeModule,
+    )
+
+    extracted_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+        fetch_open_positions=extracted_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=extracted_stop,
+        log_runtime_event=lambda event, payload: extracted_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: extracted_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=ExtractedTimeModule,
+    )
+
+    assert script_result == extracted_result == {'orderId': 54321, 'clientOrderId': 'stop-2'}
+    assert script_stop_attempts == extracted_stop_attempts == [(6.5, 'SHORT'), (2.4, 'SHORT')]
+    assert script_sleep_calls == extracted_sleep_calls == [0.25]
+    assert script_events == extracted_events
+    assert [event for event, _payload in extracted_notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert script_notifications == extracted_notifications
+
+
+def test_execution_module_matches_script_place_initial_stop_with_retries_for_long_retry_chain(monkeypatch):
+    candidate = make_candidate()
+    args = make_args()
+    args.initial_stop_max_attempts = 4
+    meta = make_meta()
+
+    script_events = []
+    extracted_events = []
+    script_notifications = []
+    extracted_notifications = []
+    script_stop_attempts = []
+    extracted_stop_attempts = []
+
+    def build_positions():
+        return iter([
+            [{'symbol': 'TESTUSDT', 'positionAmt': '4.8', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '3.1', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '1.4', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+        ])
+
+    script_positions = build_positions()
+    extracted_positions = build_positions()
+
+    def script_fetch_open_positions(_client):
+        if script_stop_attempts:
+            return copy.deepcopy(next(script_positions))
+        return []
+
+    def extracted_fetch_open_positions(_client):
+        if extracted_stop_attempts:
+            return copy.deepcopy(next(extracted_positions))
+        return []
+
+    def script_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        script_stop_attempts.append((quantity, side))
+        if len(script_stop_attempts) < 4:
+            raise RuntimeError(f'reduceOnly rejected #{len(script_stop_attempts)}')
+        return {'orderId': 98765, 'clientOrderId': 'stop-4'}
+
+    def extracted_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        extracted_stop_attempts.append((quantity, side))
+        if len(extracted_stop_attempts) < 4:
+            raise RuntimeError(f'reduceOnly rejected #{len(extracted_stop_attempts)}')
+        return {'orderId': 98765, 'clientOrderId': 'stop-4'}
+
+    script_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='LONG',
+        fetch_open_positions=script_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=script_stop,
+        log_runtime_event=lambda event, payload: script_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: script_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    extracted_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='LONG',
+        fetch_open_positions=extracted_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=extracted_stop,
+        log_runtime_event=lambda event, payload: extracted_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: extracted_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    assert script_result == extracted_result == {'orderId': 98765, 'clientOrderId': 'stop-4'}
+    assert script_stop_attempts == extracted_stop_attempts == [
+        (6.5, 'LONG'),
+        (4.8, 'LONG'),
+        (3.1, 'LONG'),
+        (1.4, 'LONG'),
+    ]
+    assert script_events == extracted_events
+    assert [event for event, _payload in extracted_notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert script_notifications == extracted_notifications
+
+
+    candidate = make_candidate()
+    meta = make_meta()
+    args = make_args()
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: None)
+
+    script_stop_attempts = []
+    extracted_stop_attempts = []
+
+    def build_positions():
+        return iter([
+            [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '1.9', 'positionSide': 'LONG', 'entryPrice': '100.2'}],
+        ])
+
+    script_positions = build_positions()
+    extracted_positions = build_positions()
+
+    def script_fetch_open_positions(_client):
+        if script_stop_attempts:
+            return copy.deepcopy(next(script_positions))
+        return []
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', script_fetch_open_positions)
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+
+    def script_stop(*_args, **kwargs):
+        quantity = _args[3]
+        side = kwargs.get('side')
+        script_stop_attempts.append((quantity, side))
+        if len(script_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', script_stop)
+    monkeypatch.setattr(
+        mod,
+        'resolve_position_protection_status',
+        lambda *a, **k: {'status': 'protected', 'expected_order_id': 54321},
+    )
+
+    script_client = Client()
+    script_result = mod.place_live_trade(script_client, candidate, leverage=5, meta=meta, args=args)
+
+    def extracted_fetch_open_positions(_client):
+        if extracted_stop_attempts:
+            return copy.deepcopy(next(extracted_positions))
+        return []
+
+    def extracted_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        extracted_stop_attempts.append((quantity, side))
+        if len(extracted_stop_attempts) == 1:
+            raise RuntimeError('reduceOnly rejected')
+        return {'orderId': 54321, 'clientOrderId': 'stop-2'}
+
+    def extracted_resolve_protection(*_args, **_kwargs):
+        next(extracted_positions)
+        return {'status': 'protected', 'expected_order_id': 54321}
+
+    extracted_client = Client()
+    extracted_result = exec_mod.place_live_trade(
+        extracted_client,
+        candidate,
+        leverage=5,
+        meta=meta,
+        args=args,
+        binance_api_error=mod.BinanceAPIError,
+        ensure_symbol_margin_type_fn=lambda client, symbol, margin_type='ISOLATED': exec_mod.ensure_symbol_margin_type(
+            client,
+            symbol,
+            binance_api_error=mod.BinanceAPIError,
+            margin_type=margin_type,
+        ),
+        round_step=mod.round_step,
+        format_decimal=mod.format_decimal,
+        should_send_position_side=mod.should_send_position_side,
+        is_position_side_mode_error=mod.is_position_side_mode_error,
+        mark_one_way_position_mode=mod.mark_one_way_position_mode,
+        build_trade_management_plan=mod.build_trade_management_plan,
+        fetch_open_positions=extracted_fetch_open_positions,
+        fetch_open_orders=mod.fetch_open_orders,
+        fetch_open_algo_orders=mod.fetch_open_algo_orders,
+        place_stop_market_order=extracted_stop,
+        resolve_position_protection_status=extracted_resolve_protection,
+        recover_unknown_entry_order=mod.recover_unknown_entry_order,
+        query_order=mod.query_order,
+        log_runtime_event=mod.log_runtime_event,
+        emit_notification=mod.emit_notification,
+        normalize_position_side=mod.normalize_position_side,
+        build_position_key=mod.build_position_key,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        _to_float=mod._to_float,
+        compute_execution_quality_size_adjustment=mod.compute_execution_quality_size_adjustment,
+        asdict=mod.asdict,
+        position_side_long=mod.POSITION_SIDE_LONG,
+        time_module=time,
+        place_take_profit_market_order=mod.place_take_profit_market_order,
+    )
+
+    assert script_result == extracted_result
+    assert script_client.calls == extracted_client.calls
+    assert script_stop_attempts == extracted_stop_attempts == [(6.5, 'LONG'), (1.9, 'LONG')]
+    assert extracted_result['stop_order']['orderId'] == 54321
 
 
 def test_execution_module_matches_script_monitor_live_trade(monkeypatch):

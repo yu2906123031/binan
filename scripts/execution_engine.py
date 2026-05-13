@@ -214,6 +214,92 @@ def ensure_symbol_margin_type(
         raise
 
 
+def place_initial_stop_with_retries(
+    client: Any,
+    candidate: Any,
+    meta: Any,
+    args: argparse.Namespace,
+    *,
+    filled_quantity: float,
+    position_side: str,
+    fetch_open_positions: Callable[..., Any],
+    position_row_matches_symbol_side: Callable[..., bool],
+    place_stop_market_order: Callable[..., Dict[str, Any]],
+    log_runtime_event: Callable[..., Any],
+    emit_notification: Callable[..., Any],
+    binance_api_error,
+    _to_float: Callable[..., float],
+    time_module,
+) -> Dict[str, Any]:
+    max_attempts = max(int(getattr(args, 'initial_stop_max_attempts', 3) or 3), 1)
+    retry_sleep_sec = max(float(getattr(args, 'initial_stop_retry_sleep_sec', 0.7) or 0.0), 0.0)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_quantity = filled_quantity
+        active_position = next(
+            (
+                row
+                for row in fetch_open_positions(client)
+                if position_row_matches_symbol_side(row, candidate.symbol, position_side)
+            ),
+            None,
+        )
+        if isinstance(active_position, dict):
+            live_quantity = abs(_to_float(active_position.get('positionAmt')))
+            if live_quantity > 0:
+                attempt_quantity = live_quantity
+
+        try:
+            stop = place_stop_market_order(
+                client,
+                candidate.symbol,
+                float(candidate.stop_price),
+                attempt_quantity,
+                meta,
+                side=position_side,
+            )
+            success_payload = {
+                'symbol': candidate.symbol,
+                'side': position_side,
+                'attempt': attempt,
+                'max_attempts': max_attempts,
+                'quantity': attempt_quantity,
+                'stop_order_id': stop.get('orderId') if isinstance(stop, dict) else None,
+                'profile': getattr(args, 'profile', 'default'),
+            }
+            log_runtime_event('initial_stop_place_attempt_succeeded', success_payload)
+            if attempt > 1:
+                emit_notification(args, 'initial_stop_place_attempt_succeeded', success_payload)
+            return stop
+        except Exception as exc:
+            last_error = exc
+            retry_payload = {
+                'symbol': candidate.symbol,
+                'side': position_side,
+                'attempt': attempt,
+                'max_attempts': max_attempts,
+                'quantity': attempt_quantity,
+                'message': f'initial stop placement failed: {exc}',
+                'profile': getattr(args, 'profile', 'default'),
+            }
+            log_runtime_event('initial_stop_place_attempt_failed', retry_payload)
+            emit_notification(args, 'initial_stop_place_attempt_failed', retry_payload)
+            if attempt < max_attempts and retry_sleep_sec > 0:
+                time_module.sleep(retry_sleep_sec)
+
+    exhausted_payload = {
+        'symbol': candidate.symbol,
+        'side': position_side,
+        'max_attempts': max_attempts,
+        'message': f'开仓成功，但初始止损重挂全部失败: {last_error}',
+        'profile': getattr(args, 'profile', 'default'),
+    }
+    log_runtime_event('initial_stop_retry_exhausted', exhausted_payload)
+    emit_notification(args, 'initial_stop_retry_exhausted', exhausted_payload)
+    raise binance_api_error(exhausted_payload['message']) from last_error
+
+
 def place_live_trade(
     client: Any,
     candidate: Any,
@@ -450,17 +536,22 @@ def place_live_trade(
     }
     log_runtime_event('entry_filled', payload)
     emit_notification(args, 'entry_filled', payload)
-    try:
-        stop_order = place_stop_market_order(client, candidate.symbol, float(candidate.stop_price), filled_quantity, meta, side=normalize_position_side(getattr(candidate, 'side', position_side_long)))
-    except Exception as exc:
-        error_payload = {
-            'symbol': candidate.symbol,
-            'message': f'开仓成功，但挂止损失败: {exc}',
-            'profile': getattr(args, 'profile', 'default'),
-        }
-        log_runtime_event('error', error_payload)
-        emit_notification(args, 'error', error_payload)
-        raise
+    stop_order = place_initial_stop_with_retries(
+        client=client,
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=filled_quantity,
+        position_side=position_side,
+        fetch_open_positions=fetch_open_positions,
+        position_row_matches_symbol_side=position_row_matches_symbol_side,
+        place_stop_market_order=place_stop_market_order,
+        log_runtime_event=log_runtime_event,
+        emit_notification=emit_notification,
+        binance_api_error=binance_api_error,
+        _to_float=_to_float,
+        time_module=time_module,
+    )
     protection = resolve_position_protection_status(
         client,
         candidate.symbol,
