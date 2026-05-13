@@ -1504,6 +1504,64 @@ def test_summarize_candidate_rejected_events_aggregates_reason_grade_and_overext
     }
 
 
+def test_build_blocked_tradeability_rows_scores_and_sorts_execution_blocks():
+    rows = mod.build_blocked_tradeability_rows([
+        {
+            'symbol': 'MIDUSDT',
+            'side': 'LONG',
+            'reject_reason_label': 'execution_slippage',
+            'expected_slippage_r': 0.27,
+            'execution_liquidity_grade': 'C',
+            'spread_bps': 8.2,
+            'book_depth_fill_ratio': 0.82,
+        },
+        {
+            'symbol': 'THINUSDT',
+            'side': 'LONG',
+            'reject_reason_label': 'execution_depth',
+            'execution_liquidity_grade': 'D',
+            'book_depth_fill_ratio': 0.31,
+        },
+        {
+            'symbol': 'OTHERUSDT',
+            'side': 'LONG',
+            'reject_reason_label': 'price_extension_chase',
+            'expected_slippage_r': 0.8,
+            'book_depth_fill_ratio': 0.2,
+        },
+        {
+            'symbol': 'MISSUSDT',
+            'side': 'LONG',
+            'reject_reason_label': 'execution_slippage',
+            'execution_liquidity_grade': 'D',
+        },
+    ])
+
+    assert rows == [
+        {
+            'symbol': 'THINUSDT',
+            'side': 'LONG',
+            'reject_label': 'execution_depth',
+            'tradeability_score': 31.0,
+            'blocked_reasons': ['liquidity_grade=D', 'depth_fill_ratio=0.31'],
+        },
+        {
+            'symbol': 'MIDUSDT',
+            'side': 'LONG',
+            'reject_label': 'execution_slippage',
+            'tradeability_score': 73.0,
+            'blocked_reasons': ['slippage_r=0.27', 'liquidity_grade=C', 'spread_bps=8.2', 'depth_fill_ratio=0.82'],
+        },
+        {
+            'symbol': 'MISSUSDT',
+            'side': 'LONG',
+            'reject_label': 'execution_slippage',
+            'tradeability_score': None,
+            'blocked_reasons': ['liquidity_grade=D'],
+        },
+    ]
+
+
 def test_evaluate_risk_guards_blocks_portfolio_theme_and_correlation_overexposure():
     candidate = mod.Candidate(
         symbol='DOGEUSDT',
