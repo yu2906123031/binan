@@ -399,6 +399,13 @@ def place_live_trade(
         emit_notification(args, 'error', error_payload)
         raise binance_api_error(error_payload['message'])
 
+    if getattr(candidate, 'probe_entry', False):
+        probe_max_leverage = int(getattr(args, 'probe_max_leverage', 2) or 2)
+        probe_max_leverage = max(probe_max_leverage, 1)
+        if requested_leverage > probe_max_leverage:
+            requested_leverage = probe_max_leverage
+            client.signed_post('/fapi/v1/leverage', {'symbol': candidate.symbol, 'leverage': requested_leverage})
+
     execution_quality = compute_execution_quality_size_adjustment(candidate)
     step_size = float(getattr(meta, 'step_size', 0.0) or 0.0)
     quantity_precision = int(getattr(meta, 'quantity_precision', 0) or 0)
@@ -406,6 +413,9 @@ def place_live_trade(
     base_quantity = round_step(candidate.quantity, step_size, quantity_precision)
     scaled_quantity = round_step(base_quantity * float(execution_quality['size_multiplier']), step_size, quantity_precision)
     quantity = scaled_quantity if scaled_quantity >= min_qty else scaled_quantity
+    if getattr(candidate, 'probe_entry', False):
+        probe_size_ratio = float(getattr(args, 'sim_probe_size_ratio', 0.2) or 0.2)
+        quantity = max(quantity * probe_size_ratio, min_qty)
     if quantity < min_qty:
         error_payload = {
             'symbol': candidate.symbol,

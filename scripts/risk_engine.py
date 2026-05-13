@@ -102,7 +102,8 @@ def evaluate_risk_guards(
         if not bool(getattr(candidate, 'setup_ready', False)):
             reasons.append('candidate_setup_not_ready')
         elif not bool(getattr(candidate, 'trigger_fired', False)):
-            reasons.append('candidate_trigger_not_fired')
+            if not bool(getattr(candidate, 'probe_entry', False)):
+                reasons.append('candidate_trigger_not_fired')
         execution_slippage_r = compute_expected_slippage_r(candidate)
         execution_liquidity_grade = classify_execution_liquidity_grade(getattr(candidate, 'book_depth_fill_ratio', 0.0), execution_slippage_r)
         if state == 'distribution':

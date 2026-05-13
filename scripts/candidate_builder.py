@@ -61,6 +61,8 @@ def finalize_candidate_construction(
     trigger_fired: bool,
     expected_slippage_pct: float,
     book_depth_fill_ratio: float,
+    liquidity_grade: str,
+    funding_rate_threshold: float,
     loser_rank: Optional[int],
     trigger_confirmation: Dict[str, Any],
     legacy_kwargs: Dict[str, Any],
@@ -145,6 +147,7 @@ def finalize_candidate_construction(
         oi_hard_reversal_threshold_pct=float(legacy_kwargs.get('oi_hard_reversal_threshold_pct', 0.8) or 0.8),
         portfolio_narrative_bucket='',
         portfolio_correlation_group='',
+        tradeability_score=round(max(0.0, min(tradeability_score, 1.0)), 4),
     )
     candidate.must_pass_flags = {
         **dict(candidate.must_pass_flags or {}),
@@ -186,6 +189,7 @@ def build_candidate(
     funding_rate_avg_threshold: float = 0.0003,
     max_distance_from_vwap_pct: float = 10.0,
     max_leverage: int = 5,
+    base_acceleration_ratio: float = 1.25,
     trigger_min_confirmations: int = 2,
     loser_rank: Optional[int] = None,
     okx_sentiment_score: float = 0.0,
@@ -258,7 +262,7 @@ def build_candidate(
     higher_timeframe_bias = trade_side
     regime_payload = legacy_kwargs.get('market_regime') or {}
     regime_label = str(regime_payload.get('label', 'neutral') or 'neutral')
-    entry_thresholds = derive_regime_entry_thresholds(trade_side, regime_label, min_5m_change_pct, base_acceleration_ratio=1.5)
+    entry_thresholds = derive_regime_entry_thresholds(trade_side, regime_label, min_5m_change_pct, base_acceleration_ratio=base_acceleration_ratio)
     effective_min_5m_change_pct = float(entry_thresholds.get('min_5m_change_pct', min_5m_change_pct) or 0.0)
     effective_acceleration_threshold = float(entry_thresholds.get('acceleration_ratio', 1.5) or 1.5)
     setup_breakout_tolerance_pct = max(_to_float(legacy_kwargs.get('setup_breakout_tolerance_pct'), default=0.0), 0.0)

@@ -997,6 +997,9 @@ class Candidate:
     execution_slippage_risk_threshold_r: float = 0.15
     portfolio_narrative_bucket: str = ''
     portfolio_correlation_group: str = ''
+    high_vol_alt_mode: bool = False
+    probe_entry: bool = False
+    tradeability_score: float = 0.0
 
     def __post_init__(self) -> None:
         self.side = normalize_trade_side(self.side)
@@ -2064,6 +2067,57 @@ def append_candidate_rejected_event(store: Optional[RuntimeStateStore], candidat
     if extra:
         payload.update(extra)
     return append_runtime_event(store, 'candidate_rejected', payload)
+
+
+def append_missed_trade_event(
+    store: Optional['RuntimeStateStore'],
+    candidate: 'Candidate',
+    reasons: Sequence[str],
+    probe_eligible: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Log a missed_trade event when a high-scoring candidate was blocked before execution.
+
+    This captures opportunity cost: candidates that passed the scoring gate but were
+    rejected due to soft vetoes (waiting_breakout, setup_not_ready, trigger_not_fired)
+    or probe_entry not being enabled.
+    """
+    setup_missing = list(getattr(candidate, 'setup_missing', []) or [])
+    trigger_missing = list(getattr(candidate, 'trigger_missing', []) or [])
+    is_waiting_breakout = 'waiting_breakout' in setup_missing or 'waiting_breakout' in trigger_missing
+
+    if not is_waiting_breakout:
+        return {}
+
+    payload = {
+        'symbol': candidate.symbol,
+        'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')),
+        'position_side': getattr(candidate, 'position_side', ''),
+        'score': round(float(candidate.score or 0.0), 4),
+        'tradeability_score': round(float(getattr(candidate, 'tradeability_score', 0.0) or 0.0), 4),
+        'state': candidate.state,
+        'alert_tier': candidate.alert_tier,
+        'setup_ready': bool(candidate.setup_ready),
+        'trigger_fired': bool(candidate.trigger_fired),
+        'candidate_stage': getattr(candidate, 'candidate_stage', 'watch_candidate'),
+        'setup_missing': setup_missing,
+        'trigger_missing': trigger_missing,
+        'trade_missing': list(getattr(candidate, 'trade_missing', []) or []),
+        'missed_reasons': list(reasons),
+        'probe_entry_eligible': probe_eligible,
+        'entry_distance_from_breakout_pct': round(float(candidate.entry_distance_from_breakout_pct or 0.0), 4),
+        'recent_5m_change_pct': round(float(getattr(candidate, 'recent_5m_change_pct', 0.0) or 0.0), 4),
+        'acceleration_ratio_5m_vs_15m': round(float(getattr(candidate, 'acceleration_ratio_5m_vs_15m', 0.0) or 0.0), 4),
+        'liquidity_grade': candidate.liquidity_grade,
+        'trend_regime': candidate.trend_regime,
+        'entry_pattern': candidate.entry_pattern,
+        'high_vol_alt_mode': bool(getattr(candidate, 'high_vol_alt_mode', False)),
+        'oi_change_pct_5m': round(float(getattr(candidate, 'oi_change_pct_5m', 0.0) or 0.0), 4),
+        'cvd_delta': round(float(getattr(candidate, 'cvd_delta', 0.0) or 0.0), 4),
+    }
+    if extra:
+        payload.update(extra)
+    return append_runtime_event(store, 'missed_trade', payload)
 
 
 def build_candidate_selected_event_payload(
@@ -3368,7 +3422,7 @@ def compute_sentiment_resonance_bonus(okx_sentiment_score: float = 0.0, okx_sent
     return {'bonus': bonus, 'penalty': penalty, 'net': bonus - penalty, 'reasons': reasons}
 
 
-def derive_regime_entry_thresholds(side: str, regime_label: str, min_5m_change_pct: float, base_acceleration_ratio: float = 1.5) -> Dict[str, float]:
+def derive_regime_entry_thresholds(side: str, regime_label: str, min_5m_change_pct: float, base_acceleration_ratio: float = 1.25) -> Dict[str, float]:
     trade_side = normalize_trade_side(side)
     regime = str(regime_label or 'neutral').strip().lower()
     change_threshold = float(min_5m_change_pct or 0.0)
@@ -5235,6 +5289,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                 execution_slippage_hard_veto_r=float(getattr(args, 'execution_slippage_hard_veto_r', 0.25) or 0.25),
                 execution_slippage_risk_threshold_r=float(getattr(args, 'execution_slippage_risk_threshold_r', 0.15) or 0.15),
                 trigger_min_confirmations=int(getattr(args, 'trigger_min_confirmations', 2) or 2),
+                base_acceleration_ratio=float(getattr(args, 'base_acceleration_ratio', 1.25) or 1.25),
                 side=candidate_side,
                 early_reject_stats=early_reject_stats,
                 **micro,
@@ -5471,6 +5526,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--risk-usdt', type=float, default=10.0)
     parser.add_argument('--max-notional-usdt', type=float, default=0.0)
     parser.add_argument('--min-5m-change-pct', type=float, default=2.0)
+    parser.add_argument('--base-acceleration-ratio', type=float, default=1.25, help='Base acceleration ratio for regime entry thresholds.')
     parser.add_argument('--min-quote-volume', type=float, default=50_000_000.0)
     parser.add_argument('--stop-buffer-pct', type=float, default=0.01)
     parser.add_argument('--max-rsi-5m', type=float, default=80.0)
@@ -5675,6 +5731,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'watch_breakout_tolerance_pct': 0.8,
             'setup_breakout_tolerance_pct': 0.35,
             'oi_hard_reversal_threshold_pct': 0.8,
+            'high_vol_alt_mode': True,
             'sim_probe_entry_enabled': True,
             'sim_probe_size_ratio': 0.2,
             'sim_probe_min_score': 62.0,
@@ -5693,6 +5750,8 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
                 'binance_simulated_trading': True,
                 'base_url': 'https://testnet.binancefuture.com',
             })
+        elif profile == 'high_vol_alt_mode':
+            profile_overrides['high_vol_alt_mode'] = True
     for key, value in profile_overrides.items():
         if key not in explicit:
             setattr(args, key, value)
@@ -6293,6 +6352,7 @@ def build_probe_candidate(candidate: Candidate, size_ratio: float) -> Candidate:
         candidate,
         quantity=max(float(candidate.quantity or 0.0) * ratio, 0.0),
         position_size_pct=round(float(candidate.position_size_pct or 0.0) * ratio, 4),
+        probe_entry=True,
         reasons=list(candidate.reasons or []) + [f'sim_probe_size_ratio={ratio:.2f}'],
     )
 
@@ -6846,6 +6906,10 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         if not bool(probe_entry.get('allowed', False)):
             cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']
             append_candidate_rejected_event(store, best_candidate, risk_guard['reasons'])
+            append_missed_trade_event(
+                store, best_candidate, risk_guard['reasons'],
+                probe_eligible=bool(probe_entry.get('probe_eligible', False)),
+            )
             persist_cycle_snapshot(cycle)
             return result
         best_candidate = build_probe_candidate(best_candidate, float(probe_entry.get('size_ratio', 0.2) or 0.2))
