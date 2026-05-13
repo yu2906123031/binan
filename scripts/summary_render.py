@@ -89,6 +89,29 @@ def _build_candidate_row(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_tradeability_block_row(item: Dict[str, Any]) -> Dict[str, Any]:
+    blocked_reasons = item.get('blocked_reasons') or []
+    if not isinstance(blocked_reasons, list):
+        blocked_reasons = [str(blocked_reasons)] if blocked_reasons else []
+    return {
+        '交易对': item.get('symbol', '-'),
+        '原因': item.get('reject_label', item.get('reason', '-')),
+        '可交易分': item.get('tradeability_score'),
+        '阻断明细': [str(reason) for reason in blocked_reasons[:4]],
+    }
+
+
+def populate_tradeability_blocks(summary: Dict[str, Any], scan: Dict[str, Any]) -> None:
+    blocked_tradeability = scan.get('blocked_tradeability') or []
+    if not isinstance(blocked_tradeability, list):
+        return
+    rows = summary['扫描概览']['可交易性拦截列表']
+    for item in blocked_tradeability[:5]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(_build_tradeability_block_row(item))
+
+
 def populate_candidate_sections(summary: Dict[str, Any], candidates: Sequence[Dict[str, Any]]) -> None:
     stage_counts = summary['扫描概览']['阶段分布']
     grouped_rows = {
@@ -139,6 +162,7 @@ def build_cn_scan_summary(result: Dict[str, Any], mask_sensitive_token) -> Dict[
                 {'原因': key, '数量': value}
                 for key, value in top_dict_items(rejected_stats.get('by_reject_label', {}), limit=4)
             ],
+            '可交易性拦截列表': [],
             '阶段分布': {
                 'setup_candidate': 0,
                 'watch_candidate': 0,
@@ -158,6 +182,7 @@ def build_cn_scan_summary(result: Dict[str, Any], mask_sensitive_token) -> Dict[
         'trade候选列表': [],
         '其他候选列表': [],
     }
+    populate_tradeability_blocks(summary, scan)
     populate_candidate_sections(summary, candidates)
     return summary
 
@@ -233,6 +258,19 @@ def _append_candidate_rows(lines: List[str], title: str, rows: Iterable[Dict[str
         )
 
 
+def _append_tradeability_block_rows(lines: List[str], rows: Iterable[Dict[str, Any]], format_num) -> None:
+    rows = list(rows)
+    if not rows:
+        return
+    lines.extend(['', '可交易性拦截:'])
+    for item in rows:
+        blocked_reasons = item.get('阻断明细') or []
+        reason_text = ', '.join(str(reason) for reason in blocked_reasons[:4]) if blocked_reasons else '-'
+        lines.append(
+            f"- {item.get('交易对')} | {item.get('原因')} | 分数 {format_num(item.get('可交易分'), 1)} | {reason_text}"
+        )
+
+
 def render_cn_scan_summary(summary: Dict[str, Any], format_num, format_pct) -> str:
     market = summary.get('市场状态', {})
     overview = summary.get('扫描概览', {})
@@ -258,6 +296,7 @@ def render_cn_scan_summary(summary: Dict[str, Any], format_num, format_pct) -> s
             f"trade {int(stage_distribution.get('trade_candidate', 0) or 0)} | "
             f"other {int(stage_distribution.get('other', 0) or 0)}"
         )
+    _append_tradeability_block_rows(lines, overview.get('可交易性拦截列表', []) or [], format_num)
     runtime_health = summary.get('运行监控', {}) or {}
     lines.extend(render_runtime_health_lines(runtime_health))
     _append_selected_lines(lines, selected, format_num, format_pct)

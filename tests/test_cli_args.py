@@ -221,8 +221,43 @@ def test_binance_sim_active_profile_uses_exploratory_simulation_thresholds():
     assert args.sim_probe_entry_enabled is True
     assert args.sim_probe_size_ratio == 0.2
     assert args.sim_probe_min_score == 62.0
+    assert args.sim_probe_max_breakout_distance_pct == 0.35
     assert args.binance_simulated_trading is True
     assert args.base_url == 'https://testnet.binancefuture.com'
+
+
+def test_high_vol_alt_mode_profile_enables_short_side_scan_and_relaxed_probe_thresholds():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'high_vol_alt_mode']))
+
+    assert args.risk_usdt == 1.0
+    assert args.max_notional_usdt == 300.0
+    assert args.leverage == 3
+    assert args.lookback_bars == 3
+    assert args.swing_bars == 4
+    assert args.top_gainers == 40
+    assert args.top_losers == 40
+    assert args.max_candidates == 12
+    assert args.max_rsi_5m == 84.0
+    assert args.min_5m_change_pct == 0.5
+    assert args.min_volume_multiple == 1.05
+    assert args.min_quote_volume == 5_000_000
+    assert args.watch_breakout_tolerance_pct == 0.8
+    assert args.setup_breakout_tolerance_pct == 0.35
+    assert args.oi_hard_reversal_threshold_pct == 0.8
+    assert args.sim_probe_entry_enabled is True
+    assert args.sim_probe_size_ratio == 0.2
+    assert args.sim_probe_min_score == 62.0
+    assert args.sim_probe_max_breakout_distance_pct == 0.35
+    assert args.execution_slippage_hard_veto_r == 0.75
+    assert args.execution_slippage_risk_threshold_r == 0.5
+    assert args.max_distance_from_ema_pct == 8.0
+    assert args.max_distance_from_vwap_pct == 7.0
+    assert args.max_funding_rate == 0.0008
+    assert args.max_funding_rate_avg == 0.0005
+    assert args.binance_simulated_trading is False
+    assert args.okx_simulated_trading is False
+    assert args.base_url == 'https://fapi.binance.com'
 
 
 def test_load_dotenv_loads_values_without_overriding_existing_env(tmp_path, monkeypatch):

@@ -1735,6 +1735,195 @@ def test_evaluate_risk_guards_blocks_heat_caps_in_r_units():
     assert 'candidate_same_correlation_heat_overexposure' in result['reasons']
 
 
+def test_evaluate_sim_probe_entry_allows_waiting_breakout_when_only_trigger_missing():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='watch',
+        alert_tier='watch',
+        setup_ready=True,
+        trigger_fired=False,
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+        liquidity_grade='A',
+        position_size_pct=1.5,
+        entry_distance_from_breakout_pct=-0.2,
+    )
+    args = argparse.Namespace(
+        sim_probe_entry_enabled=True,
+        sim_probe_min_score=62.0,
+        sim_probe_max_breakout_distance_pct=0.35,
+        sim_probe_size_ratio=0.2,
+    )
+
+    result = mod.evaluate_sim_probe_entry(candidate, {'allowed': False, 'reasons': ['candidate_trigger_not_fired']}, args)
+
+    assert result['allowed'] is True
+    assert result['reasons'] == ['sim_probe_entry_allowed']
+    assert result['size_ratio'] == 0.2
+    assert result['execution_quality']['execution_liquidity_grade'] in {'A+', 'A'}
+
+
+def test_evaluate_sim_probe_entry_allows_near_breakout_short_probe_when_only_trigger_missing():
+    candidate = mod.Candidate(
+        symbol='XRPUSDT',
+        side='short',
+        position_side='SHORT',
+        last_price=100.0,
+        price_change_pct_24h=-14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=0,
+        loser_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=101.0,
+        stop_price=101.5,
+        quantity=10.0,
+        risk_per_unit=1.5,
+        recommended_leverage=3,
+        rsi_5m=42.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='watch',
+        alert_tier='watch',
+        setup_ready=True,
+        trigger_fired=False,
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+        liquidity_grade='A',
+        position_size_pct=1.5,
+        entry_distance_from_breakout_pct=-0.2,
+    )
+    args = argparse.Namespace(
+        sim_probe_entry_enabled=True,
+        sim_probe_min_score=62.0,
+        sim_probe_max_breakout_distance_pct=0.35,
+        sim_probe_size_ratio=0.2,
+    )
+
+    result = mod.evaluate_sim_probe_entry(candidate, {'allowed': False, 'reasons': ['candidate_trigger_not_fired']}, args)
+
+    assert result['allowed'] is True
+    assert result['reasons'] == ['sim_probe_entry_allowed']
+    assert result['size_ratio'] == 0.2
+    assert result['execution_quality']['execution_liquidity_grade'] in {'A+', 'A'}
+
+
+def test_evaluate_sim_probe_entry_keeps_protected_risk_vetoes():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='watch',
+        alert_tier='watch',
+        setup_ready=True,
+        trigger_fired=False,
+        expected_slippage_pct=0.1,
+        book_depth_fill_ratio=0.85,
+        liquidity_grade='A',
+        position_size_pct=1.5,
+        entry_distance_from_breakout_pct=-0.2,
+    )
+    args = argparse.Namespace(
+        sim_probe_entry_enabled=True,
+        sim_probe_min_score=62.0,
+        sim_probe_max_breakout_distance_pct=0.35,
+        sim_probe_size_ratio=0.2,
+    )
+
+    result = mod.evaluate_sim_probe_entry(candidate, {'allowed': False, 'reasons': ['candidate_trigger_not_fired', 'candidate_oi_reversal']}, args)
+
+    assert result['allowed'] is False
+    assert result['reasons'] == ['candidate_oi_reversal']
+    assert result['execution_quality']['execution_liquidity_grade'] in {'A+', 'A'}
+
+
+def test_build_probe_candidate_scales_quantity_and_position_size():
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='watch',
+        position_size_pct=1.5,
+    )
+
+    probe_candidate = mod.build_probe_candidate(candidate, 0.2)
+
+    assert probe_candidate.quantity == 2.0
+    assert probe_candidate.position_size_pct == 0.3
+    assert probe_candidate.reasons[-1] == 'sim_probe_size_ratio=0.20'
+    assert candidate.quantity == 10.0
+
+
 def test_run_scan_once_applies_execution_quality_position_sizing(monkeypatch, tmp_path):
     args = argparse.Namespace(
         symbol='',
@@ -2929,6 +3118,98 @@ def test_place_initial_stop_with_retries_supports_short_side_and_sleep(monkeypat
     ]
 
 
+def test_place_initial_stop_with_retries_supports_short_longer_retry_chain(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=101.0,
+        recent_swing_low=97.0,
+        stop_price=102.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=32.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        side='SHORT',
+        position_side='SHORT',
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    args = argparse.Namespace(profile='test-profile', initial_stop_max_attempts=4, initial_stop_retry_sleep_sec=0.0)
+    script_events = []
+    notifications = []
+    stop_attempts = []
+    positions = iter([
+        [],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '-4.4', 'positionSide': 'SHORT', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '-2.7', 'positionSide': 'SHORT', 'entryPrice': '100.0'}],
+        [{'symbol': 'TESTUSDT', 'positionAmt': '-1.2', 'positionSide': 'SHORT', 'entryPrice': '100.0'}],
+    ])
+
+    def place_stop(_client, symbol, stop_price, quantity, _meta, side=None):
+        stop_attempts.append((symbol, stop_price, quantity, side))
+        if len(stop_attempts) < 4:
+            raise RuntimeError(f'stop rejected #{len(stop_attempts)}')
+        return {'orderId': 98766, 'clientOrderId': 'stop-short-4'}
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda _client: copy.deepcopy(next(positions)))
+    monkeypatch.setattr(mod, 'place_stop_market_order', place_stop)
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event, payload: script_events.append((event, payload)))
+    monkeypatch.setattr(
+        mod,
+        'emit_notification',
+        lambda _args, event, payload: notifications.append((event, payload)) or {'ok': True},
+    )
+
+    result = mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=make_meta(),
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+    )
+
+    assert result == {'orderId': 98766, 'clientOrderId': 'stop-short-4'}
+    assert stop_attempts == [
+        ('TESTUSDT', 102.0, 6.5, 'SHORT'),
+        ('TESTUSDT', 102.0, 4.4, 'SHORT'),
+        ('TESTUSDT', 102.0, 2.7, 'SHORT'),
+        ('TESTUSDT', 102.0, 1.2, 'SHORT'),
+    ]
+    assert [event for event, _payload in script_events] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert [event for event, _payload in notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+
+
     candidate = mod.Candidate(
         symbol='TESTUSDT',
         last_price=100.0,
@@ -3720,17 +4001,17 @@ def test_merged_candidate_symbols_includes_top_losers_for_short_side_scan():
     merged, hot_rank_map, gainer_rank_map, loser_rank_map = mod.merged_candidate_symbols(
         square_symbols=['DOGEUSDT'],
         tickers=[
+            {'symbol': '1000PEPEUSDT', 'priceChangePercent': '22.0'},
             {'symbol': 'DOGEUSDT', 'priceChangePercent': '4.0'},
-            {'symbol': 'SUIUSDT', 'priceChangePercent': '15.0'},
             {'symbol': 'XRPUSDT', 'priceChangePercent': '-9.0'},
         ],
         top_gainers=1,
         top_losers=1,
     )
 
-    assert merged == ['DOGEUSDT', 'SUIUSDT', 'XRPUSDT']
+    assert merged == ['DOGEUSDT', '1000PEPEUSDT', 'XRPUSDT']
     assert hot_rank_map == {'DOGEUSDT': 1}
-    assert gainer_rank_map == {'SUIUSDT': 1}
+    assert gainer_rank_map == {'1000PEPEUSDT': 1}
     assert loser_rank_map == {'XRPUSDT': 1}
 
 

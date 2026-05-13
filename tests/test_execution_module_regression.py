@@ -783,6 +783,136 @@ def test_execution_module_matches_script_place_initial_stop_with_retries_for_lon
     assert script_notifications == extracted_notifications
 
 
+def test_execution_module_matches_script_place_initial_stop_with_retries_for_short_longer_retry_chain(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=101.0,
+        recent_swing_low=97.0,
+        stop_price=102.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=32.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='B',
+        expected_slippage_pct=0.23,
+        book_depth_fill_ratio=0.63,
+        side='SHORT',
+        position_side='SHORT',
+        setup_ready=True,
+        trigger_fired=True,
+    )
+    args = make_args()
+    args.initial_stop_max_attempts = 4
+    meta = make_meta()
+
+    script_events = []
+    extracted_events = []
+    script_notifications = []
+    extracted_notifications = []
+    script_stop_attempts = []
+    extracted_stop_attempts = []
+
+    def build_positions():
+        return iter([
+            [{'symbol': 'TESTUSDT', 'positionAmt': '-4.4', 'positionSide': 'SHORT', 'entryPrice': '100.2'}],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '-2.7', 'positionSide': 'SHORT', 'entryPrice': '100.2'}],
+            [{'symbol': 'TESTUSDT', 'positionAmt': '-1.2', 'positionSide': 'SHORT', 'entryPrice': '100.2'}],
+        ])
+
+    script_positions = build_positions()
+    extracted_positions = build_positions()
+
+    def script_fetch_open_positions(_client):
+        if script_stop_attempts:
+            return copy.deepcopy(next(script_positions))
+        return []
+
+    def extracted_fetch_open_positions(_client):
+        if extracted_stop_attempts:
+            return copy.deepcopy(next(extracted_positions))
+        return []
+
+    def script_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        script_stop_attempts.append((quantity, side))
+        if len(script_stop_attempts) < 4:
+            raise RuntimeError(f'reduceOnly rejected #{len(script_stop_attempts)}')
+        return {'orderId': 98766, 'clientOrderId': 'short-stop-4'}
+
+    def extracted_stop(_client, _symbol, _stop_price, quantity, _meta, side=None):
+        extracted_stop_attempts.append((quantity, side))
+        if len(extracted_stop_attempts) < 4:
+            raise RuntimeError(f'reduceOnly rejected #{len(extracted_stop_attempts)}')
+        return {'orderId': 98766, 'clientOrderId': 'short-stop-4'}
+
+    script_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+        fetch_open_positions=script_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=script_stop,
+        log_runtime_event=lambda event, payload: script_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: script_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    extracted_result = exec_mod.place_initial_stop_with_retries(
+        client=object(),
+        candidate=candidate,
+        meta=meta,
+        args=args,
+        filled_quantity=6.5,
+        position_side='SHORT',
+        fetch_open_positions=extracted_fetch_open_positions,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        place_stop_market_order=extracted_stop,
+        log_runtime_event=lambda event, payload: extracted_events.append((event, payload)),
+        emit_notification=lambda _args, event, payload: extracted_notifications.append((event, payload)),
+        binance_api_error=mod.BinanceAPIError,
+        _to_float=mod._to_float,
+        time_module=time,
+    )
+
+    assert script_result == extracted_result == {'orderId': 98766, 'clientOrderId': 'short-stop-4'}
+    assert script_stop_attempts == extracted_stop_attempts == [
+        (6.5, 'SHORT'),
+        (4.4, 'SHORT'),
+        (2.7, 'SHORT'),
+        (1.2, 'SHORT'),
+    ]
+    assert script_events == extracted_events
+    assert [event for event, _payload in extracted_notifications] == [
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_failed',
+        'initial_stop_place_attempt_succeeded',
+    ]
+    assert script_notifications == extracted_notifications
+
+
     candidate = make_candidate()
     meta = make_meta()
     args = make_args()

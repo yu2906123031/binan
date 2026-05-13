@@ -5375,6 +5375,36 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'top_trigger_missing': dict(sorted(trigger_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
         'top_trade_missing': dict(sorted(trade_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
     }
+    tradeability_block_labels = {'execution_slippage', 'execution_depth'}
+    blocked_tradeability = []
+    for event in rejected_events:
+        label = str(event.get('reject_reason_label', '') or '')
+        if label not in tradeability_block_labels:
+            continue
+        slippage_r = event.get('expected_slippage_r')
+        grade = event.get('execution_liquidity_grade', '')
+        if slippage_r is not None and 0 < slippage_r < 1:
+            tradeability_score = round(max(0, 100 - slippage_r * 100), 1)
+        else:
+            tradeability_score = None
+        blocked_reasons = []
+        if slippage_r is not None:
+            blocked_reasons.append(f'slippage_r={slippage_r}')
+        if grade:
+            blocked_reasons.append(f'liquidity_grade={grade}')
+        spread = event.get('spread_bps')
+        if spread is not None:
+            blocked_reasons.append(f'spread_bps={spread}')
+        depth = event.get('book_depth_fill_ratio')
+        if depth is not None:
+            blocked_reasons.append(f'depth_fill_ratio={depth}')
+        blocked_tradeability.append({
+            'symbol': event.get('symbol'),
+            'side': event.get('side') or event.get('position_side'),
+            'reject_label': label,
+            'tradeability_score': tradeability_score,
+            'blocked_reasons': blocked_reasons,
+        })
     payload = {
         'ok': True,
         'candidate_count': len(candidates),
@@ -5390,6 +5420,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             'by_execution_liquidity_grade': reject_by_execution_grade,
             'triggered_but_risk_rejected': triggered_but_risk_rejected,
         },
+        'blocked_tradeability': blocked_tradeability,
         'early_rejected_stats': early_reject_stats,
         'funnel': funnel,
     }
@@ -5592,7 +5623,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
         }
-    elif profile in {'okx-sim-active', 'binance-sim-active'}:
+    elif profile in {'okx-sim-active', 'binance-sim-active', 'high_vol_alt_mode'}:
         profile_overrides = {
             'risk_usdt': 1.0,
             'max_notional_usdt': 300.0,
@@ -5627,7 +5658,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         }
         if profile == 'okx-sim-active':
             profile_overrides['okx_simulated_trading'] = True
-        else:
+        elif profile == 'binance-sim-active':
             profile_overrides.update({
                 'binance_simulated_trading': True,
                 'base_url': 'https://testnet.binancefuture.com',

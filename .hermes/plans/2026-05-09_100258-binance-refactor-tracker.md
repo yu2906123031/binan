@@ -1095,6 +1095,25 @@
 ## 待办任务总表
 
 ### P0｜稳定性与故障可诊断性
+- [ ] `P0-live-tradeability-score`｜为 scan→watch/setup→trade 决策链补 `tradeability_score` / blocked-reasons 聚合输出
+  - 目标：把当前 supervisor 周期里 `候选 16 / setup 7 / watch 9 / trade 0` 的阻断原因结构化写入 cycle summary、runtime-state 或事件日志，直接回答“为什么没开单”
+  - 可能涉及：`scripts/binance_futures_momentum_long.py`、runtime-state summary writer、相关 tests
+  - 子任务：
+    - [ ] `P0-live-tradeability-score-a`：先写 focused regression，固定 score payload 至少包含 candidate stage、must-pass flags、risk veto reasons、execution liquidity/slippage 摘要
+    - [ ] `P0-live-tradeability-score-b`：在 scan / select / execute 前串起统一 builder，输出 top blocked reasons 与可交易候选计数
+    - [ ] `P0-live-tradeability-score-c`：把 cycle summary / runtime-state / event payload 的字段命名统一，方便 watcher 与 cron snapshot 直接消费
+  - 验证：`pytest -q <focused suites>` + supervisor runtime snapshot 抽样校验
+  - 状态：未开始
+
+- [ ] `P0-missed-trade-telemetry`｜补 missed-trade logger，记录 setup-ready / waiting-breakout 候选为何未进入 trade
+  - 目标：围绕 `setup_ready=True`、probe 可放行、最终仍未成交的路径输出落盘证据，便于实盘回看 admission gate 与 execution veto 的真实分布
+  - 可能涉及：`scripts/binance_futures_momentum_long.py`、runtime-state events、相关 restore/smoke tests
+  - 子任务：
+    - [ ] `P0-missed-trade-telemetry-a`：focused regression 固定 setup-ready / trigger 缺失 / execution veto / portfolio veto 的事件分类 contract
+    - [ ] `P0-missed-trade-telemetry-b`：落盘 symbol、stage、blocked reasons、关键阈值与 probe allowance 摘要
+    - [ ] `P0-missed-trade-telemetry-c`：让 supervisor / snapshot 输出能直接汇总最近 missed-trade 样本
+  - 验证：`pytest -q <focused suites>` + 抽查 `runtime-state/events.jsonl`
+  - 状态：未开始
 
 #### P0-1 RuntimeStateStore 原子写入
 - 目标：消除 `write_text()` 直接覆盖带来的半写入/脏读风险
@@ -1341,8 +1360,58 @@
 
 ---
 
+### 2026-05-13｜setup-ready probe entry 与 waiting_breakout 回归补强
+- 状态：已完成
+- 范围：确认 Binance sim probe 只对 `setup_ready=True` 且仅缺失 trigger 的候选开放小仓位试单，同时保持 OI reversal、execution slippage、liquidity 与组合 heat 等保护性 veto 不放松；补齐 `binance-sim-active` profile 对应参数回归
+- 修改文件：
+  - `tests/test_strategy_v2.py`
+  - `tests/test_cli_args.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 代码现状确认：`scripts/binance_futures_momentum_long.py` 中 `evaluate_sim_probe_entry(...)` 已将 `candidate_trigger_not_fired` 设为唯一可透传的 probe 风险原因，`candidate_oi_reversal`、`candidate_execution_slippage_risk`、`candidate_execution_liquidity_poor` 与 portfolio heat 相关 veto 仍属于 hard block
+  - 新增 `test_evaluate_sim_probe_entry_allows_waiting_breakout_when_only_trigger_missing`，固定 waiting_breakout 场景下 setup-ready 候选可获得 `sim_probe_entry_allowed`，并校验 probe size ratio contract
+  - 新增 `test_evaluate_sim_probe_entry_keeps_protected_risk_vetoes`，固定当 `candidate_trigger_not_fired` 与 `candidate_oi_reversal` 同时出现时，probe entry 继续被保护性 veto 拦截
+  - 新增 `test_build_probe_candidate_scales_quantity_and_position_size`，固定 probe candidate 会按 `sim_probe_size_ratio` 同步缩放 `quantity` 与 `position_size_pct`，且原始 candidate 保持不变
+  - 扩展 `test_binance_sim_active_profile_uses_exploratory_simulation_thresholds`，补断言 `sim_probe_max_breakout_distance_pct == 0.35`，锁定 `binance-sim-active` 的 setup-ready probe 参数 contract
+  - 测试夹具修正：execution quality helper 在该场景下可能返回 `A+`，回归断言收敛为接受 `A+` / `A`，与当前 helper 输出保持一致
+- 验证：
+  - `pytest -q tests/test_strategy_v2.py -k 'sim_probe_entry or build_probe_candidate'` → `3 passed, 74 deselected in 0.37s`
+  - `pytest -q tests/test_cli_args.py -k 'binance_sim_active_profile_uses_exploratory_simulation_thresholds'` → `1 passed, 13 deselected in 0.14s`
+- 遗留风险：
+  - 当前回归覆盖的是 setup-ready / waiting_breakout 的 focused contract，后续若 probe 放宽到更多 trigger 缺口类型，适合先显式扩展 allowed-risk whitelist 再补对应 veto 组合回归
+  - 当前验证集中在 targeted pytest 子集；后续合并更大策略切片时，适合把 `tests/test_strategy_v2.py` 与 restore/smoke 集群一起复跑，确认 probe payload 不影响更长执行链路
+- 对应待办编号：
+  - t2
+  - t3
+
+---
+
 ## 下一步建议
-按顺序执行：先补 `place_initial_stop_with_retries(...)` 的 SHORT 方向与更长重试链 regression，扩满保护单编排边界 → 再把 exhausted payload / sleep 分支拆成更窄 focused tests，减少 live-trade 级别夹具负担 → 最后回到 monitor / event normalization 的稳定字段归一化 helper，继续压缩 execution parity 测试里的局部去抖逻辑
+按顺序执行：先做 `tradeability_score` 与 missed-trade telemetry，把当前“扫描到 setup/watch 但 trade 仍为 0”的阻断原因结构化落盘到 cycle/runtime 产物 → 再补更大策略切片回归，串联 `setup_ready` probe、restore/smoke 与 `high_vol_alt_mode` 的双向扫描路径，确认放宽后的 admission contract 在长执行链里保持稳定 → 最后统一 `merged_candidate_symbols` 相关测试夹具为四元返回，收敛历史兼容分支，降低后续继续拆 execution/scan seam 的认知负担
+
+### 2026-05-13｜high_vol_alt_mode profile 对齐双向扫描与 probe 参数契约
+- 状态：已完成
+- 范围：把 `high_vol_alt_mode` 纳入与 `okx-sim-active` / `binance-sim-active` 同组的运行时 profile override，固定其双向候选扫描所需的 gainers/losers/probe/slippage 参数 contract，并用 targeted regression 验证相关策略子集保持绿色
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_cli_args.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 扩展 `apply_runtime_profile(...)` 的 profile 分支，让 `high_vol_alt_mode` 复用 sim-active 档位的 `top_gainers=40`、`top_losers=40`、`max_candidates=12`、probe entry、execution slippage 与 funding/EMA/VWAP 门槛参数
+  - 保持 `high_vol_alt_mode` 仅继承扫描与风控阈值，不自动开启 `binance_simulated_trading` / `okx_simulated_trading`，同时维持生产 `base_url` 默认值
+  - 扩展 `test_binance_sim_active_profile_uses_exploratory_simulation_thresholds`，补锁 `sim_probe_max_breakout_distance_pct == 0.35`
+  - 新增 `test_high_vol_alt_mode_profile_enables_short_side_scan_and_relaxed_probe_thresholds`，集中锁定 `high_vol_alt_mode` 的 lookback/swing、gainers/losers、probe/slippage、distance/funding 与 simulated-trading 开关 contract
+- 验证：
+  - `pytest -q tests/test_cli_args.py::test_high_vol_alt_mode_profile_enables_short_side_scan_and_relaxed_probe_thresholds -q` → `1 passed`
+  - `pytest -q tests/test_cli_args.py tests/test_strategy_v2.py tests/test_strategy_v2_restore_regression.py tests/test_portfolio_risk_guards.py tests/test_risk_engine_unit.py` → `230 passed in 1.12s`
+- 遗留风险：
+  - 当前收口在 runtime profile contract 与相关策略回归子集，后续若 `high_vol_alt_mode` 引入独立的 long/short 配额或 symbol hedge 行为，适合先补 focused CLI/portfolio guard regression 再扩 profile 分支
+  - 现有 restore regression 里的 `merged_candidate_symbols` 假实现仍保留三元返回；生产代码已兼容四元返回，后续适合统一测试夹具返回形状，减少历史兼容分支的认知负担
+- 对应待办编号：
+  - t3
+  - t4
+
+---
 
 ### 2026-05-12｜execution/candidate/默认参数/动态杠杆与管理动作回归收口
 - 状态：已完成

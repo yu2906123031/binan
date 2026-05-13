@@ -327,3 +327,59 @@ def test_build_cn_scan_summary_includes_runtime_health_sections():
     assert 'BookTicker WS: unavailable | 原因 websocket_client_missing' in rendered
     assert 'User Data Stream: refresh_failed | 动作 refresh_failed | 断线 2 | 续期失败 3 | 重连 1 | 更新时间 2026-04-20T12:31:00Z | 错误 boom' in rendered
     assert '运行告警: warning | listen key stale' in rendered
+
+
+def test_build_cn_scan_summary_includes_execution_slippage_tradeability_details():
+    result = {
+        'ok': True,
+        'cycles': [
+            {
+                'scan_only': False,
+                'live_requested': True,
+                'scan': {
+                    'market_regime': {'label': 'risk-on', 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20']},
+                    'candidate_count': 2,
+                    'rejected_stats': {
+                        'total': 2,
+                        'by_reject_label': {'execution_slippage': 2},
+                    },
+                    'candidate_alerts': [],
+                    'blocked_tradeability': [
+                        {
+                            'symbol': 'DOGEUSDT',
+                            'reject_label': 'execution_slippage',
+                            'tradeability_score': 41.2,
+                            'blocked_reasons': ['slippage_r=0.33', 'spread_bps=9.2', 'depth_fill_ratio=0.38'],
+                        },
+                        {
+                            'symbol': 'PEPEUSDT',
+                            'reject_label': 'execution_slippage',
+                            'tradeability_score': 36.7,
+                            'blocked_reasons': ['slippage_r=0.29', 'spread_bps=11.5'],
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+
+    summary = mod.build_cn_scan_summary(result)
+    rendered = mod.render_cn_scan_summary(result)
+
+    assert summary['扫描概览']['可交易性拦截列表'] == [
+        {
+            '交易对': 'DOGEUSDT',
+            '原因': 'execution_slippage',
+            '可交易分': 41.2,
+            '阻断明细': ['slippage_r=0.33', 'spread_bps=9.2', 'depth_fill_ratio=0.38'],
+        },
+        {
+            '交易对': 'PEPEUSDT',
+            '原因': 'execution_slippage',
+            '可交易分': 36.7,
+            '阻断明细': ['slippage_r=0.29', 'spread_bps=11.5'],
+        },
+    ]
+    assert '可交易性拦截:' in rendered
+    assert 'DOGEUSDT | execution_slippage | 分数 41.2 | slippage_r=0.33, spread_bps=9.2, depth_fill_ratio=0.38' in rendered
+    assert 'PEPEUSDT | execution_slippage | 分数 36.7 | slippage_r=0.29, spread_bps=11.5' in rendered
