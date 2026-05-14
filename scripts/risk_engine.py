@@ -22,7 +22,11 @@ def evaluate_portfolio_risk_guards(
     snapshot = build_position_exposure_snapshot(open_positions)
     reasons = []
     candidate_symbol = str(getattr(candidate, 'symbol', '') or '').upper()
-    candidate_side = normalize_position_side(getattr(candidate, 'side', position_side_long)) if candidate is not None else position_side_long
+    candidate_side = position_side_long
+    if candidate is not None:
+        candidate_side = normalize_position_side(
+            getattr(candidate, 'position_side', None) or getattr(candidate, 'side', position_side_long)
+        )
     candidate_notional = abs(_to_float(getattr(candidate, 'notional', 0.0) or getattr(candidate, 'planned_notional', 0.0)))
     if candidate_notional <= 0:
         candidate_notional = abs(_to_float(getattr(candidate, 'entry_price', 0.0) or getattr(candidate, 'last_price', 0.0))) * abs(_to_float(getattr(candidate, 'quantity', 0.0)))
@@ -105,7 +109,16 @@ def evaluate_risk_guards(
             if not bool(getattr(candidate, 'probe_entry', False)):
                 reasons.append('candidate_trigger_not_fired')
         execution_slippage_r = compute_expected_slippage_r(candidate)
-        execution_liquidity_grade = classify_execution_liquidity_grade(getattr(candidate, 'book_depth_fill_ratio', 0.0), execution_slippage_r)
+        spread_bps = _to_float(getattr(candidate, 'spread_bps', 0.0))
+        orderbook_slope = _to_float(getattr(candidate, 'orderbook_slope', 0.0))
+        cancel_rate = _to_float(getattr(candidate, 'cancel_rate', 0.0))
+        execution_liquidity_grade = classify_execution_liquidity_grade(
+            getattr(candidate, 'book_depth_fill_ratio', 0.0),
+            execution_slippage_r,
+            spread_bps=spread_bps,
+            orderbook_slope=orderbook_slope,
+            cancel_rate=cancel_rate,
+        )
         if state == 'distribution':
             reasons.append('candidate_distribution_risk')
         if _to_float(getattr(candidate, 'cvd_delta', 0.0)) < 0 and _to_float(getattr(candidate, 'cvd_zscore', 0.0)) <= -2.0:
@@ -116,7 +129,14 @@ def evaluate_risk_guards(
         risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
         if execution_slippage_r > risk_slippage_r:
             reasons.append('candidate_execution_slippage_risk')
-        if execution_liquidity_grade == 'C' and _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5:
+        liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
+        if execution_liquidity_grade == 'D':
+            reasons.append('candidate_execution_liquidity_poor')
+        elif execution_liquidity_grade == 'C' and (
+            _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5 or liquidity_penalty_present
+        ):
+            reasons.append('candidate_execution_liquidity_poor')
+        elif execution_liquidity_grade == 'B' and liquidity_penalty_present:
             reasons.append('candidate_execution_liquidity_poor')
         position_size_pct = max(_to_float(getattr(candidate, 'position_size_pct', 0.0)), 0.0)
         portfolio_narrative_bucket = str(kwargs.get('portfolio_narrative_bucket') or getattr(candidate, 'portfolio_narrative_bucket', '') or '').strip()

@@ -233,3 +233,38 @@ def test_evaluate_portfolio_risk_guards_marks_flip_cooldown_when_single_side_gua
         'opposite_side_flip_cooldown_active',
     ]
     assert payload['snapshot']['symbol_sides']['DOGEUSDT'] == [POSITION_SIDE_LONG]
+
+
+
+def test_evaluate_risk_guards_uses_orderbook_penalties_in_execution_liquidity_grade():
+    candidate = make_candidate(
+        risk_per_unit=1.0,
+        expected_slippage_pct=0.05,
+        book_depth_fill_ratio=0.9,
+        spread_bps=18.0,
+        orderbook_slope=0.2,
+        cancel_rate=0.4,
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is False
+    assert payload['reasons'] == ['candidate_execution_liquidity_poor']
+
+
+
+def test_evaluate_portfolio_risk_guards_prefers_candidate_position_side_for_short_limits():
+    candidate = SimpleNamespace(symbol='SUIUSDT', position_side='SHORT', entry_price=50.0, quantity=2.0)
+    open_positions = [
+        {'symbol': 'ETHUSDT', 'positionSide': 'SHORT', 'notional': 80.0},
+    ]
+
+    payload = evaluate_portfolio_risk_guards(
+        open_positions=open_positions,
+        candidate=candidate,
+        max_short_positions=1,
+    )
+
+    assert payload['allowed'] is False
+    assert payload['reasons'] == ['max_short_positions_reached']
+    assert payload['snapshot']['candidate_side'] == POSITION_SIDE_SHORT
