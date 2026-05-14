@@ -373,170 +373,14 @@ def fetch_okx_account_balance(client: OKXClient) -> Dict[str, Any]:
     return rows[0] if rows and isinstance(rows[0], dict) else {}
 
 
-def fetch_okx_open_positions(client: OKXClient, inst_id: str = '') -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {'instType': 'SWAP'}
-    if inst_id:
-        params['instId'] = str(inst_id).upper()
-    payload = client.get('/api/v5/account/positions', params)
-    rows = payload.get('data', []) if isinstance(payload, dict) else []
-    positions: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        qty = abs(_to_float(row.get('pos') or row.get('availPos') or row.get('availPosCcy')))
-        if qty <= 0:
-            continue
-        positions.append(row)
-    return positions
-
-
-def okx_position_matches_symbol_side(
-    position: Dict[str, Any],
-    symbol: str,
-    side: Any = 'LONG',
-    account_snapshot: Optional[Dict[str, Any]] = None,
-) -> bool:
-    if not isinstance(position, dict):
-        return False
-    inst_id = str(position.get('instId') or '').upper()
-    if inst_id != normalize_okx_swap_inst_id(symbol):
-        return False
-    expected_side = normalize_position_side(side)
-    pos_side = str(position.get('posSide') or '').strip().lower()
-    quantity = _to_float(position.get('pos') or position.get('availPos') or position.get('availPosCcy'))
-    if pos_side in {'long', 'short'}:
-        return pos_side == ('short' if expected_side == POSITION_SIDE_SHORT else 'long')
-    if str((account_snapshot or {}).get('position_mode') or '').lower() == 'net_mode' or pos_side == 'net':
-        return quantity < 0 if expected_side == POSITION_SIDE_SHORT else quantity > 0
-    return quantity < 0 if expected_side == POSITION_SIDE_SHORT else quantity > 0
-
-
-def okx_position_exists_for_symbol_side(
-    client: OKXClient,
-    symbol: str,
-    side: Any = 'LONG',
-    account_snapshot: Optional[Dict[str, Any]] = None,
-) -> bool:
-    inst_id = normalize_okx_swap_inst_id(symbol)
-    rows = fetch_okx_open_positions(client, inst_id=inst_id)
-    return any(okx_position_matches_symbol_side(row, symbol, side, account_snapshot=account_snapshot) for row in rows)
-
-
-def build_okx_account_snapshot(client: OKXClient) -> Dict[str, Any]:
-    config = fetch_okx_account_config(client)
-    balance = fetch_okx_account_balance(client)
-    details = balance.get('details', []) if isinstance(balance, dict) else []
-    usdt = next((row for row in details if str(row.get('ccy', '')).upper() == 'USDT'), {}) if isinstance(details, list) else {}
-    acct_lv = str(config.get('acctLv') or '')
-    return {
-        'exchange': 'OKX',
-        'simulated': bool(client.simulated_trading),
-        'account_mode': acct_lv,
-        'account_mode_label': okx_account_mode_label(acct_lv),
-        'position_mode': config.get('posMode'),
-        'api_label': config.get('label'),
-        'api_permissions': config.get('perm'),
-        'total_wallet_balance': _to_float(balance.get('totalEq')),
-        'account_total_margin_balance': _to_float(balance.get('totalEq')),
-        'account_available_balance': _to_float(usdt.get('availEq') or usdt.get('availBal') or usdt.get('cashBal')),
-        'available_balance': _to_float(usdt.get('availEq') or usdt.get('availBal') or usdt.get('cashBal')),
-        'usdt_equity': _to_float(usdt.get('eq')),
-        'usdt_cash_balance': _to_float(usdt.get('cashBal')),
-        'usdt_available_equity': _to_float(usdt.get('availEq')),
-        'supports_swap_trading': acct_lv in {'2', '3', '4'},
-        'mode_error': 'okx_account_mode_not_supported' if acct_lv == '1' else '',
-        'mode_help': 'OKX 合约模拟盘需要 Futures/Multi-currency/Portfolio 账户模式；Spot mode 会触发 51010。第一次切换必须在 OKX 网页或 App 的模拟盘账户模式里完成。',
-        'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-
-
-def fetch_okx_ticker_last(client: OKXClient, inst_id: str) -> float:
-    payload = client.public_get('/api/v5/market/ticker', {'instId': inst_id})
-    rows = payload.get('data', []) if isinstance(payload, dict) else []
-    row = rows[0] if rows and isinstance(rows[0], dict) else {}
-    return _to_float(row.get('last') or row.get('markPx') or row.get('idxPx'), default=0.0)
-
-
-def build_okx_reduce_only_order(
-    position: Dict[str, Any],
-    quantity: float,
-    args: argparse.Namespace,
-    instrument: Dict[str, Any],
-    account_snapshot: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    symbol = str(position.get('symbol') or '').upper()
-    inst_id = str(instrument.get('instId') or '').upper() or normalize_okx_swap_inst_id(symbol)
-    position_side = normalize_position_side(position.get('side') or position.get('position_side'))
-    order_side = 'buy' if position_side == POSITION_SIDE_SHORT else 'sell'
-    contract_value = abs(_to_float(instrument.get('ctVal'), default=1.0)) or 1.0
-    raw_contracts = abs(float(quantity or 0.0)) / contract_value
-    lot_size = abs(_to_float(instrument.get('lotSz'), default=1.0)) or 1.0
-    contracts = _round_down_to_step(raw_contracts, lot_size)
-    if contracts <= 0:
-        raise OKXAPIError(f'invalid OKX reduce quantity for {symbol}: {quantity}')
-    td_mode = str(position.get('margin_type') or getattr(args, 'margin_type', 'ISOLATED') or 'ISOLATED').lower()
-    td_mode = 'cross' if td_mode in {'crossed', 'cross'} else 'isolated'
-    order = {
-        'instId': inst_id,
-        'tdMode': td_mode,
-        'side': order_side,
-        'ordType': 'market',
-        'sz': _format_decimal(contracts),
-        'reduceOnly': 'true',
-    }
-    if str((account_snapshot or {}).get('position_mode') or '').lower() != 'net_mode':
-        order['posSide'] = 'short' if position_side == POSITION_SIDE_SHORT else 'long'
-    return order
-
-
-def place_okx_reduce_only_market(
-    okx_client: OKXClient,
-    position: Dict[str, Any],
-    quantity: float,
-    args: argparse.Namespace,
-    account_snapshot: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    symbol = str(position.get('symbol') or '').upper()
-    inst_id = normalize_okx_swap_inst_id(symbol)
-    instrument = fetch_okx_swap_instrument(okx_client, inst_id)
-    order = build_okx_reduce_only_order(position, quantity, args, instrument, account_snapshot)
-    response = okx_client.post('/api/v5/trade/order', order)
-    order_row = (response.get('data') or [{}])[0] if isinstance(response, dict) else {}
-    return {
-        'exchange': 'OKX',
-        'simulated': True,
-        'symbol': symbol,
-        'inst_id': order.get('instId'),
-        'side': normalize_position_side(position.get('side') or position.get('position_side')),
-        'closed_quantity': float(quantity or 0.0),
-        'okx_order': order,
-        'okx_response': response,
-        'order_feedback': {
-            'order_id': order_row.get('ordId'),
-            'client_order_id': order_row.get('clOrdId'),
-            'status': order_row.get('sCode', response.get('code')),
-            'message': order_row.get('sMsg', ''),
-        },
-    }
-
-
 def is_binance_simulated_trading(args: argparse.Namespace) -> bool:
     return bool(getattr(args, 'binance_simulated_trading', False))
 
 
 def execution_exchange_label(args: argparse.Namespace) -> str:
-    if bool(getattr(args, 'okx_simulated_trading', False)):
-        return 'OKX_SIMULATED'
     if is_binance_simulated_trading(args):
         return 'BINANCE_SIMULATED'
     return 'BINANCE'
-
-
-def resolve_okx_simulated_api_credentials() -> Tuple[str, str, str]:
-    api_key = os.getenv('OKX_SIMULATED_API_KEY') or os.getenv('OKX_API_KEY', '')
-    api_secret = os.getenv('OKX_SIMULATED_SECRET_KEY') or os.getenv('OKX_SECRET_KEY', '')
-    passphrase = os.getenv('OKX_SIMULATED_PASSPHRASE') or os.getenv('OKX_PASSPHRASE', '')
-    return api_key, api_secret, passphrase
 
 
 def resolve_binance_api_credentials(args: argparse.Namespace) -> Tuple[str, str]:
@@ -545,99 +389,6 @@ def resolve_binance_api_credentials(args: argparse.Namespace) -> Tuple[str, str]
         api_secret = os.getenv('BINANCE_FUTURES_TESTNET_API_SECRET') or os.getenv('BINANCE_FUTURES_API_SECRET', '')
         return api_key, api_secret
     return os.getenv('BINANCE_FUTURES_API_KEY', ''), os.getenv('BINANCE_FUTURES_API_SECRET', '')
-
-
-def build_okx_simulated_order(
-    candidate: Any,
-    leverage: int,
-    args: argparse.Namespace,
-    instrument: Dict[str, Any],
-    account_snapshot: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    inst_id = str(instrument.get('instId') or '').upper() or normalize_okx_swap_inst_id(getattr(candidate, 'symbol', ''))
-    position_side = normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG))
-    side = 'sell' if position_side == POSITION_SIDE_SHORT else 'buy'
-    pos_side = 'short' if position_side == POSITION_SIDE_SHORT else 'long'
-    base_quantity = abs(_to_float(getattr(candidate, 'quantity', 0.0)))
-    contract_value = abs(_to_float(instrument.get('ctVal'), default=1.0)) or 1.0
-    raw_contracts = base_quantity / contract_value
-    lot_size = abs(_to_float(instrument.get('lotSz'), default=1.0)) or 1.0
-    min_size = abs(_to_float(instrument.get('minSz'), default=lot_size)) or lot_size
-    contracts = _round_down_to_step(raw_contracts, lot_size)
-    if contracts < min_size:
-        contracts = min_size
-    td_mode = 'cross' if str(getattr(args, 'margin_type', 'ISOLATED')).upper() == 'CROSSED' else 'isolated'
-    order = {
-        'instId': inst_id,
-        'tdMode': td_mode,
-        'side': side,
-        'ordType': 'market',
-        'sz': _format_decimal(contracts),
-        'lever': str(int(leverage)),
-    }
-    if str((account_snapshot or {}).get('position_mode') or '').lower() != 'net_mode':
-        order['posSide'] = pos_side
-    return order
-
-
-def place_okx_simulated_trade(okx_client: OKXClient, candidate: Any, leverage: int, args: argparse.Namespace) -> Dict[str, Any]:
-    inst_id = normalize_okx_swap_inst_id(getattr(candidate, 'symbol', ''))
-    if not inst_id:
-        raise OKXAPIError('missing OKX instrument id')
-    account_snapshot = build_okx_account_snapshot(okx_client)
-    if not bool(account_snapshot.get('supports_swap_trading')):
-        raise OKXAPIError(
-            'OKX API error 51010: current account mode does not support SWAP trading; '
-            f"acctLv={account_snapshot.get('account_mode') or 'unknown'} "
-            f"({account_snapshot.get('account_mode_label')}); "
-            'switch Demo Trading account mode to Futures/Multi-currency/Portfolio on OKX Web/App first.'
-        )
-    instrument = fetch_okx_swap_instrument(okx_client, inst_id)
-    order = build_okx_simulated_order(candidate, leverage, args, instrument, account_snapshot)
-    response = okx_client.post('/api/v5/trade/order', order)
-    order_row = (response.get('data') or [{}])[0] if isinstance(response, dict) else {}
-    position_side = normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG))
-    entry_price = float(getattr(candidate, 'last_price', 0.0) or 0.0)
-    filled_quantity = float(getattr(candidate, 'quantity', 0.0) or 0.0)
-    plan = build_trade_management_plan(
-        entry_price=entry_price,
-        stop_price=float(getattr(candidate, 'stop_price')),
-        quantity=filled_quantity,
-        tp1_r=float(getattr(args, 'tp1_r', 1.5)),
-        tp1_close_pct=float(getattr(args, 'tp1_close_pct', 0.3)),
-        tp2_r=float(getattr(args, 'tp2_r', 2.0)),
-        tp2_close_pct=float(getattr(args, 'tp2_close_pct', 0.4)),
-        breakeven_r=float(getattr(args, 'breakeven_r', 1.0)),
-        atr_stop_distance=float(getattr(candidate, 'atr_stop_distance', 0.0) or 0.0),
-        side=position_side,
-        breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
-        breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
-    )
-    return {
-        'exchange': 'OKX',
-        'simulated': True,
-        'symbol': str(getattr(candidate, 'symbol', '')).upper(),
-        'inst_id': inst_id,
-        'side': position_side,
-        'entry_price': entry_price,
-        'filled_quantity': filled_quantity,
-        'margin_type': order.get('tdMode', '').upper(),
-        'leverage': int(leverage),
-        'entry_order_feedback': {
-            'order_id': order_row.get('ordId'),
-            'client_order_id': order_row.get('clOrdId'),
-            'status': order_row.get('sCode', response.get('code')),
-            'message': order_row.get('sMsg', ''),
-        },
-        'okx_order': order,
-        'okx_response': response,
-        'okx_account': account_snapshot,
-        'trade_management_plan': asdict(plan),
-        'stop_order': {},
-        'protection_check': {'status': 'simulated', 'side': position_side},
-    }
-
-
 
 
 POSITION_SIDE_LONG = 'LONG'
@@ -1570,7 +1321,6 @@ def make_auto_loop_book_ticker_unavailable_summary_builder() -> Callable[[str], 
 
 @dataclass(frozen=True)
 class AutoLoopUserDataStreamMonitorConfig:
-    okx_simulated_trading: bool = False
     refresh_interval_minutes: float = 30.0
     disconnect_timeout_minutes: float = 65.0
 
@@ -1624,7 +1374,6 @@ def build_auto_loop_user_data_stream_monitor_config(
     args: argparse.Namespace,
 ) -> AutoLoopUserDataStreamMonitorConfig:
     return AutoLoopUserDataStreamMonitorConfig(
-        okx_simulated_trading=bool(getattr(args, 'okx_simulated_trading', False)),
         refresh_interval_minutes=float(getattr(args, 'user_stream_refresh_interval_minutes', 30.0) or 30.0),
         disconnect_timeout_minutes=float(getattr(args, 'user_stream_disconnect_timeout_minutes', 65.0) or 65.0),
     )
@@ -1804,19 +1553,6 @@ def run_auto_loop_user_data_stream_monitor(
     config: Optional[AutoLoopUserDataStreamMonitorConfig] = None,
 ) -> Dict[str, Any]:
     monitor_config = config or build_auto_loop_user_data_stream_monitor_config(args)
-    if monitor_config.okx_simulated_trading:
-        uds_monitor = {
-            'status': 'skipped',
-            'action': 'skipped',
-            'exchange': 'OKX_SIMULATED',
-            'listen_key': '',
-            'detail': 'okx_simulated_trading_uses_okx_private_state_not_binance_listen_key',
-            'now_utc': _isoformat_utc(_utc_now()),
-            'refresh_failure_count': 0,
-            'disconnect_count': 0,
-        }
-        store.save_json('user_data_stream', uds_monitor)
-        return {'monitor': uds_monitor, 'alert': None}
     existing_uds_state = store.load_json('user_data_stream', {})
     return run_auto_loop_user_data_stream_monitor_core(
         client=client,
@@ -2919,191 +2655,6 @@ def recover_protected_position_trade_management_plan(
     return tracked
 
 
-def manage_okx_simulated_positions(store: RuntimeStateStore, args: argparse.Namespace, okx_client: OKXClient) -> Dict[str, Any]:
-    positions_state = store.load_json('positions', {})
-    if not isinstance(positions_state, dict):
-        positions_state = {}
-    canonical_positions = migrate_positions_state(positions_state)
-    if not iter_canonical_open_positions(canonical_positions):
-        store.save_json('positions', materialize_positions_state(canonical_positions, include_legacy_alias=True))
-        return {'ok': True, 'actions': [], 'errors': [], 'tracked_positions': 0}
-    actions_taken: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-    try:
-        account_snapshot = build_okx_account_snapshot(okx_client)
-    except Exception:
-        account_snapshot = {}
-    for position_key, position in iter_canonical_open_positions(canonical_positions):
-        symbol = str(position.get('symbol') or '').upper()
-        side = normalize_position_side(position.get('side') or position.get('position_side'))
-        remaining = abs(_to_float(position.get('remaining_quantity') or position.get('quantity') or position.get('filled_quantity')))
-        if not symbol or remaining <= 0:
-            continue
-        try:
-            current_price = fetch_okx_ticker_last(okx_client, normalize_okx_swap_inst_id(symbol))
-            if current_price <= 0:
-                continue
-            plan = build_trade_management_plan_from_position(position, args)
-            state = TradeManagementState(
-                symbol=symbol,
-                side=side,
-                position_side=side,
-                position_key=position_key,
-                initial_quantity=_to_float(position.get('quantity') or position.get('filled_quantity') or plan.quantity),
-                remaining_quantity=remaining,
-                current_stop_price=_to_float(position.get('current_stop_price') or position.get('stop_price') or plan.stop_price, default=plan.stop_price),
-                moved_to_breakeven=bool(position.get('moved_to_breakeven', False)),
-                tp1_hit=bool(position.get('tp1_hit', False)),
-                tp2_hit=bool(position.get('tp2_hit', False)),
-                highest_price_seen=_to_float(position.get('highest_price_seen') or position.get('entry_price'), default=_to_float(position.get('entry_price'))),
-                lowest_price_seen=_to_float(position.get('lowest_price_seen') or position.get('entry_price'), default=_to_float(position.get('entry_price'))),
-            )
-            stop_hit = current_price <= state.current_stop_price if side == POSITION_SIDE_LONG else current_price >= state.current_stop_price
-            actions = [{'type': 'stop_exit', 'close_qty': remaining, 'exit_reason': 'stop'}] if stop_hit else evaluate_management_actions(
-                state,
-                plan,
-                current_price=current_price,
-                ema5m=current_price,
-                trailing_reference=current_price,
-                trailing_buffer_pct=float(getattr(args, 'trailing_buffer_pct', 0.02) or 0.02),
-                allow_runner_exit=True,
-            )
-            if not actions:
-                position.update({
-                    'highest_price_seen': state.highest_price_seen,
-                    'lowest_price_seen': state.lowest_price_seen,
-                    'last_management_price': current_price,
-                    'last_management_at': _isoformat_utc(_utc_now()),
-                    'monitor_mode': 'okx_simulated_loop',
-                })
-                canonical_positions, _ = upsert_position_record(canonical_positions, position, key=position_key)
-                continue
-            for action in actions:
-                action_type = str(action.get('type') or '')
-                if action_type == 'move_stop_to_breakeven':
-                    state.current_stop_price = _to_float(action.get('new_stop_price'), default=state.current_stop_price or plan.entry_price)
-                    state.moved_to_breakeven = True
-                    position.update({
-                        'current_stop_price': state.current_stop_price,
-                        'moved_to_breakeven': True,
-                        'last_management_price': current_price,
-                        'last_management_at': _isoformat_utc(_utc_now()),
-                        'monitor_mode': 'okx_simulated_loop',
-                    })
-                    canonical_positions, _ = upsert_position_record(canonical_positions, position, key=position_key)
-                    store.append_event('okx_breakeven_moved', {
-                        'symbol': symbol,
-                        'side': side,
-                        'position_key': position_key,
-                        'new_stop_price': state.current_stop_price,
-                        'profile': getattr(args, 'profile', 'default'),
-                    })
-                    continue
-                close_qty = min(abs(_to_float(action.get('close_qty'))), state.remaining_quantity)
-                if close_qty <= 0:
-                    continue
-                try:
-                    close_result = place_okx_reduce_only_market(okx_client, position, close_qty, args, account_snapshot)
-                except OKXAPIError as exc:
-                    if is_okx_reduce_position_missing_error(exc):
-                        exchange_position_exists = True
-                        try:
-                            exchange_position_exists = okx_position_exists_for_symbol_side(
-                                okx_client,
-                                symbol,
-                                side,
-                                account_snapshot=account_snapshot,
-                            )
-                        except Exception:
-                            exchange_position_exists = True
-                        if not exchange_position_exists:
-                            exit_reason = str(action.get('exit_reason') or ('stop' if action_type == 'stop_exit' else 'exchange_position_missing'))
-                            position.update({
-                                'remaining_quantity': 0.0,
-                                'current_stop_price': _to_float(action.get('new_stop_price'), default=state.current_stop_price or plan.stop_price),
-                                'moved_to_breakeven': state.moved_to_breakeven,
-                                'tp1_hit': state.tp1_hit,
-                                'tp2_hit': state.tp2_hit,
-                                'last_management_price': current_price,
-                                'last_management_at': _isoformat_utc(_utc_now()),
-                                'monitor_mode': 'okx_simulated_loop',
-                                'status': 'closed',
-                                'protection_status': 'flat',
-                                'exit_reason': exit_reason,
-                                'exchange_reconcile_reason': 'okx_position_missing_after_reduce_failure',
-                            })
-                            canonical_positions, _ = upsert_position_record(canonical_positions, position, key=position_key)
-                            event = store.append_event('okx_position_reconciled_closed', {
-                                'symbol': symbol,
-                                'side': side,
-                                'position_key': position_key,
-                                'close_qty': close_qty,
-                                'remaining_quantity': 0.0,
-                                'current_price': current_price,
-                                'exit_reason': exit_reason,
-                                'reconcile_reason': 'okx_position_missing_after_reduce_failure',
-                                'error': str(exc),
-                                'profile': getattr(args, 'profile', 'default'),
-                            })
-                            actions_taken.append(event)
-                            state.remaining_quantity = 0.0
-                            break
-                    raise
-                state.remaining_quantity = round(max(state.remaining_quantity - close_qty, 0.0), 10)
-                if action_type == 'take_profit_1':
-                    state.tp1_hit = True
-                elif action_type == 'take_profit_2':
-                    state.tp2_hit = True
-                exit_reason = str(action.get('exit_reason') or ('stop' if action_type == 'stop_exit' else action_type))
-                position.update({
-                    'remaining_quantity': state.remaining_quantity,
-                    'current_stop_price': _to_float(action.get('new_stop_price'), default=state.current_stop_price or plan.stop_price),
-                    'moved_to_breakeven': state.moved_to_breakeven,
-                    'tp1_hit': state.tp1_hit,
-                    'tp2_hit': state.tp2_hit,
-                    'last_management_price': current_price,
-                    'last_management_at': _isoformat_utc(_utc_now()),
-                    'last_reduce_order_id': close_result.get('order_feedback', {}).get('order_id'),
-                    'monitor_mode': 'okx_simulated_loop',
-                    'status': 'closed' if state.remaining_quantity <= 0 else 'open',
-                    'protection_status': 'flat' if state.remaining_quantity <= 0 else position.get('protection_status', 'simulated'),
-                    'exit_reason': exit_reason if state.remaining_quantity <= 0 else position.get('exit_reason'),
-                })
-                canonical_positions, _ = upsert_position_record(canonical_positions, position, key=position_key)
-                event_type = {
-                    'take_profit_1': 'okx_tp1_hit',
-                    'take_profit_2': 'okx_tp2_hit',
-                    'runner_exit': 'okx_runner_exited',
-                    'stop_exit': 'okx_stop_exited',
-                }.get(action_type, 'okx_position_reduced')
-                event = store.append_event(event_type, {
-                    'symbol': symbol,
-                    'side': side,
-                    'position_key': position_key,
-                    'close_qty': close_qty,
-                    'remaining_quantity': state.remaining_quantity,
-                    'current_price': current_price,
-                    'exit_reason': exit_reason,
-                    'order_id': close_result.get('order_feedback', {}).get('order_id'),
-                    'profile': getattr(args, 'profile', 'default'),
-                })
-                actions_taken.append(event)
-                if state.remaining_quantity <= 0:
-                    break
-        except Exception as exc:
-            error_payload = {
-                'symbol': symbol,
-                'side': side,
-                'position_key': position_key,
-                'message': str(exc),
-                'profile': getattr(args, 'profile', 'default'),
-            }
-            errors.append(error_payload)
-            store.append_event('okx_management_action_failed', error_payload)
-    store.save_json('positions', materialize_positions_state(canonical_positions, include_legacy_alias=True))
-    return {'ok': not errors, 'actions': actions_taken, 'errors': errors, 'tracked_positions': len(iter_canonical_open_positions(canonical_positions))}
-
-
 def compute_relative_oi_features(
     oi_now: Optional[float],
     oi_5m_ago: Optional[float],
@@ -3423,6 +2974,13 @@ def compute_sentiment_resonance_bonus(okx_sentiment_score: float = 0.0, okx_sent
 
 
 def derive_regime_entry_thresholds(side: str, regime_label: str, min_5m_change_pct: float, base_acceleration_ratio: float = 1.25) -> Dict[str, float]:
+    """Apply side-aware market-regime entry gates.
+
+    Base case keeps the caller-provided thresholds. Favorable regime relaxes both
+    the 5m change gate and the acceleration gate for the aligned side. With the
+    default base_acceleration_ratio=1.25, favorable regime lowers the
+    acceleration floor to 1.15, while opposing regime tightens it to 1.45.
+    """
     trade_side = normalize_trade_side(side)
     regime = str(regime_label or 'neutral').strip().lower()
     change_threshold = float(min_5m_change_pct or 0.0)
@@ -5149,7 +4707,6 @@ def apply_candidate_diagnostics(candidate: Candidate) -> Candidate:
 
 def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespace, explicit_square_symbols: Optional[Sequence[str]] = None):
     store = get_runtime_state_store(args)
-    okx_simulated_trading = bool(getattr(args, 'okx_simulated_trading', False))
     base_okx = load_okx_sentiment_map(args)
     auto_okx = load_okx_sentiment_map_auto(args) if getattr(args, 'okx_auto', False) or getattr(args, 'okx_sentiment_command', '') else {}
     okx_map = dict(base_okx)
@@ -5175,35 +4732,6 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     raw_merged_symbol_count = len(merged_symbols)
     okx_unavailable_symbols: List[str] = []
     okx_available_inst_count = 0
-    if okx_simulated_trading:
-        okx_skip_symbols = load_okx_sim_skip_symbols(store)
-        try:
-            okx_filter_client = OKXClient(
-                base_url=getattr(args, 'okx_base_url', 'https://www.okx.com'),
-                simulated_trading=True,
-            )
-            okx_inst_ids = fetch_okx_swap_inst_ids(okx_filter_client)
-            okx_available_inst_count = len(okx_inst_ids)
-            filtered_symbols = []
-            for symbol in merged_symbols:
-                normalized_symbol = normalize_symbol(symbol)
-                if normalized_symbol in okx_skip_symbols:
-                    okx_unavailable_symbols.append(symbol)
-                elif normalize_okx_swap_inst_id(symbol) in okx_inst_ids:
-                    filtered_symbols.append(symbol)
-                else:
-                    okx_unavailable_symbols.append(symbol)
-            merged_symbols = filtered_symbols
-        except Exception as exc:
-            okx_unavailable_symbols = [f'okx_instrument_filter_failed:{exc}']
-            if okx_skip_symbols:
-                filtered_symbols = []
-                for symbol in merged_symbols:
-                    if normalize_symbol(symbol) in okx_skip_symbols:
-                        okx_unavailable_symbols.append(symbol)
-                    else:
-                        filtered_symbols.append(symbol)
-                merged_symbols = filtered_symbols
     ticker_map = {row['symbol']: row for row in tickers}
 
     regime_payload = compute_market_regime_filter(
@@ -5573,8 +5101,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--okx-auto', action='store_true')
     parser.add_argument('--okx-mcp-command', default='')
     parser.add_argument('--okx-sentiment-timeout', type=int, default=20)
-    parser.add_argument('--okx-simulated-trading', action='store_true', help='Execute selected live candidate on OKX simulated trading instead of Binance live trading.')
-    parser.add_argument('--okx-base-url', default=os.getenv('OKX_BASE_URL', 'https://www.okx.com'))
     parser.add_argument('--binance-simulated-trading', action='store_true', help='Use Binance USDT-M Futures Testnet / Mock Trading instead of Binance production futures.')
     parser.add_argument('--external-signal-json', default='')
     parser.add_argument('--use-external-setup-relaxation', action='store_true', help='Let strong external accumulation signals relax early scan gates; live entries still require setup/trigger risk guards.')
@@ -5646,6 +5172,9 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         if not hasattr(args, key):
             setattr(args, key, value)
     profile = getattr(args, 'profile', 'default')
+    valid_profiles = {'default', '10u-aggressive', '10u-active', 'binance-sim-active', 'high_vol_alt_mode'}
+    if profile not in valid_profiles:
+        raise ValueError(f'Unknown profile: {profile}')
     profile_overrides: Dict[str, Any] = {}
     if profile == '10u-aggressive':
         profile_overrides = {
@@ -5709,7 +5238,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
         }
-    elif profile in {'okx-sim-active', 'binance-sim-active', 'high_vol_alt_mode'}:
+    elif profile in {'binance-sim-active', 'high_vol_alt_mode'}:
         profile_overrides = {
             'risk_usdt': 1.0,
             'max_notional_usdt': 300.0,
@@ -5743,9 +5272,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
         }
-        if profile == 'okx-sim-active':
-            profile_overrides['okx_simulated_trading'] = True
-        elif profile == 'binance-sim-active':
+        if profile == 'binance-sim-active':
             profile_overrides.update({
                 'binance_simulated_trading': True,
                 'base_url': 'https://testnet.binancefuture.com',
@@ -6682,7 +6209,6 @@ def append_buy_fill_confirmed_event(store: RuntimeStateStore, symbol: str, posit
 
 def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     store = get_runtime_state_store(args)
-    okx_simulated_trading = bool(getattr(args, 'okx_simulated_trading', False))
     binance_simulated_trading = is_binance_simulated_trading(args)
     execution_exchange = execution_exchange_label(args)
 
@@ -6700,16 +6226,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         except Exception:
             pass
 
-    if okx_simulated_trading:
-        reconcile = {
-            'ok': True,
-            'skipped': True,
-            'skip_reason': 'okx_simulated_trading',
-            'orphan_positions': [],
-            'positions_missing_protection': [],
-            'protection_repairs': [],
-        }
-    elif binance_simulated_trading:
+    if binance_simulated_trading:
         reconcile = {
             'ok': True,
             'skipped': True,
@@ -6791,17 +6308,6 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         })
         persist_cycle_snapshot(cycle)
         return result
-    okx_client_for_management: Optional[OKXClient] = None
-    if okx_simulated_trading:
-        okx_api_key, okx_api_secret, okx_passphrase = resolve_okx_simulated_api_credentials()
-        okx_client_for_management = OKXClient(
-            base_url=getattr(args, 'okx_base_url', 'https://www.okx.com'),
-            api_key=okx_api_key,
-            api_secret=okx_api_secret,
-            passphrase=okx_passphrase,
-            simulated_trading=True,
-        )
-        cycle['okx_position_management'] = manage_okx_simulated_positions(store, args, okx_client_for_management)
     scan_result, best_candidate, meta_map = run_scan_once(client, args)
     cycle['scan'] = scan_result
     if best_candidate is None:
@@ -6840,9 +6346,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''),
         portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''),
     )
-    if getattr(args, 'live', False) and okx_simulated_trading:
-        open_positions = build_local_open_positions_for_risk(store)
-    elif getattr(args, 'live', False) and not binance_simulated_trading:
+    if getattr(args, 'live', False) and not binance_simulated_trading:
         open_positions = fetch_open_positions(client)
     else:
         open_positions = []
@@ -6901,7 +6405,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             'overextension_flag': bool(getattr(best_candidate, 'overextension_flag', False)),
         }
         cycle['triggered_but_risk_rejected'] = [risk_reject_detail] if bool(getattr(best_candidate, 'trigger_fired', False)) or bool(getattr(best_candidate, 'setup_ready', False)) else []
-        probe_entry = evaluate_sim_probe_entry(best_candidate, risk_guard, args) if (okx_simulated_trading or binance_simulated_trading) else {'allowed': False, 'reasons': ['not_simulated_trading']}
+        probe_entry = evaluate_sim_probe_entry(best_candidate, risk_guard, args) if binance_simulated_trading else {'allowed': False, 'reasons': ['not_simulated_trading']}
         cycle['sim_probe_entry'] = probe_entry
         if not bool(probe_entry.get('allowed', False)):
             cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']
@@ -6927,78 +6431,25 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     if meta is None:
         raise ValueError(f'missing symbol meta for {best_candidate.symbol}')
     requested_leverage = int(getattr(args, 'leverage', best_candidate.recommended_leverage) or best_candidate.recommended_leverage)
-    if okx_simulated_trading:
-        okx_client = okx_client_for_management
-        if okx_client is None:
-            okx_api_key, okx_api_secret, okx_passphrase = resolve_okx_simulated_api_credentials()
-            okx_client = OKXClient(
-                base_url=getattr(args, 'okx_base_url', 'https://www.okx.com'),
-                api_key=okx_api_key,
-                api_secret=okx_api_secret,
-                passphrase=okx_passphrase,
-                simulated_trading=True,
-            )
-        try:
-            live_execution = place_okx_simulated_trade(okx_client, best_candidate, requested_leverage, args)
-        except OKXAPIError as exc:
-            if is_non_retryable_okx_symbol_error(exc):
-                skip_symbols = load_okx_sim_skip_symbols(store)
-                skip_symbols.add(normalize_symbol(best_candidate.symbol))
-                save_okx_sim_skip_symbols(store, skip_symbols)
-            cycle['live_execution_error'] = {
-                'exchange': 'OKX',
-                'simulated': True,
-                'symbol': best_candidate.symbol,
-                'side': getattr(best_candidate, 'side', getattr(best_candidate, 'position_side', '')),
-                'error': str(exc),
-                'entry_mode': 'sim_probe' if bool(probe_entry.get('allowed', False)) else 'full',
-            }
-            append_candidate_rejected_event(store, best_candidate, ['okx_execution_preflight_failed'], cycle['live_execution_error'])
-            persist_cycle_snapshot(cycle)
-            return result
-        if bool(probe_entry.get('allowed', False)):
-            live_execution['entry_mode'] = 'sim_probe'
-            live_execution['probe_size_ratio'] = float(probe_entry.get('size_ratio', 0.2) or 0.2)
-    else:
-        try:
-            live_execution = place_live_trade(client, best_candidate, requested_leverage, meta, args)
-        except BinanceAPIError as exc:
-            cycle['live_execution_error'] = {
-                'exchange': 'Binance',
-                'simulated': bool(binance_simulated_trading),
-                'symbol': best_candidate.symbol,
-                'side': getattr(best_candidate, 'side', getattr(best_candidate, 'position_side', '')),
-                'error': str(exc),
-                'entry_mode': 'sim_probe' if bool(probe_entry.get('allowed', False)) else 'full',
-            }
-            append_candidate_rejected_event(store, best_candidate, ['binance_execution_preflight_failed'], cycle['live_execution_error'])
-            persist_cycle_snapshot(cycle)
-            return result
+    try:
+        live_execution = place_live_trade(client, best_candidate, requested_leverage, meta, args)
+    except BinanceAPIError as exc:
+        cycle['live_execution_error'] = {
+            'exchange': 'Binance',
+            'simulated': bool(binance_simulated_trading),
+            'symbol': best_candidate.symbol,
+            'side': getattr(best_candidate, 'side', getattr(best_candidate, 'position_side', '')),
+            'error': str(exc),
+            'entry_mode': 'sim_probe' if bool(probe_entry.get('allowed', False)) else 'full',
+        }
+        append_candidate_rejected_event(store, best_candidate, ['binance_execution_preflight_failed'], cycle['live_execution_error'])
+        persist_cycle_snapshot(cycle)
+        return result
     cycle['live_execution'] = live_execution
     scan_funnel = cycle.get('scan', {}).get('funnel')
     if isinstance(scan_funnel, dict):
         scan_funnel['order_submitted_count'] = 1
     positions_state, position_key = persist_live_open_position(store, best_candidate, live_execution)
-    if okx_simulated_trading:
-        store.append_event('okx_simulated_order_submitted', {
-            'symbol': best_candidate.symbol,
-            'side': live_execution.get('side'),
-            'position_key': position_key,
-            'entry_price': live_execution.get('entry_price'),
-            'quantity': live_execution.get('filled_quantity'),
-            'inst_id': live_execution.get('inst_id'),
-            'order_id': live_execution.get('entry_order_feedback', {}).get('order_id'),
-            'entry_mode': live_execution.get('entry_mode', 'full'),
-            'probe_size_ratio': live_execution.get('probe_size_ratio'),
-            'profile': getattr(args, 'profile', 'default'),
-        })
-        cycle['trade_management'] = {
-            'mode': 'okx_simulated',
-            'status': 'submitted',
-            'message': 'OKX simulated order submitted; Binance live monitor is skipped.',
-        }
-        persist_cycle_snapshot(cycle)
-        return result
     if getattr(args, 'auto_loop', False):
         uds_monitor = run_user_data_stream_monitor_cycle(
             client=client,

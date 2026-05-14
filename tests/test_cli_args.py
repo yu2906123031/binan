@@ -226,6 +226,20 @@ def test_binance_sim_active_profile_uses_exploratory_simulation_thresholds():
     assert args.base_url == 'https://testnet.binancefuture.com'
 
 
+def test_parse_args_rejects_removed_okx_simulated_trading_flags():
+    mod = load_module()
+    with pytest.raises(SystemExit):
+        mod.parse_args(['--okx-simulated-trading'])
+    with pytest.raises(SystemExit):
+        mod.parse_args(['--okx-base-url', 'https://www.okx.com'])
+
+
+def test_apply_runtime_profile_rejects_removed_okx_sim_profile():
+    mod = load_module()
+    with pytest.raises(ValueError, match='Unknown profile'):
+        mod.apply_runtime_profile(mod.parse_args(['--profile', 'okx-sim-active']))
+
+
 def test_high_vol_alt_mode_profile_enables_short_side_scan_and_relaxed_probe_thresholds():
     mod = load_module()
     args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'high_vol_alt_mode']))
@@ -256,7 +270,7 @@ def test_high_vol_alt_mode_profile_enables_short_side_scan_and_relaxed_probe_thr
     assert args.max_funding_rate == 0.0008
     assert args.max_funding_rate_avg == 0.0005
     assert args.binance_simulated_trading is False
-    assert args.okx_simulated_trading is False
+    assert not hasattr(args, 'okx_simulated_trading')
     assert args.base_url == 'https://fapi.binance.com'
 
 
@@ -313,6 +327,44 @@ def test_binance_public_get_retries_transient_timeout(monkeypatch):
 
     assert client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'}) == {'ok': True}
     assert session.calls == 2
+
+
+def test_binance_public_get_retries_transient_http_rate_limit(monkeypatch):
+    mod = load_module()
+    sleeps = []
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: sleeps.append(seconds))
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.calls = 0
+
+        def get(self, url, params=None, timeout=15):
+            self.calls += 1
+            if self.calls == 1:
+                return Response(429, {'code': -1003, 'msg': 'Too many requests; please use websocket.'})
+            return Response(200, {'ok': True})
+
+    session = Session()
+    client = mod.BinanceFuturesClient(
+        'https://example.test',
+        session=session,
+        max_get_retries=2,
+        get_retry_sleep_sec=0.25,
+    )
+
+    assert client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'}) == {'ok': True}
+    assert session.calls == 2
+    assert sleeps == [0.25]
 
 
 def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):

@@ -291,6 +291,7 @@ def test_build_candidate_request_path_preserves_trade_management_plan_fields(mon
     assert captured['max_distance_from_vwap_pct'] == 12.0
     assert captured['max_leverage'] == 5
     assert captured['market_regime']['label'] == 'risk_on'
+    assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
 
 
 def test_finalize_candidate_construction_appends_tail_fields_and_flags():
@@ -371,6 +372,9 @@ def test_finalize_candidate_construction_appends_tail_fields_and_flags():
         trigger_fired=False,
         expected_slippage_pct=0.2672,
         book_depth_fill_ratio=0.8664,
+        liquidity_grade='B',
+        funding_rate_threshold=0.0005,
+        tradeability_score=0.635,
         loser_rank=None,
         trigger_confirmation={
             'flags': {
@@ -1084,21 +1088,87 @@ def test_run_loop_records_rejection_event_when_max_open_positions_blocks_trade(m
     assert rows[-1]['reasons'] == ['max_open_positions_reached']
 
 
-def test_run_auto_loop_user_data_stream_monitor_returns_skipped_payload_for_okx_simulated(monkeypatch, tmp_path):
+def test_run_loop_okx_simulated_reconcile_clears_stale_position_before_max_open_check(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
-    args = argparse.Namespace(okx_simulated_trading=True)
-    fixed_now = datetime.datetime(2026, 5, 10, 12, 0, tzinfo=datetime.timezone.utc)
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 5.0,
+            'remaining_quantity': 5.0,
+            'stop_order_id': 321,
+            'protection_status': 'simulated',
+            'trade_management_plan': {'quantity': 5.0},
+        },
+    })
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        max_open_positions=1,
+        profile='test',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        repair_missing_protection=False,
+    )
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+    )
+    placed = []
 
-    monkeypatch.setattr(mod, '_utc_now', lambda: fixed_now)
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'TESTUSDT'}]}, candidate, {'TESTUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, best_candidate, requested_leverage, meta, passed_args: placed.append((client, best_candidate.symbol, requested_leverage)) or {
+        'symbol': best_candidate.symbol,
+        'side': 'LONG',
+        'filled_quantity': 1.0,
+        'entry_price': 132.0,
+        'entry_order_feedback': {'orderId': 'abc'},
+        'trade_management_plan': {'quantity': 1.0},
+        'stop_order': {},
+        'protection_check': {'status': 'protected'},
+    })
 
-    result = mod.run_auto_loop_user_data_stream_monitor(client=object(), store=store, args=args)
-    saved_state = store.load_json('user_data_stream', {})
+    result = mod.run_loop(client=object(), args=args)
+    positions = store.load_json('positions', {})
 
-    assert result['alert'] is None
-    assert result['monitor']['status'] == 'skipped'
-    assert result['monitor']['exchange'] == 'OKX_SIMULATED'
-    assert result['monitor']['now_utc'] == mod._isoformat_utc(fixed_now)
-    assert saved_state == result['monitor']
+    assert len(placed) == 1
+    assert placed[0][1:] == ('TESTUSDT', 3)
+    assert result['cycles'][0].get('live_skipped_due_to_existing_positions', []) == []
+    assert positions['DOGEUSDT:LONG']['status'] == 'closed'
+    assert positions['TESTUSDT:LONG']['status'] in {'open', 'recovery_pending'}
 
 
 def test_run_auto_loop_user_data_stream_monitor_cycles_existing_listen_key_and_emits_alert(monkeypatch, tmp_path):
@@ -1111,7 +1181,6 @@ def test_run_auto_loop_user_data_stream_monitor_cycles_existing_listen_key_and_e
         }
     })
     args = argparse.Namespace(
-        okx_simulated_trading=False,
         user_stream_refresh_interval_minutes=12.5,
         user_stream_disconnect_timeout_minutes=34.0,
         disable_notify=False,
@@ -1163,7 +1232,7 @@ def test_run_auto_loop_user_data_stream_monitor_cycles_existing_listen_key_and_e
 
 def test_run_auto_loop_user_data_stream_monitor_returns_empty_payload_without_existing_listen_key(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
-    args = argparse.Namespace(okx_simulated_trading=False)
+    args = argparse.Namespace()
 
     result = mod.run_auto_loop_user_data_stream_monitor(client=object(), store=store, args=args)
 
@@ -1247,7 +1316,6 @@ def test_run_auto_loop_book_ticker_websocket_monitor_marks_unavailable_without_w
 
 def test_build_auto_loop_user_data_stream_monitor_config_reads_explicit_fields_only():
     args = argparse.Namespace(
-        okx_simulated_trading=True,
         user_stream_refresh_interval_minutes=12.5,
         user_stream_disconnect_timeout_minutes=34.0,
         unrelated_field='ignored',
@@ -1256,7 +1324,6 @@ def test_build_auto_loop_user_data_stream_monitor_config_reads_explicit_fields_o
     config = mod.build_auto_loop_user_data_stream_monitor_config(args)
 
     assert config == mod.AutoLoopUserDataStreamMonitorConfig(
-        okx_simulated_trading=True,
         refresh_interval_minutes=12.5,
         disconnect_timeout_minutes=34.0,
     )
@@ -1281,7 +1348,6 @@ def test_run_auto_loop_user_data_stream_monitor_uses_explicit_config_without_arg
     monkeypatch.setattr(mod, 'emit_user_data_stream_alert_if_needed', lambda args, symbol, monitor: None)
 
     config = mod.AutoLoopUserDataStreamMonitorConfig(
-        okx_simulated_trading=False,
         refresh_interval_minutes=22.0,
         disconnect_timeout_minutes=44.0,
     )
@@ -1427,7 +1493,6 @@ def test_run_auto_loop_user_data_stream_monitor_core_runs_cycle_persist_and_aler
         args='args',
         existing_uds_state=existing_state,
         config=mod.AutoLoopUserDataStreamMonitorConfig(
-            okx_simulated_trading=False,
             refresh_interval_minutes=22.0,
             disconnect_timeout_minutes=44.0,
         ),
@@ -1456,7 +1521,6 @@ def test_run_auto_loop_user_data_stream_monitor_core_returns_empty_result_withou
         args='args',
         existing_uds_state={'symbol': 'TESTUSDT'},
         config=mod.AutoLoopUserDataStreamMonitorConfig(
-            okx_simulated_trading=False,
             refresh_interval_minutes=22.0,
             disconnect_timeout_minutes=44.0,
         ),
@@ -1470,7 +1534,6 @@ def test_run_auto_loop_user_data_stream_monitor_wrapper_builds_state_and_delegat
     store.save_json('user_data_stream', {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'})
     captured = {}
     config = mod.AutoLoopUserDataStreamMonitorConfig(
-        okx_simulated_trading=False,
         refresh_interval_minutes=22.0,
         disconnect_timeout_minutes=44.0,
     )
@@ -2120,7 +2183,6 @@ def test_run_cycle_auto_loop_builds_book_ticker_config_then_calls_core_helper(mo
     args = argparse.Namespace(auto_loop=True, reconcile_only=False, live=False, scan_only=False)
     expected_book_ticker_config = mod.AutoLoopBookTickerWebsocketMonitorConfig(symbol_provider=lambda: ['BTCUSDT'])
     expected_user_stream_config = mod.AutoLoopUserDataStreamMonitorConfig(
-        okx_simulated_trading=False,
         refresh_interval_minutes=30.0,
         disconnect_timeout_minutes=65.0,
     )
@@ -3146,6 +3208,60 @@ def test_reconcile_runtime_state_reports_closed_tracked_positions(monkeypatch, t
     assert positions['DOGEUSDT:LONG']['status'] == 'closed'
     assert positions['DOGEUSDT:LONG']['remaining_quantity'] == 0.0
     assert positions['DOGEUSDT:LONG']['protection_status'] == 'flat'
+
+
+def test_sync_tracked_positions_with_exchange_clears_recovery_flags_when_position_closes(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT': {
+            'symbol': 'DOGEUSDT',
+            'status': 'monitoring',
+            'quantity': 5.0,
+            'remaining_quantity': 5.0,
+            'stop_order_id': 123,
+            'protection_status': 'protected',
+            'recovery_incomplete': True,
+            'protected_recovery_pending': True,
+            'trade_management_plan': {'quantity': 5.0, 'tp1': 0.12},
+        },
+    })
+
+    mod.sync_tracked_positions_with_exchange(store, exchange_positions=[])
+    positions = store.load_json('positions', {})
+
+    assert positions['DOGEUSDT:LONG']['status'] == 'closed'
+    assert positions['DOGEUSDT:LONG']['recovery_incomplete'] is False
+    assert positions['DOGEUSDT:LONG']['protected_recovery_pending'] is False
+    assert positions['DOGEUSDT:LONG']['trade_management_plan'] == {}
+    assert positions['DOGEUSDT:LONG']['exchange_reconcile_reason'] == 'exchange_position_missing'
+
+
+def test_reconcile_runtime_state_okx_simulated_closes_stale_runtime_positions(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 5.0,
+            'remaining_quantity': 5.0,
+            'stop_order_id': 123,
+            'protection_status': 'simulated',
+            'trade_management_plan': {'quantity': 5.0},
+        },
+    })
+    args = argparse.Namespace()
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+
+    result = mod.reconcile_runtime_state(client=object(), store=store, halt_on_orphan_position=False, args=args)
+    positions = store.load_json('positions', {})
+
+    assert result['closed_tracked_positions'] == ['DOGEUSDT']
+    assert result['position_count'] == 0
+    assert positions['DOGEUSDT:LONG']['status'] == 'closed'
+    assert positions['DOGEUSDT:LONG']['remaining_quantity'] == 0.0
+    assert positions['DOGEUSDT:LONG']['exchange_reconcile_reason'] == 'exchange_position_missing'
 
 
 def test_reconcile_runtime_state_auto_repairs_missing_protection(monkeypatch, tmp_path):

@@ -63,6 +63,7 @@ def finalize_candidate_construction(
     book_depth_fill_ratio: float,
     liquidity_grade: str,
     funding_rate_threshold: float,
+    tradeability_score: float,
     loser_rank: Optional[int],
     trigger_confirmation: Dict[str, Any],
     legacy_kwargs: Dict[str, Any],
@@ -140,6 +141,7 @@ def finalize_candidate_construction(
         trigger_fired=trigger_fired,
         expected_slippage_pct=expected_slippage_pct,
         book_depth_fill_ratio=book_depth_fill_ratio,
+        liquidity_grade=liquidity_grade,
         loser_rank=loser_rank,
         trigger_confirmation_flags=dict(trigger_confirmation['flags']),
         trigger_confirmation_count=int(trigger_confirmation['confirmation_count']),
@@ -234,6 +236,7 @@ def build_candidate(
     clamp,
     classify_alert_tier,
     recommended_position_size_pct,
+    build_trade_management_plan,
     **legacy_kwargs: Any,
 ):
     early_reject_stats = legacy_kwargs.get('early_reject_stats')
@@ -684,6 +687,13 @@ def build_candidate(
             trigger_confirmation['flags']['watch_only_breakout_distance'] = True
     expected_slippage_pct = round(max(entry_distance_from_breakout_pct, 0.0) * 0.35, 4)
     book_depth_fill_ratio = round(clamp(1.0 - (expected_slippage_pct / 2.0), 0.0, 1.0), 4)
+    if book_depth_fill_ratio >= 0.85 and expected_slippage_pct <= 0.2:
+        liquidity_grade = 'A'
+    elif book_depth_fill_ratio >= 0.6 and expected_slippage_pct <= 0.5:
+        liquidity_grade = 'B'
+    else:
+        liquidity_grade = 'C'
+    tradeability_score = round(max(0.0, min((1.0 - max(expected_slippage_pct, 0.0)) * book_depth_fill_ratio, 1.0)), 4)
     initial_alert_tier = classify_alert_tier(score, state_payload['state'], regime_label)
     initial_position_size_pct = recommended_position_size_pct(score, initial_alert_tier, regime_multiplier)
     return finalize_candidate_construction(
@@ -743,6 +753,9 @@ def build_candidate(
         trigger_fired=trigger_fired,
         expected_slippage_pct=expected_slippage_pct,
         book_depth_fill_ratio=book_depth_fill_ratio,
+        liquidity_grade=liquidity_grade,
+        funding_rate_threshold=funding_rate_threshold,
+        tradeability_score=tradeability_score,
         loser_rank=loser_rank,
         trigger_confirmation=trigger_confirmation,
         legacy_kwargs=legacy_kwargs,

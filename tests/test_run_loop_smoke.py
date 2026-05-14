@@ -75,6 +75,42 @@ def make_args(**overrides):
     return SimpleNamespace(**base)
 
 
+def test_run_loop_live_path_uses_binance_only_without_okx_args(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    candidate = SimpleNamespace(symbol='DOGEUSDT', recommended_leverage=3)
+    live_execution = {'symbol': 'DOGEUSDT', 'side': 'LONG', 'quantity': 10.0}
+    persisted_positions = {'DOGEUSDT:LONG': {'symbol': 'DOGEUSDT', 'side': 'LONG'}}
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'candidate_count': 1, 'candidates': ['DOGEUSDT']}, candidate, {'DOGEUSDT': {'symbol': 'DOGEUSDT'}}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'persist_live_open_position', lambda store, candidate, execution: (persisted_positions, 'DOGEUSDT:LONG'))
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda *a, **k: {'status': 'monitored'})
+
+    def fake_place_live_trade(client, picked_candidate, requested_leverage, meta, args):
+        assert picked_candidate.symbol == 'DOGEUSDT'
+        assert requested_leverage == 3
+        assert meta == {'symbol': 'DOGEUSDT'}
+        assert not hasattr(args, 'okx_simulated_trading')
+        assert not hasattr(args, 'okx_base_url')
+        return live_execution
+
+    monkeypatch.setattr(mod, 'place_live_trade', fake_place_live_trade)
+
+    result = mod.run_loop(DummyClient(), make_args(live=True))
+
+    assert result['ok'] is True
+    cycle = result['cycles'][0]
+    assert cycle['live_execution'] == live_execution
+    assert cycle['trade_management'] == {'status': 'monitored'}
+
+
 def test_run_loop_scan_only_returns_before_live_execution(monkeypatch):
     mod = load_module()
     store = DummyStore()
@@ -263,24 +299,6 @@ def test_run_loop_binance_live_submits_without_simulation_flags(monkeypatch, tmp
     assert cycle['live_execution']['exchange'] == 'BINANCE'
     assert cycle['trade_management']['mode'] == 'binance_live'
     assert submitted['trade']['symbol'] == 'APEUSDT'
-
-
-def test_build_okx_reduce_only_order_omits_pos_side_in_net_mode():
-    mod = load_module()
-    position = {'symbol': 'APEUSDT', 'side': 'LONG', 'margin_type': 'ISOLATED'}
-
-    order = mod.build_okx_reduce_only_order(
-        position,
-        quantity=10.0,
-        args=make_args(margin_type='ISOLATED'),
-        instrument={'instId': 'APE-USDT-SWAP', 'ctVal': '0.1', 'lotSz': '1'},
-        account_snapshot={'position_mode': 'net_mode'},
-    )
-
-    assert order['side'] == 'sell'
-    assert order['reduceOnly'] == 'true'
-    assert order['sz'] == '100'
-    assert 'posSide' not in order
 
 
 def test_apply_management_action_executes_stop_exit_without_rearming_stop(monkeypatch):

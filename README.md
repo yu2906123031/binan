@@ -9,7 +9,8 @@
 - `long` 侧偏向向上突破后的延续，`short` 侧偏向向下破位后的延续。
 - 入场判断不只看涨跌幅，还叠加 5m 动量、成交量放大、5m/15m 加速度、1h/4h 趋势、OI、CVD、taker ratio、order book 和 book ticker 微观结构。
 - 可选接入 OKX 情绪、情绪加速度、板块共振和 smart money flow 作为加减分项。
-- BTC 和 SOL 会先做市场环境过滤，环境会影响候选分数、信号等级和建议仓位。
+- BTC 和 SOL 会先做市场环境过滤，环境会影响候选分数、信号等级、建议仓位，以及入场门槛。
+- regime entry gate 当前语义固定如下：顺风方向会把 `min_5m_change_pct` 乘以 `0.75`，并把 `acceleration_ratio` 门槛从默认 `1.25` 放宽到 `1.15`；逆风方向会把 `min_5m_change_pct` 乘以 `1.10`，并把 `acceleration_ratio` 收紧到 `1.45`；`caution` 会把 `min_5m_change_pct` 乘以 `1.05`，并在 `acceleration_ratio` 上额外加 `0.10`。
 - 高风险场景会直接 veto，例如 distribution、负 CVD、OI 反转、过度追价、滑点过高、深度不足、smart money 明显流出。
 
 ## 仓位与出场
