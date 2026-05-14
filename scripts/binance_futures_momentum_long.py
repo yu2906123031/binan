@@ -5639,6 +5639,10 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             tracked['mark_price'] = 0.0
             tracked['stop_order_id'] = None
             tracked['protection_status'] = 'flat'
+            tracked['recovery_incomplete'] = False
+            tracked['protected_recovery_pending'] = False
+            tracked['trade_management_plan'] = {}
+            tracked['exchange_reconcile_reason'] = 'exchange_position_missing'
             if was_openish:
                 closed_symbols.append(report_key)
             normalized_positions[position_key] = tracked
@@ -5730,6 +5734,7 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         'positions_missing_protection': positions_missing_protection,
         'protection_repairs': protection_repairs,
         'exchange_position_count': len(exchange_positions),
+        'position_count': len(exchange_positions),
         'closed_tracked_positions': sync_result.get('closed_symbols', []),
         'refreshed_tracked_positions': sync_result.get('refreshed_symbols', []),
     }
@@ -6034,45 +6039,72 @@ def place_live_trade(client: BinanceFuturesClient, candidate: Candidate, leverag
 
 
 def monitor_live_trade(client: Any, symbol: str, meta: SymbolMeta, args: argparse.Namespace, trade: Dict[str, Any], store: RuntimeStateStore) -> Dict[str, Any]:
-    return execution_monitor_live_trade(
-        client,
-        symbol,
-        meta,
-        args,
-        trade,
-        store,
-        trade_management_plan_type=TradeManagementPlan,
-        trade_management_state_type=TradeManagementState,
-        position_side_long=POSITION_SIDE_LONG,
-        position_side_short=POSITION_SIDE_SHORT,
-        binance_api_error=BinanceAPIError,
-        _to_float=_to_float,
-        normalize_position_side=normalize_position_side,
-        position_side_to_trade_side=position_side_to_trade_side,
-        build_position_key=build_position_key,
-        get_position_by_symbol_side=get_position_by_symbol_side,
-        build_trade_analytics_snapshot=build_trade_analytics_snapshot,
-        upsert_position_record=upsert_position_record,
-        materialize_positions_state=materialize_positions_state,
-        asdict=asdict,
-        log_runtime_event=log_runtime_event,
-        emit_notification=emit_notification,
-        fetch_klines=fetch_klines,
-        extract_closes=extract_closes,
-        extract_highs=extract_highs,
-        extract_lows=extract_lows,
-        resolve_monitor_current_price=resolve_monitor_current_price,
-        evaluate_management_actions=evaluate_management_actions,
-        update_trade_progress_metrics=update_trade_progress_metrics,
-        apply_management_action=apply_management_action,
-        resolve_reduce_order_exit_price=resolve_reduce_order_exit_price,
-        compute_trade_realized_r_increment=compute_trade_realized_r_increment,
-        score_to_decile_label=score_to_decile_label,
-        resolve_trigger_class=resolve_trigger_class,
-        utc_now=_utc_now,
-        isoformat_utc=_isoformat_utc,
-        time_module=time,
-    )
+    try:
+        return execution_monitor_live_trade(
+            client,
+            symbol,
+            meta,
+            args,
+            trade,
+            store,
+            trade_management_plan_type=TradeManagementPlan,
+            trade_management_state_type=TradeManagementState,
+            position_side_long=POSITION_SIDE_LONG,
+            position_side_short=POSITION_SIDE_SHORT,
+            binance_api_error=BinanceAPIError,
+            _to_float=_to_float,
+            normalize_position_side=normalize_position_side,
+            position_side_to_trade_side=position_side_to_trade_side,
+            build_position_key=build_position_key,
+            get_position_by_symbol_side=get_position_by_symbol_side,
+            build_trade_analytics_snapshot=build_trade_analytics_snapshot,
+            upsert_position_record=upsert_position_record,
+            materialize_positions_state=materialize_positions_state,
+            asdict=asdict,
+            log_runtime_event=log_runtime_event,
+            emit_notification=emit_notification,
+            fetch_klines=fetch_klines,
+            extract_closes=extract_closes,
+            extract_highs=extract_highs,
+            extract_lows=extract_lows,
+            resolve_monitor_current_price=resolve_monitor_current_price,
+            evaluate_management_actions=evaluate_management_actions,
+            update_trade_progress_metrics=update_trade_progress_metrics,
+            apply_management_action=apply_management_action,
+            resolve_reduce_order_exit_price=resolve_reduce_order_exit_price,
+            compute_trade_realized_r_increment=compute_trade_realized_r_increment,
+            score_to_decile_label=score_to_decile_label,
+            resolve_trigger_class=resolve_trigger_class,
+            utc_now=_utc_now,
+            isoformat_utc=_isoformat_utc,
+            time_module=time,
+        )
+    except TypeError as exc:
+        if 'TradeManagementPlan.__init__' not in str(exc):
+            raise
+        positions_state = store.load_json('positions', {})
+        if not isinstance(positions_state, dict):
+            positions_state = {}
+        trade_side = normalize_position_side((trade or {}).get('side') or POSITION_SIDE_LONG)
+        position_key, tracked = get_position_by_symbol_side(positions_state, symbol, trade_side)
+        tracked = dict(tracked or {})
+        tracked['symbol'] = symbol
+        tracked['side'] = trade_side
+        tracked['position_key'] = position_key
+        tracked['status'] = 'recovery_pending'
+        tracked['protection_status'] = 'pending'
+        tracked['recovery_incomplete'] = True
+        tracked['protected_recovery_pending'] = False
+        tracked['recovery_reason'] = 'incomplete_trade_management_plan'
+        positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
+        store.save_json('positions', positions_state)
+        return {
+            'ok': False,
+            'status': 'recovery_pending',
+            'reason': 'incomplete_trade_management_plan',
+            'error': str(exc),
+            'symbol': symbol,
+        }
 
 
 def start_trade_monitor_thread(client: Any, symbol: str, meta: SymbolMeta, args: argparse.Namespace, trade: Dict[str, Any], store: RuntimeStateStore) -> threading.Thread:
@@ -6237,12 +6269,23 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         }
     else:
         try:
-            reconcile = reconcile_runtime_state(
-                client,
-                store,
-                halt_on_orphan_position=getattr(args, 'halt_on_orphan_position', False),
-                repair_missing_protection_enabled=getattr(args, 'repair_missing_protection', True),
-            )
+            try:
+                reconcile = reconcile_runtime_state(
+                    client,
+                    store,
+                    halt_on_orphan_position=getattr(args, 'halt_on_orphan_position', False),
+                    repair_missing_protection_enabled=getattr(args, 'repair_missing_protection', True),
+                    args=args,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'args'" not in str(exc):
+                    raise
+                reconcile = reconcile_runtime_state(
+                    client,
+                    store,
+                    halt_on_orphan_position=getattr(args, 'halt_on_orphan_position', False),
+                    repair_missing_protection_enabled=getattr(args, 'repair_missing_protection', True),
+                )
         except BinanceAPIError as exc:
             missing_api_secret = str(exc) == 'api_secret is required for signed requests'
             if missing_api_secret and not getattr(args, 'live', False) and not getattr(args, 'reconcile_only', False):
@@ -6378,6 +6421,13 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     if not getattr(args, 'live', False):
         persist_cycle_snapshot(cycle)
         return result
+    book_ticker_gate = cycle.get('book_ticker_websocket') if isinstance(cycle.get('book_ticker_websocket'), dict) else None
+    if book_ticker_gate and book_ticker_gate.get('status') == 'unavailable':
+        websocket_reason = str(book_ticker_gate.get('reason') or 'unknown')
+        cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_unavailable:{websocket_reason}']
+        append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
+        persist_cycle_snapshot(cycle)
+        return result
     max_open_positions = int(getattr(args, 'max_open_positions', 1) or 1)
     if len(open_positions) >= max_open_positions:
         cycle['live_skipped_due_to_existing_positions'] = open_positions
@@ -6490,7 +6540,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             'user_data_stream': uds_monitor,
         }
     else:
-        cycle['trade_management'] = monitor_live_trade(client=client, symbol=best_candidate.symbol, meta=meta, args=args, trade=live_execution)
+        cycle['trade_management'] = monitor_live_trade(client=client, symbol=best_candidate.symbol, meta=meta, args=args, trade=live_execution, store=store)
     persist_cycle_snapshot(cycle)
     return result
 

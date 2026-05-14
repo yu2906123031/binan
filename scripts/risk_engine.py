@@ -103,10 +103,19 @@ def evaluate_risk_guards(
 
     if candidate is not None:
         state = getattr(candidate, 'state', '')
-        if not bool(getattr(candidate, 'setup_ready', False)):
+        must_pass_flags = getattr(candidate, 'must_pass_flags', None)
+        if not isinstance(must_pass_flags, dict):
+            must_pass_flags = {}
+
+        effective_setup_ready = bool(must_pass_flags.get('setup_ready', getattr(candidate, 'setup_ready', False)))
+        effective_trigger_fired = bool(must_pass_flags.get('trigger_fired', getattr(candidate, 'trigger_fired', False)))
+        effective_probe_entry = bool(must_pass_flags.get('probe_entry', getattr(candidate, 'probe_entry', False)))
+        effective_high_vol_alt_mode = bool(must_pass_flags.get('high_vol_alt_mode', getattr(candidate, 'high_vol_alt_mode', False)))
+
+        if not effective_setup_ready:
             reasons.append('candidate_setup_not_ready')
-        elif not bool(getattr(candidate, 'trigger_fired', False)):
-            if not bool(getattr(candidate, 'probe_entry', False)):
+        elif not effective_trigger_fired:
+            if not effective_probe_entry:
                 reasons.append('candidate_trigger_not_fired')
         execution_slippage_r = compute_expected_slippage_r(candidate)
         spread_bps = _to_float(getattr(candidate, 'spread_bps', 0.0))

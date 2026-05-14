@@ -3435,6 +3435,43 @@ def test_sync_tracked_positions_with_exchange_zeroes_runtime_fields_for_closed_r
     assert tracked['protection_status'] == 'flat'
 
 
+def test_run_loop_forwards_args_into_reconcile_runtime_state(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    captured = {}
+    args = argparse.Namespace(
+        halt_on_orphan_position=False,
+        repair_missing_protection=True,
+        reconcile_only=True,
+        profile='unit-test',
+        live=True,
+        scan_only=False,
+        auto_loop=False,
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'is_binance_simulated_trading', lambda _args: False)
+    monkeypatch.setattr(mod, 'execution_exchange_label', lambda _args: 'binance')
+
+    def fake_reconcile_runtime_state(client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True, args=None):
+        captured['client'] = client
+        captured['store'] = store
+        captured['halt_on_orphan_position'] = halt_on_orphan_position
+        captured['repair_missing_protection_enabled'] = repair_missing_protection_enabled
+        captured['args'] = args
+        return {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
+
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', fake_reconcile_runtime_state)
+
+    result = mod.run_loop(client=object(), args=args)
+
+    assert result['mode'] == 'reconcile_only'
+    assert captured['store'] is store
+    assert captured['halt_on_orphan_position'] is False
+    assert captured['repair_missing_protection_enabled'] is True
+    assert captured['args'] is args
+
+
+
 def test_reconcile_runtime_state_keeps_protected_recovery_pending_without_valid_plan(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     store.save_json('positions', {

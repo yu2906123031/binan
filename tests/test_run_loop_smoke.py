@@ -981,6 +981,60 @@ def test_run_loop_auto_loop_records_book_ticker_unavailable_when_dependency_miss
     assert any(row['event_type'] == 'book_ticker_ws_unavailable' for row in events)
 
 
+def test_run_loop_auto_loop_hard_gates_live_trade_when_book_ticker_websocket_unavailable(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    candidate = mod.Candidate(
+        symbol='DOGEUSDT',
+        last_price=0.12,
+        price_change_pct_24h=8.0,
+        quote_volume_24h=5_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.5,
+        acceleration_ratio_5m_vs_15m=1.2,
+        breakout_level=0.119,
+        recent_swing_low=0.115,
+        stop_price=0.114,
+        quantity=100.0,
+        risk_per_unit=0.006,
+        recommended_leverage=3,
+        rsi_5m=66.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=2.0,
+        distance_from_vwap_15m_pct=1.7,
+        higher_tf_summary={'1h': 'up'},
+        score=70.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False, 'halt_reason': '', 'symbol_cooldowns': {}, 'daily_realized_pnl_usdt': 0.0, 'consecutive_losses': 0})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *args, **kwargs: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'DOGEUSDT'}]}, candidate, {'DOGEUSDT': {'score': candidate.score, 'quote_volume_24h': candidate.quote_volume_24h}}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'websocket', None, raising=False)
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: placed.append(True) or {'symbol': 'DOGEUSDT'})
+
+    result = mod.run_loop(DummyClient(), make_args(auto_loop=True, live=True, runtime_state_dir=str(tmp_path)))
+
+    cycle = result['cycles'][0]
+    assert placed == []
+    assert cycle['book_ticker_websocket'] == {
+        'status': 'unavailable',
+        'reason': 'websocket_client_missing',
+    }
+    assert cycle['live_skipped_due_to_websocket_gate'] == ['book_ticker_websocket_unavailable:websocket_client_missing']
+
+
 def test_run_loop_auto_loop_refreshes_existing_user_data_stream_without_new_trade(monkeypatch, tmp_path):
     mod = load_module()
     store = mod.RuntimeStateStore(str(tmp_path))

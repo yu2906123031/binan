@@ -194,6 +194,33 @@ def test_evaluate_risk_guards_blocks_same_bucket_heat_caps_using_dynamic_thresho
     ]
 
 
+def test_evaluate_risk_guards_uses_must_pass_flags_for_setup_and_trigger_gates():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=True,
+        must_pass_flags={'setup_ready': False, 'trigger_fired': False},
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is False
+    assert payload['reasons'] == ['candidate_setup_not_ready']
+
+
+def test_evaluate_risk_guards_uses_must_pass_flags_probe_entry_override_for_trigger_gate():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=True,
+        probe_entry=False,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': False, 'probe_entry': True},
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+
+
 def test_evaluate_portfolio_risk_guards_blocks_short_count_and_net_exposure_from_fallback_notional():
     candidate = SimpleNamespace(symbol='SUIUSDT', side='SHORT', entry_price=50.0, quantity=2.0)
     open_positions = [
