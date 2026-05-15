@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'scripts' / 'hermes_outer_watcher.py'
 spec = importlib.util.spec_from_file_location('hermes_outer_watcher', MODULE_PATH)
@@ -12,6 +14,16 @@ assert spec.loader is not None
 watcher = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = watcher
 spec.loader.exec_module(watcher)
+
+
+@pytest.fixture
+def isolated_runtime_layout(tmp_path, monkeypatch):
+    canonical_dir = tmp_path / 'canonical-runtime-state'
+    canonical_dir.mkdir()
+    legacy_dir = tmp_path / 'legacy-runtime-state'
+    monkeypatch.setattr(watcher, 'CANONICAL_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(watcher, 'LEGACY_RUNTIME_STATE_DIR', legacy_dir)
+    return canonical_dir, legacy_dir
 
 
 def test_build_command_preserves_forwarded_max_open_positions(tmp_path):
@@ -57,9 +69,8 @@ def test_run_once_passes_timeout_to_subprocess(monkeypatch):
     }
 
 
-def test_main_emits_timeout_event_and_returns_timeout_exit_code(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_main_emits_timeout_event_and_returns_timeout_exit_code(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     runner = tmp_path / 'main.py'
     runner.write_text('')
 
@@ -84,9 +95,8 @@ def test_main_emits_timeout_event_and_returns_timeout_exit_code(tmp_path, monkey
     assert '"timeout_sec": 7.0' in captured.err
 
 
-def test_main_returns_missing_runner_exit_code_without_spawning(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_main_returns_missing_runner_exit_code_without_spawning(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     missing_runner = tmp_path / 'missing_main.py'
     spawned = {'called': False}
 
@@ -110,9 +120,8 @@ def test_main_returns_missing_runner_exit_code_without_spawning(tmp_path, monkey
     assert '"status": "missing_runner"' in captured.err
 
 
-def test_main_returns_interrupted_exit_code_when_runner_is_cancelled(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_main_returns_interrupted_exit_code_when_runner_is_cancelled(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     runner = tmp_path / 'main.py'
     runner.write_text('')
 
@@ -135,9 +144,8 @@ def test_main_returns_interrupted_exit_code_when_runner_is_cancelled(tmp_path, m
     assert '"status": "interrupted"' in captured.err
 
 
-def test_main_emits_state_read_error_for_malformed_positions_json(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_main_emits_state_read_error_for_malformed_positions_json(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     positions_path = runtime_state_dir / 'positions.json'
     positions_path.write_text('{bad json', encoding='utf-8')
     runner = tmp_path / 'main.py'
@@ -163,9 +171,8 @@ def test_main_emits_state_read_error_for_malformed_positions_json(tmp_path, monk
     assert 'positions.json' in captured.err
 
 
-def test_main_emits_events_read_error_for_malformed_events_jsonl(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_main_emits_events_read_error_for_malformed_events_jsonl(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     positions_path = runtime_state_dir / 'positions.json'
     events_path = runtime_state_dir / 'events.jsonl'
     positions_path.write_text(json.dumps({'positions': []}), encoding='utf-8')
@@ -193,9 +200,8 @@ def test_main_emits_events_read_error_for_malformed_events_jsonl(tmp_path, monke
     assert 'events.jsonl' in captured.err
 
 
-def test_watcher_stays_pre_entry_until_reaching_max_open_positions(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_watcher_stays_pre_entry_until_reaching_max_open_positions(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     events_path = runtime_state_dir / 'events.jsonl'
     positions_path = runtime_state_dir / 'positions.json'
     runner = tmp_path / 'main.py'
@@ -275,9 +281,8 @@ def test_watcher_stays_pre_entry_until_reaching_max_open_positions(tmp_path, mon
     assert '"status": "exit_confirmed_and_positions_cleared"' in output
 
 
-def test_watcher_promotes_orphan_positions_to_entry_confirmed_when_target_already_reached(tmp_path, monkeypatch, capsys):
-    runtime_state_dir = tmp_path / 'state'
-    runtime_state_dir.mkdir()
+def test_watcher_promotes_orphan_positions_to_entry_confirmed_when_target_already_reached(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
     events_path = runtime_state_dir / 'events.jsonl'
     positions_path = runtime_state_dir / 'positions.json'
     runner = tmp_path / 'main.py'
@@ -331,3 +336,77 @@ def test_watcher_promotes_orphan_positions_to_entry_confirmed_when_target_alread
     assert '"tracked_positions": 2' in output
     assert '"phase": "post_entry"' in output
     assert '"status": "exit_confirmed_and_positions_cleared"' in output
+
+
+def test_watcher_rejects_legacy_runtime_state_real_directory_before_spawn(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    canonical_dir, legacy_dir = isolated_runtime_layout
+    legacy_dir.mkdir(parents=True)
+    runner = tmp_path / 'main.py'
+    runner.write_text('')
+    spawned = {'called': False}
+
+    monkeypatch.setattr(watcher, 'DEFAULT_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(watcher, 'CANONICAL_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(watcher, 'LEGACY_RUNTIME_STATE_DIR', legacy_dir)
+
+    def fake_run_once(*_args, **_kwargs):
+        spawned['called'] = True
+        raise AssertionError('watcher should fail before spawning runner when legacy runtime-state is a real directory')
+
+    monkeypatch.setattr(watcher, '_run_once', fake_run_once)
+
+    exit_code = watcher.main([
+        '--runner', str(runner),
+        '--runtime-state-dir', str(legacy_dir),
+        '--poll-interval-sec', '0',
+        '--', '--live', '--profile', 'default'
+    ])
+
+    assert exit_code == watcher.EXIT_STATE_READ_ERROR
+    assert spawned['called'] is False
+    captured = capsys.readouterr()
+    assert '"event_type": "watcher_runtime_state_layout_error"' in captured.out
+    assert '"status": "runtime_state_layout_error"' in captured.err
+    assert str(legacy_dir) in captured.out
+    assert str(legacy_dir) in captured.err
+
+
+@pytest.mark.skipif(not hasattr(Path, 'symlink_to'), reason='symlink support required')
+def test_watcher_normalizes_legacy_runtime_state_symlink_before_spawn(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    canonical_dir, legacy_dir = isolated_runtime_layout
+    legacy_dir.symlink_to(canonical_dir, target_is_directory=True)
+    runner = tmp_path / 'main.py'
+    runner.write_text('')
+
+    monkeypatch.setattr(watcher, 'DEFAULT_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(watcher, 'CANONICAL_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(watcher, 'LEGACY_RUNTIME_STATE_DIR', legacy_dir)
+
+    run_calls = []
+
+    class Completed:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = ''
+            self.stderr = ''
+
+    def fake_run_once(cmd, print_command, timeout_sec=0.0):
+        run_calls.append(list(cmd))
+        return Completed()
+
+    monkeypatch.setattr(watcher, '_run_once', fake_run_once)
+
+    exit_code = watcher.main([
+        '--runner', str(runner),
+        '--runtime-state-dir', str(legacy_dir),
+        '--poll-interval-sec', '0',
+        '--max-pre-entry-cycles', '1',
+        '--', '--live', '--profile', 'default'
+    ])
+
+    assert exit_code == 0
+    assert len(run_calls) == 1
+    cmd = run_calls[0]
+    assert cmd[cmd.index('--runtime-state-dir') + 1] == str(canonical_dir)
+    output = capsys.readouterr().out
+    assert f'"runtime_state_dir": "{canonical_dir}"' in output

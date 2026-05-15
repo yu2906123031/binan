@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = ROOT / 'scripts'
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from runtime_store import CANONICAL_RUNTIME_STATE_DIR, LEGACY_RUNTIME_STATE_DIR, validate_runtime_state_layout
+
 DEFAULT_RUNNER = ROOT / 'main.py'
 DEFAULT_RUNTIME_STATE_DIR = Path.home() / '.hermes' / 'binance-futures-momentum-long' / 'runtime-state'
 ENTRY_EVENTS = {'buy_fill_confirmed'}
@@ -170,7 +176,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     strategy_args = _normalize_strategy_args(args.strategy_args)
     runner = Path(args.runner).expanduser().resolve()
-    runtime_state_dir = Path(args.runtime_state_dir).expanduser().resolve()
+    try:
+        runtime_state_dir = validate_runtime_state_layout(
+            args.runtime_state_dir,
+            canonical_dir=CANONICAL_RUNTIME_STATE_DIR,
+            legacy_dir=LEGACY_RUNTIME_STATE_DIR,
+        )
+    except RuntimeError as exc:
+        payload = {
+            'ok': False,
+            'status': 'runtime_state_layout_error',
+            'phase': 'startup',
+            'path': str(Path(args.runtime_state_dir).expanduser()),
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        }
+        _emit('watcher_runtime_state_layout_error', **payload)
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+        return EXIT_STATE_READ_ERROR
+    args.runtime_state_dir = str(runtime_state_dir)
     runtime_state_dir.mkdir(parents=True, exist_ok=True)
     events_path = _events_path(runtime_state_dir)
     positions_path = _positions_path(runtime_state_dir)

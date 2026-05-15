@@ -8,10 +8,50 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+CANONICAL_RUNTIME_STATE_DIR = Path('~/.hermes/binance-futures-momentum-long/runtime-state').expanduser()
+LEGACY_RUNTIME_STATE_DIR = Path('/root/runtime-state')
+
 POSITION_SIDE_LONG = 'LONG'
 POSITION_SIDE_SHORT = 'SHORT'
 TRADE_SIDE_LONG = 'long'
 TRADE_SIDE_SHORT = 'short'
+
+
+def validate_runtime_state_layout(
+    configured_dir: Any,
+    canonical_dir: Path = CANONICAL_RUNTIME_STATE_DIR,
+    legacy_dir: Path = LEGACY_RUNTIME_STATE_DIR,
+) -> Path:
+    canonical_path = Path(canonical_dir).expanduser()
+    canonical_path.mkdir(parents=True, exist_ok=True)
+    if not canonical_path.is_dir():
+        raise RuntimeError(f'canonical runtime-state path is not a directory: {canonical_path}')
+    if not os.access(canonical_path, os.W_OK):
+        raise RuntimeError(f'canonical runtime-state path is not writable: {canonical_path}')
+
+    legacy_path = Path(legacy_dir).expanduser()
+    if legacy_path.is_symlink():
+        try:
+            legacy_resolved = legacy_path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f'legacy runtime-state symlink is broken: {legacy_path}') from exc
+        if legacy_resolved != canonical_path.resolve():
+            raise RuntimeError(
+                f'legacy runtime-state symlink points to {legacy_resolved}, expected {canonical_path}'
+            )
+    elif legacy_path.exists():
+        raise RuntimeError(f'legacy runtime-state path is a real directory or file: {legacy_path}')
+
+    configured_path = Path(configured_dir).expanduser()
+    try:
+        configured_resolved = configured_path.resolve(strict=False)
+    except RuntimeError as exc:
+        raise RuntimeError(f'configured runtime-state path could not be resolved: {configured_path}') from exc
+    if configured_resolved != canonical_path.resolve():
+        raise RuntimeError(
+            f'runtime-state-dir must resolve to canonical path {canonical_path}; got {configured_path}'
+        )
+    return canonical_path
 
 
 RebuildTradeManagementPlan = Callable[[Dict[str, Any], Any], Any]

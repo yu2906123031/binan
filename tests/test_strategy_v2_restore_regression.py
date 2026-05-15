@@ -417,6 +417,104 @@ def test_finalize_candidate_construction_appends_tail_fields_and_flags():
     assert 'position_size_pct=3.3' in candidate.reasons
 
 
+def test_finalize_candidate_construction_writes_probe_entry_into_must_pass_flags():
+    candidate = mod.candidate_builder_mod.finalize_candidate_construction(
+        Candidate=mod.Candidate,
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=12.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=2,
+        funding_rate=-0.0014,
+        funding_rate_avg=-0.0008,
+        recent_5m_change_pct=2.3,
+        acceleration_ratio=1.8,
+        breakout_level=131.0,
+        recent_swing_low=127.0,
+        stop_price=129.5,
+        quantity=1.25,
+        risk_per_unit=2.0,
+        recommended_leverage=4,
+        rsi_5m=68.0,
+        volume_multiple=2.4,
+        distance_from_ema20_5m_pct=1.2,
+        distance_from_vwap_15m_pct=0.8,
+        trend_1h={'allowed': True},
+        trend_4h={'allowed': True},
+        score=187.4,
+        reasons=['probe_entry_flag_sentinel'],
+        trade_side=mod.TRADE_SIDE_LONG,
+        position_side='LONG',
+        higher_timeframe_bias='long',
+        oi_features={
+            'oi_change_pct_5m': 8.0,
+            'oi_change_pct_15m': 15.0,
+            'oi_acceleration_ratio': 1.9,
+            'taker_buy_ratio': 0.62,
+            'oi_zscore_5m': 4.1,
+            'volume_zscore_5m': 3.7,
+            'bollinger_bandwidth_pct': 2.2,
+            'price_above_vwap': True,
+            'funding_rate_percentile_hint': 'low',
+            'cvd_delta': 240000.0,
+            'cvd_zscore': 3.2,
+        },
+        microstructure_inputs={
+            'long_short_ratio': 0.88,
+            'short_bias': 0.78,
+        },
+        atr_stop_distance=1.4,
+        stop_model='atr',
+        stop_distance_pct=1.06,
+        stop_too_tight_flag=False,
+        stop_too_wide_flag=False,
+        state_payload={
+            'state': 'launch',
+            'state_reasons': ['launch_short_squeeze'],
+            'setup_score': 18.5,
+            'exhaustion_score': 1.2,
+        },
+        okx_sentiment_score=0.28,
+        okx_sentiment_acceleration=0.42,
+        sector_resonance_score=0.64,
+        smart_money_effective=0.45,
+        leading_payload={'score': 10.0},
+        squeeze_payload={'score': 14.0},
+        control_risk_payload={'score': 0.0, 'veto': False, 'veto_reason': ''},
+        initial_alert_tier='critical',
+        initial_position_size_pct=3.3,
+        regime_label='risk_on',
+        regime_multiplier=1.1,
+        onchain_smart_money_score=0.25,
+        smart_money_merge={'veto': False, 'veto_reason': '', 'sources': ['exchange_flow']},
+        entry_distance_from_breakout_pct=0.7634,
+        entry_distance_from_vwap_pct=0.8,
+        overextension_flag=False,
+        setup_ready=True,
+        trigger_fired=True,
+        expected_slippage_pct=0.2672,
+        book_depth_fill_ratio=0.8664,
+        liquidity_grade='B',
+        funding_rate_threshold=0.0005,
+        tradeability_score=0.635,
+        loser_rank=None,
+        trigger_confirmation={
+            'flags': {
+                'breakout_close_confirmed': True,
+                'probe_entry': True,
+                'long_crowding_ok': True,
+            },
+            'confirmation_count': 3,
+            'min_confirmations': 2,
+        },
+        legacy_kwargs={'oi_hard_reversal_threshold_pct': 0.8},
+        waiting_breakout=False,
+    )
+
+    assert candidate.must_pass_flags['probe_entry'] is True
+
+
 def test_build_candidate_request_path_preserves_tail_outputs_after_candidate_construction_refactor(monkeypatch):
     sentinel_candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1171,6 +1269,94 @@ def test_run_loop_okx_simulated_reconcile_clears_stale_position_before_max_open_
     assert positions['TESTUSDT:LONG']['status'] in {'open', 'recovery_pending'}
 
 
+def test_evaluate_risk_guards_blocks_candidate_when_expected_edge_fails_total_cost_floor():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        setup_ready=True,
+        trigger_fired=True,
+        book_depth_fill_ratio=0.91,
+        expected_slippage_pct=0.2,
+        tradeability_score=0.71,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': True},
+    )
+    candidate.expected_edge = 0.45
+    candidate.expected_total_fee_pct = 0.18
+    candidate.execution_slippage_buffer_pct = 0.17
+    candidate.min_profit_buffer_pct = 0.15
+
+    result = mod.evaluate_risk_guards(candidate=candidate)
+
+    assert result['allowed'] is False
+    assert 'candidate_edge_after_costs_insufficient' in result['reasons']
+
+
+def test_evaluate_risk_guards_blocks_candidate_when_expected_edge_is_zero_against_positive_cost_floor():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        setup_ready=True,
+        trigger_fired=True,
+        book_depth_fill_ratio=0.91,
+        expected_slippage_pct=0.2,
+        tradeability_score=0.71,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': True},
+    )
+    candidate.expected_edge = 0.0
+    candidate.expected_total_fee_pct = 0.18
+    candidate.execution_slippage_buffer_pct = 0.17
+    candidate.min_profit_buffer_pct = 0.15
+
+    result = mod.evaluate_risk_guards(candidate=candidate)
+
+    assert result['allowed'] is False
+    assert 'candidate_edge_after_costs_insufficient' in result['reasons']
+
+
 def test_run_auto_loop_user_data_stream_monitor_cycles_existing_listen_key_and_emits_alert(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     store.save_json('user_data_stream', {'listen_key': 'lk-1', 'symbol': 'TESTUSDT'})
@@ -1312,6 +1498,138 @@ def test_run_auto_loop_book_ticker_websocket_monitor_marks_unavailable_without_w
         },
         'kwargs': {'key': 'global', 'min_interval_seconds': 3600.0},
     }]
+
+
+def test_run_loop_allows_live_trade_when_book_ticker_ws_unavailable_and_gate_disabled(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        max_open_positions=1,
+        profile='test',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        repair_missing_protection=False,
+        require_book_ticker_ws=False,
+    )
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'TESTUSDT'}]}, candidate, {'TESTUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', lambda client, store, args: {'status': 'unavailable', 'summary': {'status': 'unavailable', 'reason': 'websocket_client_missing'}, 'health': {}})
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, best_candidate, requested_leverage, meta, passed_args: placed.append((best_candidate.symbol, requested_leverage)) or {
+        'symbol': best_candidate.symbol,
+        'side': 'LONG',
+        'filled_quantity': 1.0,
+        'entry_price': 132.0,
+        'entry_order_feedback': {'orderId': 'abc'},
+        'trade_management_plan': {'quantity': 1.0},
+        'stop_order': {},
+        'protection_check': {'status': 'protected'},
+    })
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda **kwargs: {'status': 'closed', 'exit_reason': 'test'})
+
+    result = mod.run_loop(client=object(), args=args)
+
+    assert placed == [('TESTUSDT', 3)]
+    assert result['cycles'][0].get('live_skipped_due_to_websocket_gate', []) == []
+
+
+def test_run_loop_skips_live_trade_when_book_ticker_ws_unavailable_and_gate_required(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        max_open_positions=1,
+        profile='test',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        repair_missing_protection=False,
+        require_book_ticker_ws=True,
+    )
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'TESTUSDT'}]}, candidate, {'TESTUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', lambda client, store, args: {'status': 'unavailable', 'summary': {'status': 'unavailable', 'reason': 'websocket_client_missing'}, 'health': {}})
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: placed.append('called'))
+
+    result = mod.run_loop(client=object(), args=args)
+
+    assert placed == []
+    assert result['cycles'][0]['live_skipped_due_to_websocket_gate'] == ['book_ticker_websocket_unavailable:websocket_client_missing']
 
 
 def test_build_auto_loop_user_data_stream_monitor_config_reads_explicit_fields_only():
@@ -3234,6 +3552,43 @@ def test_sync_tracked_positions_with_exchange_clears_recovery_flags_when_positio
     assert positions['DOGEUSDT:LONG']['protected_recovery_pending'] is False
     assert positions['DOGEUSDT:LONG']['trade_management_plan'] == {}
     assert positions['DOGEUSDT:LONG']['exchange_reconcile_reason'] == 'exchange_position_missing'
+
+
+def test_sync_tracked_positions_with_exchange_clears_orphan_close_fields_when_position_closes(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'status': 'orphan',
+            'monitor_mode': 'background_thread',
+            'quantity': 5.0,
+            'remaining_quantity': 5.0,
+            'exchange_position_amt': 5.0,
+            'notional': 600.0,
+            'unrealized_pnl': 12.0,
+            'mark_price': 0.1234,
+            'stop_order_id': 123,
+            'protection_status': 'missing',
+            'user_data_stream': {'status': 'healthy', 'listen_key': 'lk-1'},
+            'book_ticker_websocket': {'status': 'healthy'},
+            'monitor_thread_name': 'trade-monitor-1',
+            'active_stop_order': {'orderId': 123},
+        },
+    })
+
+    mod.sync_tracked_positions_with_exchange(store, exchange_positions=[])
+    positions = store.load_json('positions', {})
+
+    assert positions['DOGEUSDT:LONG']['status'] == 'closed'
+    assert positions['DOGEUSDT:LONG']['closed_at']
+    assert positions['DOGEUSDT:LONG']['exit_reason'] == 'exchange_position_missing'
+    assert positions['DOGEUSDT:LONG']['monitor_mode'] == 'closed'
+    assert positions['DOGEUSDT:LONG']['user_data_stream'] == {}
+    assert positions['DOGEUSDT:LONG']['book_ticker_websocket'] == {}
+    assert positions['DOGEUSDT:LONG']['monitor_thread_name'] == ''
+    assert positions['DOGEUSDT:LONG']['active_stop_order'] == {}
 
 
 def test_reconcile_runtime_state_okx_simulated_closes_stale_runtime_positions(monkeypatch, tmp_path):

@@ -138,6 +138,18 @@ def evaluate_risk_guards(
         risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
         if execution_slippage_r > risk_slippage_r:
             reasons.append('candidate_execution_slippage_risk')
+        expected_edge = max(_to_float(getattr(candidate, 'expected_edge', 0.0)), 0.0)
+        expected_total_fee_pct = max(_to_float(getattr(candidate, 'expected_total_fee_pct', 0.0)), 0.0)
+        execution_slippage_buffer_pct = max(
+            _to_float(
+                getattr(candidate, 'execution_slippage_buffer_pct', getattr(candidate, 'expected_slippage_pct', 0.0)),
+            ),
+            0.0,
+        )
+        min_profit_buffer_pct = max(_to_float(getattr(candidate, 'min_profit_buffer_pct', 0.0)), 0.0)
+        total_cost_floor_pct = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
+        if total_cost_floor_pct > 0 and expected_edge <= total_cost_floor_pct:
+            reasons.append('candidate_edge_after_costs_insufficient')
         liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
         if execution_liquidity_grade == 'D':
             reasons.append('candidate_execution_liquidity_poor')

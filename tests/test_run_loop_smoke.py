@@ -42,8 +42,13 @@ class DummyStore:
     def __init__(self):
         self.saved = []
         self.events = []
+        self.json_state = {}
+
+    def load_json(self, name, default=None):
+        return self.json_state.get(name, default)
 
     def save_json(self, name, payload):
+        self.json_state[name] = payload
         self.saved.append((name, payload))
 
     def append_event(self, event_type, payload):
@@ -55,7 +60,7 @@ class DummyStore:
 
 def make_args(**overrides):
     base = dict(
-        runtime_state_dir='/tmp/runtime',
+        runtime_state_dir='/root/.hermes/binance-futures-momentum-long/runtime-state',
         halt_on_orphan_position=False,
         live=False,
         reconcile_only=False,
