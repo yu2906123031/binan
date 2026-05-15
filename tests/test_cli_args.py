@@ -196,8 +196,11 @@ def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     assert args.max_open_positions == 3
     assert args.max_long_positions == 3
     assert args.max_short_positions == 3
-    assert args.watch_breakout_tolerance_pct == 0.75
-    assert args.setup_breakout_tolerance_pct == 0.4
+    assert args.watch_breakout_tolerance_pct == 1.0
+    assert args.setup_breakout_tolerance_pct == 0.6
+    assert args.oi_hard_reversal_threshold_pct == 1.0
+    assert args.extended_chase_threshold_pct == 18.0
+    assert args.trigger_min_confirmations == 1
     assert args.max_distance_from_ema_pct == 9.0
     assert args.max_distance_from_vwap_pct == 8.0
 
@@ -497,6 +500,70 @@ def test_recommended_position_size_pct_applies_regime_and_side_multiplier():
     mod = load_module()
     assert abs(mod.recommended_position_size_pct('high', regime_multiplier=0.8, side_multiplier=1.15) - 2.76) < 1e-9
     assert abs(mod.recommended_position_size_pct('blocked', regime_multiplier=1.0, side_multiplier=1.15) - 0.0) < 1e-9
+
+
+def test_main_rejects_legacy_runtime_state_real_directory_before_loading_env_or_credentials(tmp_path, monkeypatch):
+    mod = load_module()
+    canonical_dir = tmp_path / 'canonical-runtime-state'
+    canonical_dir.mkdir(parents=True)
+    legacy_dir = tmp_path / 'runtime-state'
+    legacy_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(mod, 'CANONICAL_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(mod, 'LEGACY_RUNTIME_STATE_DIR', legacy_dir)
+
+    touched = {'load_dotenv': False, 'resolve_credentials': False}
+
+    def fake_load_dotenv(*args, **kwargs):
+        touched['load_dotenv'] = True
+        return {}
+
+    def fake_resolve_credentials(args):
+        touched['resolve_credentials'] = True
+        return ('key', 'secret')
+
+    monkeypatch.setattr(mod, 'load_dotenv', fake_load_dotenv)
+    monkeypatch.setattr(mod, 'resolve_binance_api_credentials', fake_resolve_credentials)
+
+    with pytest.raises(SystemExit, match='legacy runtime-state path is a real directory'):
+        mod.main(['--scan-only'])
+
+    assert touched['load_dotenv'] is False
+    assert touched['resolve_credentials'] is False
+
+
+@pytest.mark.skipif(not hasattr(Path, 'symlink_to'), reason='symlink support required')
+def test_main_normalizes_legacy_runtime_state_symlink_to_canonical(tmp_path, monkeypatch):
+    mod = load_module()
+    canonical_dir = tmp_path / 'canonical-runtime-state'
+    canonical_dir.mkdir(parents=True)
+    legacy_dir = tmp_path / 'runtime-state'
+    legacy_dir.symlink_to(canonical_dir, target_is_directory=True)
+
+    monkeypatch.setattr(mod, 'CANONICAL_RUNTIME_STATE_DIR', canonical_dir)
+    monkeypatch.setattr(mod, 'LEGACY_RUNTIME_STATE_DIR', legacy_dir)
+    monkeypatch.setattr(mod, 'load_dotenv', lambda *args, **kwargs: {})
+    monkeypatch.setattr(mod, 'resolve_binance_api_credentials', lambda args: ('key', 'secret'))
+
+    captured = {}
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            captured['client_init'] = {'args': args, 'kwargs': kwargs}
+
+    monkeypatch.setattr(mod, 'BinanceFuturesClient', DummyClient)
+
+    def fake_run_loop(client, args):
+        captured['runtime_state_dir'] = args.runtime_state_dir
+        return {'ok': True}
+
+    monkeypatch.setattr(mod, 'run_loop', fake_run_loop)
+    monkeypatch.setattr(mod, 'print_scan_output', lambda *args, **kwargs: None)
+
+    exit_code = mod.main(['--runtime-state-dir', str(legacy_dir)])
+
+    assert exit_code == 0
+    assert Path(captured['runtime_state_dir']) == canonical_dir
 
 
 def test_derive_side_risk_multiplier_biases_by_regime_and_side():

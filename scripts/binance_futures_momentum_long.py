@@ -26,7 +26,7 @@ from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
 from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl, load_local_open_positions_for_risk as load_local_open_positions_for_risk_impl, load_runtime_risk_state as load_runtime_risk_state_impl
-from runtime_store import RuntimeStateStore as RuntimeStateStoreImpl, restore_position_lifecycle_fields as restore_position_lifecycle_fields_impl, save_positions_state as save_positions_state_impl
+from runtime_store import CANONICAL_RUNTIME_STATE_DIR, LEGACY_RUNTIME_STATE_DIR, RuntimeStateStore as RuntimeStateStoreImpl, restore_position_lifecycle_fields as restore_position_lifecycle_fields_impl, save_positions_state as save_positions_state_impl, validate_runtime_state_layout
 
 try:
     import websocket
@@ -113,6 +113,11 @@ class BinanceFuturesClient:
                 response = self.session.get(url, params=params or {}, timeout=timeout)
                 self._raise_for_status(response)
                 return response.json()
+            except BinanceAPIError as exc:
+                last_exc = exc
+                if not self._is_retryable_public_get_error(response) or attempt + 1 >= self.max_get_retries:
+                    break
+                time.sleep(self.get_retry_sleep_sec * (2 ** attempt))
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt + 1 >= self.max_get_retries:
@@ -190,6 +195,18 @@ class BinanceFuturesClient:
     def _is_recvwindow_error(exc: BinanceAPIError) -> bool:
         message = str(exc)
         return 'recvWindow' in message or "code': -1021" in message or 'code": -1021' in message
+
+    @staticmethod
+    def _is_retryable_public_get_error(response) -> bool:
+        if int(getattr(response, 'status_code', 0) or 0) == 429:
+            return True
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and str(payload.get('code')) == '-1003':
+            return True
+        return 'Too many requests' in str(payload)
 
     @staticmethod
     def _raise_for_status(response):
@@ -1644,6 +1661,7 @@ REJECT_REASON_LABELS = {
     'oi_reversal_veto': 'open_interest_reversal',
     'execution_slippage_veto': 'execution_slippage',
     'execution_depth_veto': 'execution_depth',
+    'candidate_edge_after_costs_insufficient': 'edge_after_costs_insufficient',
     'extended_chase_veto': 'price_extension_chase',
     'control_risk_veto': 'control_risk',
     'external_signal_veto': 'external_signal_blocked',
@@ -5200,8 +5218,11 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_rsi_5m': 84.0,
             'min_volume_multiple': 0.8,
             'min_5m_change_pct': 0.35,
-            'watch_breakout_tolerance_pct': 0.75,
-            'setup_breakout_tolerance_pct': 0.4,
+            'watch_breakout_tolerance_pct': 1.0,
+            'setup_breakout_tolerance_pct': 0.6,
+            'oi_hard_reversal_threshold_pct': 1.0,
+            'extended_chase_threshold_pct': 18.0,
+            'trigger_min_confirmations': 1,
             'max_distance_from_ema_pct': 9.0,
             'max_distance_from_vwap_pct': 8.0,
             'max_funding_rate': 0.0008,
@@ -5642,7 +5663,14 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             tracked['recovery_incomplete'] = False
             tracked['protected_recovery_pending'] = False
             tracked['trade_management_plan'] = {}
+            tracked['monitor_mode'] = 'closed'
+            tracked['user_data_stream'] = {}
+            tracked['book_ticker_websocket'] = {}
+            tracked['monitor_thread_name'] = ''
+            tracked['active_stop_order'] = {}
             tracked['exchange_reconcile_reason'] = 'exchange_position_missing'
+            tracked['closed_at'] = str(tracked.get('closed_at') or _isoformat_utc(_utc_now()))
+            tracked['exit_reason'] = str(tracked.get('exit_reason') or 'exchange_position_missing')
             if was_openish:
                 closed_symbols.append(report_key)
             normalized_positions[position_key] = tracked
@@ -5834,6 +5862,7 @@ SIM_PROBE_HARD_RISK_REASONS = {
     'candidate_cvd_divergence',
     'candidate_oi_reversal',
     'candidate_execution_slippage_risk',
+    'candidate_edge_after_costs_insufficient',
     'candidate_execution_liquidity_poor',
     'strategy_halted',
     'daily_max_loss_reached',
@@ -6421,6 +6450,16 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     if not getattr(args, 'live', False):
         persist_cycle_snapshot(cycle)
         return result
+    websocket_gate_required = bool(getattr(args, 'require_book_ticker_ws', True))
+    if websocket_gate_required and not isinstance(cycle.get('book_ticker_websocket'), dict):
+        book_ticker_result = run_auto_loop_book_ticker_websocket_monitor(
+            client=client,
+            store=store,
+            args=args,
+        )
+        cycle['book_ticker_websocket'] = dict(book_ticker_result.get('summary', {}), health=book_ticker_result.get('health', {}))
+        if cycle['book_ticker_websocket'].get('status') == 'unavailable' and not cycle['book_ticker_websocket'].get('health'):
+            cycle['book_ticker_websocket'].pop('health', None)
     book_ticker_gate = cycle.get('book_ticker_websocket') if isinstance(cycle.get('book_ticker_websocket'), dict) else None
     if book_ticker_gate and book_ticker_gate.get('status') == 'unavailable':
         websocket_reason = str(book_ticker_gate.get('reason') or 'unknown')
@@ -6477,6 +6516,17 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         if isinstance(scan_funnel, dict):
             scan_funnel['selected_risk_allowed_count'] = 1
             scan_funnel['probe_entry_allowed_count'] = 1
+    websocket_gate_required = bool(getattr(args, 'require_book_ticker_ws', True))
+    websocket_health = cycle.get('book_ticker_websocket', {})
+    websocket_summary = websocket_health.get('summary', {}) if isinstance(websocket_health, dict) else {}
+    websocket_status = str(websocket_summary.get('status') or '').lower()
+    websocket_reason = str(websocket_summary.get('reason') or 'unknown')
+    if websocket_gate_required and websocket_status == 'unavailable':
+        cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_unavailable:{websocket_reason}']
+        append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
+        append_missed_trade_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
+        persist_cycle_snapshot(cycle)
+        return result
     meta = meta_map.get(best_candidate.symbol)
     if meta is None:
         raise ValueError(f'missing symbol meta for {best_candidate.symbol}')
@@ -6553,8 +6603,29 @@ def print_scan_output(result: Dict[str, Any], output_format: str) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    try:
+        args.runtime_state_dir = str(
+            validate_runtime_state_layout(
+                getattr(args, 'runtime_state_dir', CANONICAL_RUNTIME_STATE_DIR),
+                canonical_dir=CANONICAL_RUNTIME_STATE_DIR,
+                legacy_dir=LEGACY_RUNTIME_STATE_DIR,
+            )
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     load_dotenv()
-    args = apply_runtime_profile(parse_args(argv))
+    args = apply_runtime_profile(args)
+    try:
+        args.runtime_state_dir = str(
+            validate_runtime_state_layout(
+                getattr(args, 'runtime_state_dir', CANONICAL_RUNTIME_STATE_DIR),
+                canonical_dir=CANONICAL_RUNTIME_STATE_DIR,
+                legacy_dir=LEGACY_RUNTIME_STATE_DIR,
+            )
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     if is_binance_simulated_trading(args) and 'base_url' not in set(getattr(args, '_explicit_cli_dests', set()) or set()):
         args.base_url = 'https://testnet.binancefuture.com'
     binance_api_key, binance_api_secret = resolve_binance_api_credentials(args)

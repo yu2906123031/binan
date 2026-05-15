@@ -29,6 +29,7 @@
   - `pytest -q tests/test_risk_engine_unit.py tests/test_portfolio_risk_guards.py tests/test_strategy_v2.py tests/test_hermes_outer_watcher.py tests/test_cli_args.py tests/test_run_loop_smoke.py tests/test_scan_summary_mode_regression.py` → `146 passed in 1.34s`
   - `pytest -q tests/test_strategy_v2_restore_regression.py tests/test_run_loop_smoke.py` → `111 passed`
   - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py` → `82 passed in 0.37s`
+  - `pytest -q /root/binan/tests/test_hermes_outer_watcher.py` → `12 passed in 0.08s`
   - `pytest -q tests/test_execution_module_regression.py tests/test_strategy_v2_restore_regression.py -k "build_candidate_wrapper or smart_money_veto or malformed_positions_json or malformed_risk_state_json or build_trade_management_plan_from_position or reconcile_runtime_state"` → `15 passed, 67 deselected in 0.19s`
   - `python -m pip check` 通过
   - `python -m compileall -q scripts main.py tests` 通过
@@ -41,6 +42,84 @@
 ---
 
 ## 已完成升级记录
+
+### 2026-05-15｜修复 Binance public GET 在 429/-1003 下未重试的回归
+- 状态：已完成
+- 范围：定位 `BinanceFuturesClient.get(...)` 在公共 GET 路径收到 HTTP 429 / Binance `-1003` 限频响应时直接抛错、未进入既有重试退避逻辑的问题，并补齐 focused regression
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_cli_args.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 根因确认：`get(...)` 只捕获 `requests.RequestException`，而 `_raise_for_status(...)` 对 429 响应抛出的是 `BinanceAPIError`，导致 public GET 的限频场景提前中断
+  - 保留既有失败回归 `test_binance_public_get_retries_transient_http_rate_limit` 作为 RED 证明，先复现 429 首次响应会直接失败
+  - 在 `get(...)` 中新增 `BinanceAPIError` 分支，复用原有指数退避逻辑处理可重试的 public GET 限频错误
+  - 新增 `_is_retryable_public_get_error(...)`，把 HTTP 429、payload `code=-1003`、`Too many requests` 文案统一识别为可重试限频信号
+- 验证：
+  - `pytest -q /root/binan/tests/test_cli_args.py -k 'binance_public_get_retries_transient_http_rate_limit' -vv` → `1 passed, 19 deselected in 0.22s`
+  - `pytest -q /root/binan/tests/test_cli_args.py -k 'binance_public_get_retries_transient_http_rate_limit or runtime_state_real_directory_before_loading_env_or_credentials or normalizes_legacy_runtime_state_symlink_to_canonical'` → `3 passed, 17 deselected in 0.27s`
+  - `pytest -q /root/binan/tests/test_cli_args.py` → `20 passed in 0.43s`
+  - `pytest -q /root/binan/tests/test_hermes_outer_watcher.py /root/binan/tests/test_cli_args.py /root/binan/tests/test_run_loop_smoke.py` → `78 passed in 26.50s`
+- 遗留风险：
+  - 当前 public GET retry contract 仍以通用 `BinanceAPIError` + 响应内容判断可重试类型，后续若 Binance 返回新的限频 payload 形态，适合补更多对称回归
+  - signed 请求路径当前只对 `recvWindow` 漂移做自动恢复，后续若要扩展 signed 限频退避，适合单独定义更精细的幂等与重试边界
+- 对应待办编号：
+  - g1
+  - g2
+  - g3
+  - g4
+  - g5
+
+### 2026-05-15｜前置 strategy 入口 runtime-state 自检，先阻断错误布局再加载环境
+- 状态：已完成
+- 范围：把 `scripts/binance_futures_momentum_long.py` 的 runtime-state 布局校验前移到启动最前段，固定 legacy 实目录场景下先阻断、再停止，避免在错误布局上继续加载 `.env` 或进入凭证解析
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_cli_args.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `test_main_rejects_legacy_runtime_state_real_directory_before_loading_env_or_credentials`，先固定错误布局时 `load_dotenv()` 与 `resolve_binance_api_credentials()` 都不应被触发
+  - 复现失败形态：策略入口原先会先执行 `load_dotenv()`，再做 runtime-state 布局校验，启动前自检位置偏后
+  - 调整 `main(...)` 启动顺序：先 `parse_args(...)`，立即校验并规范 `runtime_state_dir`，随后再加载 `.env`、应用 runtime profile，并保留二次校验兜底
+  - 保持 legacy symlink 归一化路径继续通过，确保兼容入口仍会收敛到 canonical runtime-state
+- 验证：
+  - `pytest -q /root/binan/tests/test_cli_args.py -k 'runtime_state_real_directory_before_loading_env_or_credentials or normalizes_legacy_runtime_state_symlink_to_canonical'` → `2 passed, 18 deselected in 0.22s`
+  - `pytest -q /root/binan/tests/test_hermes_outer_watcher.py` → `12 passed in 0.08s`
+  - `pytest -q /root/binan/tests/test_cli_args.py` → 当前仍有既有失败：`test_binance_public_get_retries_transient_http_rate_limit`
+  - `pytest -q /root/binan/tests/test_hermes_outer_watcher.py /root/binan/tests/test_cli_args.py /root/binan/tests/test_run_loop_smoke.py` → 当前仍被同一既有失败阻塞
+- 遗留风险：
+  - `tests/test_cli_args.py::test_binance_public_get_retries_transient_http_rate_limit` 当前与本轮改动无关，仍在 focused 回归里失败，后续适合单独排查 `BinanceFuturesClient.get(...)` 的 429 retry contract
+  - strategy 入口已具备前置自检，后续适合继续把同一 contract 扩到 live 启动包装器或 supervisor 启动脚本，形成更完整的开机自检链路
+- 对应待办编号：
+  - s1
+  - s2
+  - s3
+  - s4
+
+### 2026-05-14｜修复 protected recovery 丢失 args 导致 Binance 持仓卡死
+- 状态：已完成
+- 范围：定位 `run_loop(...)` 到 `reconcile_runtime_state(...)` 的参数传递缺口，修复 protected recovery 无法重建 `trade_management_plan`、仓位长期停留在 `protected_recovery_pending` 的实盘恢复故障
+- 修改文件：
+  - `scripts/binance_futures_momentum_long.py`
+  - `tests/test_strategy_v2_restore_regression.py`
+  - `/root/binan/.hermes/plans/2026-05-09_100258-binance-refactor-tracker.md`
+- 完成内容：
+  - 新增 `test_run_loop_forwards_args_into_reconcile_runtime_state`，先固定 `run_loop(...)` 在 `reconcile_only` 路径里必须把原始 `args` 传给 `reconcile_runtime_state(...)`
+  - 确认回归失败形态：未透传 `args` 时，`reconcile_runtime_state(...)` 收到 `args=None`，protected recovery 无法读取 TP / breakeven 参数，恢复路径停在 `missing_valid_stop_distance`
+  - 修复 `run_loop(...)` 调用点，补上 `args=args`，让 `recover_protected_position_trade_management_plan(...)` 能基于运行参数重建 `trade_management_plan`
+  - 保持已有 protected recovery focused regression 继续通过，锁定 SHORT 仓位恢复 contract
+- 验证：
+  - `pytest -q /root/binan/tests/test_strategy_v2_restore_regression.py -k 'run_loop_forwards_args_into_reconcile_runtime_state'` → `1 passed, 128 deselected in 0.21s`
+  - `pytest -q /root/binan/tests/test_strategy_v2_restore_regression.py -k 'reconcile_runtime_state_rebuilds_plan_for_protected_recovered_short or run_loop_forwards_args_into_reconcile_runtime_state'` → `2 passed, 127 deselected in 0.14s`
+  - `pytest -q /root/binan/tests/test_strategy_v2_restore_regression.py` → `129 passed in 0.41s`
+  - `python -m compileall -q /root/binan/scripts/binance_futures_momentum_long.py /root/binan/tests/test_strategy_v2_restore_regression.py` → 通过
+- 遗留风险：
+  - 线上 `LABUSDT:SHORT` 运行态文件当前仍保留旧的 `protected_recovery_pending` 标记，需要重启 supervisor/策略进程让修复后的 reconcile 重新执行一次恢复链路
+  - 当前回归覆盖 `reconcile_only` 调用链；后续适合补一条贴近 live auto-loop 的端到端恢复回归，固定 supervisor 拉起后的恢复表现
+- 对应待办编号：
+  - t1
+  - t2
+  - t3
 
 ### 2026-05-11｜补齐 OKX simulated 对 absolute profit targets 的契约回归
 - 状态：已完成
