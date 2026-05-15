@@ -1,0 +1,179 @@
+{
+  "generated_at": "2026-05-15T03:40:12.285201+00:00",
+  "source_file": "/root/.hermes/binance-futures-momentum-long/runtime-state/events.jsonl",
+  "cutoff_utc": "2026-05-08T03:40:08.775985+00:00",
+  "raw_event_count": 38,
+  "distinct_positions": 9,
+  "by_event_type": {
+    "buy_fill_confirmed": 12,
+    "entry_filled": 12,
+    "protection_confirmed": 12,
+    "breakeven_moved": 2
+  },
+  "positions": [
+    {
+      "position_key": "LABUSDT:SHORT",
+      "symbol": "LABUSDT",
+      "side": "SHORT",
+      "first_event_at": "2026-05-08T15:44:46.664332Z",
+      "last_event_at": "2026-05-14T03:45:11.299480Z",
+      "event_count": 9,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed",
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed",
+        "entry_filled",
+        "buy_fill_confirmed",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "VVVUSDT:LONG",
+      "symbol": "VVVUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-09T15:32:08.424324Z",
+      "last_event_at": "2026-05-09T15:36:40.148374Z",
+      "event_count": 4,
+      "event_types": [
+        "entry_filled",
+        "protection_confirmed",
+        "buy_fill_confirmed",
+        "breakeven_moved"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": true,
+      "has_close_event": false
+    },
+    {
+      "position_key": "ZECUSDT:SHORT",
+      "symbol": "ZECUSDT",
+      "side": "SHORT",
+      "first_event_at": "2026-05-11T03:17:47.542048Z",
+      "last_event_at": "2026-05-11T03:17:47.544472Z",
+      "event_count": 3,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "BNBUSDT:LONG",
+      "symbol": "BNBUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-12T03:02:16.596649Z",
+      "last_event_at": "2026-05-12T04:20:22.908300Z",
+      "event_count": 6,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed",
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "BNBUSDT:SHORT",
+      "symbol": "BNBUSDT",
+      "side": "SHORT",
+      "first_event_at": "2026-05-12T03:48:42.768393Z",
+      "last_event_at": "2026-05-12T03:48:42.779551Z",
+      "event_count": 3,
+      "event_types": [
+        "entry_filled",
+        "buy_fill_confirmed",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "SKYAIUSDT:LONG",
+      "symbol": "SKYAIUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-12T14:43:49.243986Z",
+      "last_event_at": "2026-05-12T14:43:49.249816Z",
+      "event_count": 3,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "LABUSDT:LONG",
+      "symbol": "LABUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-13T08:46:35.460513Z",
+      "last_event_at": "2026-05-13T08:50:07.012900Z",
+      "event_count": 4,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed",
+        "breakeven_moved"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": true,
+      "has_close_event": false
+    },
+    {
+      "position_key": "RIVERUSDT:LONG",
+      "symbol": "RIVERUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-13T10:27:01.946779Z",
+      "last_event_at": "2026-05-13T10:27:01.950124Z",
+      "event_count": 3,
+      "event_types": [
+        "entry_filled",
+        "buy_fill_confirmed",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    },
+    {
+      "position_key": "QNTUSDT:LONG",
+      "symbol": "QNTUSDT",
+      "side": "LONG",
+      "first_event_at": "2026-05-14T12:30:06.810768Z",
+      "last_event_at": "2026-05-14T12:30:06.822077Z",
+      "event_count": 3,
+      "event_types": [
+        "buy_fill_confirmed",
+        "entry_filled",
+        "protection_confirmed"
+      ],
+      "has_entry_filled": true,
+      "has_buy_fill_confirmed": true,
+      "has_breakeven_moved": false,
+      "has_close_event": false
+    }
+  ]
+}
