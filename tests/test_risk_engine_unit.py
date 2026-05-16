@@ -295,3 +295,55 @@ def test_evaluate_portfolio_risk_guards_prefers_candidate_position_side_for_shor
     assert payload['allowed'] is False
     assert payload['reasons'] == ['max_short_positions_reached']
     assert payload['snapshot']['candidate_side'] == POSITION_SIDE_SHORT
+
+
+
+def test_evaluate_risk_guards_blocks_daily_symbol_trade_limit():
+    candidate = make_candidate(
+        expected_edge=1.0,
+        expected_total_fee_pct=0.02,
+        execution_slippage_buffer_pct=0.02,
+        min_profit_buffer_pct=0.02,
+    )
+    risk_state = default_risk_state()
+    risk_state['daily_symbol_trade_counts'] = {'DOGEUSDT': 3}
+
+    payload = evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        risk_state=risk_state,
+        candidate=candidate,
+        daily_symbol_trade_limit=3,
+    )
+
+    assert payload['allowed'] is False
+    assert 'daily_symbol_trade_limit_reached' in payload['reasons']
+
+
+
+def test_evaluate_risk_guards_blocks_aggressive_flip_reentry_inside_cooldown_window():
+    candidate = make_candidate(
+        side='SHORT',
+        expected_edge=1.0,
+        expected_total_fee_pct=0.02,
+        execution_slippage_buffer_pct=0.02,
+        min_profit_buffer_pct=0.02,
+    )
+    risk_state = default_risk_state()
+    risk_state['recent_closed_trades'] = [
+        {
+            'symbol': 'DOGEUSDT',
+            'position_side': 'LONG',
+            'closed_at': 1_710_000_000,
+        }
+    ]
+
+    payload = evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        risk_state=risk_state,
+        candidate=candidate,
+        now_ts=1_710_000_000 + 60,
+        aggressive_flip_cooldown_minutes=5,
+    )
+
+    assert payload['allowed'] is False
+    assert 'aggressive_flip_cooldown_active' in payload['reasons']

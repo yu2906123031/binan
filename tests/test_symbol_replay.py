@@ -189,3 +189,117 @@ def test_run_filters_symbol_side_and_writes_report_files(tmp_path):
     assert '# Symbol Replay Report' in markdown
     assert 'DOGEUSDT:SHORT' in markdown
     assert 'DOGEUSDT:LONG' not in markdown
+
+
+def test_build_symbol_replay_payload_separates_same_symbol_side_sessions_by_position_instance_id():
+    rows = [
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-01T01:00:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'doge-long-001',
+            'entry_price': 0.152,
+            'stop_price': 0.149,
+            'quantity': 1000.0,
+            'filled_quantity': 1000.0,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-05-01T01:03:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'doge-long-001',
+            'exit_reason': 'time_stop',
+        },
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-01T01:10:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'doge-long-002',
+            'entry_price': 0.153,
+            'stop_price': 0.15,
+            'quantity': 1200.0,
+            'filled_quantity': 1200.0,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-05-01T01:14:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'doge-long-002',
+            'exit_reason': 'tp1',
+        },
+    ]
+
+    payload = mod.build_symbol_replay_payload(rows, symbol='DOGEUSDT', side='LONG')
+
+    assert payload['summary']['session_count'] == 2
+    assert payload['summary']['closed_count'] == 2
+    assert [session['position_instance_id'] for session in payload['sessions']] == ['doge-long-001', 'doge-long-002']
+    assert [session['exit_reason'] for session in payload['sessions']] == ['time_stop', 'tp1']
+
+
+def test_build_symbol_replay_payload_preserves_close_event_details_for_recent_trade_analysis():
+    rows = [
+        {
+            'event_type': 'candidate_selected',
+            'recorded_at': '2026-05-02T02:00:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'SHORT',
+            'position_key': 'DOGEUSDT:SHORT',
+            'position_instance_id': 'doge-short-003',
+            'score': 88.2,
+        },
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-02T02:00:05+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'SHORT',
+            'position_key': 'DOGEUSDT:SHORT',
+            'position_instance_id': 'doge-short-003',
+            'entry_price': 0.151,
+            'stop_price': 0.154,
+            'quantity': 800.0,
+            'filled_quantity': 800.0,
+        },
+        {
+            'event_type': 'runner_exited',
+            'recorded_at': '2026-05-02T02:06:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'SHORT',
+            'position_key': 'DOGEUSDT:SHORT',
+            'position_instance_id': 'doge-short-003',
+            'close_qty': 800.0,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-05-02T02:06:01+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'SHORT',
+            'position_key': 'DOGEUSDT:SHORT',
+            'position_instance_id': 'doge-short-003',
+            'exit_reason': 'runner',
+            'close_event_type': 'runner_exited',
+            'close_order_id': 778899,
+            'closed_quantity': 800.0,
+            'realized_pnl': 12.75,
+        },
+    ]
+
+    payload = mod.build_symbol_replay_payload(rows, symbol='DOGEUSDT', side='SHORT')
+
+    assert payload['summary']['closed_count'] == 1
+    assert payload['by_exit_reason'] == [{'exit_reason': 'runner', 'count': 1}]
+    session = payload['sessions'][0]
+    assert session['position_instance_id'] == 'doge-short-003'
+    assert session['close_event_type'] == 'runner_exited'
+    assert session['close_order_id'] == 778899
+    assert session['closed_quantity'] == 800.0
+    assert session['realized_pnl'] == 12.75
+    assert session['closed_at'] == '2026-05-02T02:06:01+00:00'

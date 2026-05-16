@@ -105,6 +105,18 @@ python scripts\rejected_analysis.py --help
 python scripts\trade_bucket_analysis.py --runtime-state-dir runtime-state --lookback-days 7
 ```
 
+生成最近 7 天交易诊断打包产物：
+
+```powershell
+python scripts\recent_trade_diagnostics.py --runtime-state-dir runtime-state --lookback-days 7
+```
+
+micro-scalp 模式可配合时间止盈收口：
+
+```powershell
+python main.py --micro-scalp-mode --micro-scalp-time-stop-sec 300 --micro-scalp-min-profit-r 0.3
+```
+
 按单币种回放 runtime 事件链路：
 
 ```powershell

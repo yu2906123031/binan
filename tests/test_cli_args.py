@@ -119,6 +119,76 @@ def test_parse_args_accepts_supervisor_live_flags():
     assert args.notify_target == 'telegram:-5125444265,weixin:chatid'
 
 
+def test_parse_notification_target_accepts_bare_weixin_home_channel(monkeypatch):
+    mod = load_module()
+    monkeypatch.setenv('WEIXIN_HOME_CHANNEL', 'wx-home-chat')
+
+    parsed = mod.parse_notification_target('weixin')
+
+    assert parsed == {'platform': 'weixin', 'chat_id': 'wx-home-chat', 'thread_id': None}
+
+
+def test_parse_notification_target_accepts_bare_telegram_home_channel(monkeypatch):
+    mod = load_module()
+    monkeypatch.setenv('TELEGRAM_HOME_CHANNEL', '-1001234567890')
+
+    parsed = mod.parse_notification_target('telegram')
+
+    assert parsed == {'platform': 'telegram', 'chat_id': '-1001234567890', 'thread_id': None}
+
+
+def test_emit_notification_captures_weixin_delivery_errors(monkeypatch):
+    mod = load_module()
+    args = mod.parse_args(['--notify-target', 'weixin:wx-home-chat'])
+    monkeypatch.setattr(mod, 'send_weixin_notification', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('weixin adapter unavailable')))
+
+    result = mod.emit_notification(args, 'entry_filled', {'symbol': 'IOUSDT'})
+
+    assert result['ok'] is False
+    assert result['platform'] == 'weixin'
+    assert 'weixin adapter unavailable' in result['error']
+    assert result['event_type'] == 'entry_filled'
+
+
+def test_send_weixin_notification_uses_gateway_direct_helper(monkeypatch):
+    mod = load_module()
+    calls = []
+
+    def fake_asyncio_run(coro):
+        try:
+            coro.send(None)
+        except StopIteration as stop:
+            return stop.value
+        raise AssertionError('coroutine did not finish synchronously')
+
+    async def fake_send_weixin_direct(*, extra, token, chat_id, message, media_files=None):
+        calls.append({
+            'extra': extra,
+            'token': token,
+            'chat_id': chat_id,
+            'message': message,
+            'media_files': media_files,
+        })
+        return {'success': True, 'message_id': 'wx-msg-1'}
+
+    monkeypatch.setattr(mod.asyncio, 'run', fake_asyncio_run)
+    monkeypatch.setitem(sys.modules, 'gateway.platforms.weixin', type('FakeWeixinModule', (), {
+        'check_weixin_requirements': staticmethod(lambda: True),
+        'send_weixin_direct': staticmethod(fake_send_weixin_direct),
+    }))
+
+    result = mod.send_weixin_notification('wx-home-chat', 'hello hermes')
+
+    assert result == {'ok': True, 'platform': 'weixin', 'message_id': 'wx-msg-1'}
+    assert calls == [{
+        'extra': {},
+        'token': '',
+        'chat_id': 'wx-home-chat',
+        'message': 'hello hermes',
+        'media_files': None,
+    }]
+
+
 def test_parse_args_defaults_cover_run_loop_dependencies():
     mod = load_module()
     args = mod.apply_runtime_profile(mod.parse_args([]))
@@ -187,19 +257,23 @@ def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     assert args.tp2_close_pct == 0.5
     assert args.entry_tp1_offset_abs == 5.0
     assert args.entry_tp2_offset_abs == 10.0
-    assert args.min_5m_change_pct == 0.35
-    assert args.min_volume_multiple == 0.8
-    assert args.min_quote_volume == 5_000_000
+    assert args.min_5m_change_pct == 0.2
+    assert args.min_volume_multiple == 0.5
+    assert args.min_quote_volume == 3_000_000
     assert args.top_gainers == 45
     assert args.top_losers == 45
-    assert args.max_candidates == 16
+    assert args.max_candidates == 24
     assert args.max_open_positions == 3
     assert args.max_long_positions == 3
     assert args.max_short_positions == 3
-    assert args.watch_breakout_tolerance_pct == 1.0
-    assert args.setup_breakout_tolerance_pct == 0.6
-    assert args.oi_hard_reversal_threshold_pct == 1.0
-    assert args.extended_chase_threshold_pct == 18.0
+    assert args.watch_breakout_tolerance_pct == 1.2
+    assert args.setup_breakout_tolerance_pct == 0.8
+    assert args.oi_hard_reversal_threshold_pct == 1.2
+    assert args.extended_chase_threshold_pct == 22.0
+    assert args.sim_probe_entry_enabled is True
+    assert args.sim_probe_size_ratio == 0.3
+    assert args.sim_probe_min_score == 58.0
+    assert args.sim_probe_max_breakout_distance_pct == 0.6
     assert args.trigger_min_confirmations == 1
     assert args.max_distance_from_ema_pct == 9.0
     assert args.max_distance_from_vwap_pct == 8.0
@@ -572,3 +646,12 @@ def test_derive_side_risk_multiplier_biases_by_regime_and_side():
     assert abs(mod.derive_side_risk_multiplier('SHORT', 'risk_on') - 0.85) < 1e-9
     assert abs(mod.derive_side_risk_multiplier('SHORT', 'risk_off') - 1.15) < 1e-9
     assert abs(mod.derive_side_risk_multiplier('LONG', 'caution') - 0.9) < 1e-9
+
+
+def test_normalize_symbol_rejects_non_ascii_square_garbage():
+    mod = load_module()
+
+    assert mod.normalize_symbol('BUSDT') is None
+    assert mod.normalize_symbol('币安人生USDT') is None
+    assert mod.normalize_symbol('龙虾USDT') is None
+    assert mod.normalize_symbol(' op/usdt ') == 'OPUSDT'

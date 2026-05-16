@@ -826,7 +826,7 @@ def test_run_loop_auto_loop_background_monitor_records_event_and_state(monkeypat
     assert tracked['monitor_mode'] == 'background_thread'
     assert tracked['monitor_thread_name'] == 'trade-monitor-DOGEUSDT'
     assert tracked['user_data_stream']['status'] == 'started'
-    assert tracked['user_data_stream']['listen_key'] == 'dummy-listen-key'
+    assert tracked['user_data_stream']['listen_key'] == 'dumm***-key'
     assert result['cycles'][0]['trade_management']['user_data_stream']['listen_key'] == 'dummy-listen-key'
     assert tracked['book_ticker_websocket']['status'] == 'healthy'
     assert tracked['book_ticker_websocket']['active_streams'] == ['dogeusdt@bookTicker']
@@ -1106,7 +1106,7 @@ def test_run_loop_auto_loop_refreshes_existing_user_data_stream_without_new_trad
     assert cycle['scan']['candidate_count'] == 0
     tracked = store.load_json('positions', {})['DOGEUSDT:LONG']
     assert tracked['user_data_stream']['status'] == 'refreshed'
-    assert tracked['user_data_stream']['listen_key'] == 'existing-listen-key'
+    assert tracked['user_data_stream']['listen_key'] == 'exis***-key'
 
 
 def test_run_loop_auto_loop_alerts_existing_user_data_stream_refresh_failure(monkeypatch, tmp_path):
@@ -1154,7 +1154,7 @@ def test_run_loop_auto_loop_alerts_existing_user_data_stream_refresh_failure(mon
         'user_data_stream_alert',
         {
             'symbol': 'DOGEUSDT',
-            'listen_key': 'existing-listen-key',
+            'listen_key': 'exis***-key',
             'status': 'refresh_failed',
             'action': 'refresh_failed',
             'error': 'refresh timeout',
@@ -1358,7 +1358,7 @@ def test_run_loop_background_buy_fill_confirmed_persists_entry_feedback(monkeypa
     assert tracked['portfolio_narrative_bucket'] == 'meme'
     assert tracked['portfolio_correlation_group'] == 'dog-family'
     assert tracked['user_data_stream']['status'] == 'started'
-    assert tracked['user_data_stream']['listen_key'] == 'dummy-listen-key'
+    assert tracked['user_data_stream']['listen_key'] == 'dumm***-key'
     assert result['cycles'][0]['trade_management']['user_data_stream']['listen_key'] == 'dummy-listen-key'
 
     rows = [mod.json.loads(line) for line in store._events_path().read_text(encoding='utf-8').splitlines() if line.strip()]
@@ -1978,12 +1978,12 @@ def test_run_loop_auto_loop_persists_user_data_stream_health_state(monkeypatch, 
     assert monitor_calls == [{'symbol': 'DOGEUSDT', 'refresh_interval_minutes': 30.0, 'disconnect_timeout_minutes': 65.0}]
     position = store.load_json('positions', {})['DOGEUSDT:LONG']
     assert position['user_data_stream']['status'] == 'started'
-    assert position['user_data_stream']['listen_key'] == 'dummy-listen-key'
+    assert position['user_data_stream']['listen_key'] == 'dumm***-key'
     assert position['user_data_stream']['health']['refresh_failure_count'] == 0
     assert position['user_data_stream']['health']['disconnect_count'] == 0
     assert result['cycles'][0]['trade_management']['user_data_stream']['health']['status'] == 'started'
     buy_fill_events = [row for row in store.read_events(limit=20) if row.get('event_type') == 'buy_fill_confirmed']
-    assert buy_fill_events[-1]['listen_key'] == 'dummy-listen-key'
+    assert buy_fill_events[-1]['listen_key'] == 'dumm***-key'
     assert notifications == []
 
 

@@ -1269,6 +1269,87 @@ def test_run_loop_okx_simulated_reconcile_clears_stale_position_before_max_open_
     assert positions['TESTUSDT:LONG']['status'] in {'open', 'recovery_pending'}
 
 
+def test_run_loop_reconcile_closed_symbol_enters_cooldown_before_same_symbol_reentry(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'COSUSDT:LONG': {
+            'symbol': 'COSUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 12.0,
+            'remaining_quantity': 12.0,
+            'stop_order_id': 654,
+            'protection_status': 'simulated',
+            'trade_management_plan': {'quantity': 12.0},
+        },
+    })
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=15,
+        live=True,
+        max_open_positions=1,
+        profile='test',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        repair_missing_protection=False,
+    )
+    candidate = mod.Candidate(
+        symbol='COSUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+        setup_ready=True,
+        trigger_fired=True,
+        book_depth_fill_ratio=1.0,
+        expected_slippage_pct=0.0,
+        spread_bps=0.0,
+        orderbook_slope=0.0,
+        cancel_rate=0.0,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': True},
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'COSUSDT'}]}, candidate, {'COSUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: placed.append(True) or {'symbol': 'COSUSDT'})
+
+    result = mod.run_loop(client=object(), args=args)
+    positions = store.load_json('positions', {})
+    risk_state = mod.load_risk_state(store)
+
+    assert placed == []
+    assert positions['COSUSDT:LONG']['status'] == 'closed'
+    assert result['cycles'][0]['risk_guard']['allowed'] is False
+    assert 'symbol_cooldown_active' in result['cycles'][0]['risk_guard']['reasons']
+    assert int(risk_state['symbol_cooldowns']['COSUSDT']) > int(mod.time.time())
+
+
 def test_evaluate_risk_guards_blocks_candidate_when_expected_edge_fails_total_cost_floor():
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1571,6 +1652,88 @@ def test_run_loop_allows_live_trade_when_book_ticker_ws_unavailable_and_gate_dis
     assert result['cycles'][0].get('live_skipped_due_to_websocket_gate', []) == []
 
 
+def test_run_loop_allows_live_probe_entry_for_10u_aggressive_waiting_breakout(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        max_open_positions=1,
+        profile='10u-aggressive',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        repair_missing_protection=False,
+        require_book_ticker_ws=False,
+        leverage=5,
+        sim_probe_entry_enabled=True,
+        sim_probe_size_ratio=0.3,
+        sim_probe_min_score=58.0,
+        sim_probe_max_breakout_distance_pct=0.6,
+        binance_simulated_trading=False,
+    )
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=130.0,
+        recent_swing_low=126.0,
+        stop_price=124.0,
+        quantity=1.0,
+        risk_per_unit=8.0,
+        recommended_leverage=3,
+        rsi_5m=67.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0,
+        distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        state='launch',
+        state_reasons=['impulse_ready'],
+        setup_ready=True,
+        trigger_fired=False,
+        entry_distance_from_breakout_pct=-0.2,
+        position_size_pct=1.5,
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'compute_execution_quality_size_adjustment', lambda _candidate: {'execution_liquidity_grade': 'A', 'expected_slippage_r': 0.05})
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'TESTUSDT'}]}, candidate, {'TESTUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': False, 'reasons': ['candidate_trigger_not_fired'], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, best_candidate, requested_leverage, meta, passed_args: placed.append((best_candidate.symbol, requested_leverage, best_candidate.quantity, getattr(best_candidate, 'probe_entry', False))) or {
+        'symbol': best_candidate.symbol,
+        'side': 'LONG',
+        'filled_quantity': best_candidate.quantity,
+        'entry_price': 132.0,
+        'entry_order_feedback': {'orderId': 'abc'},
+        'trade_management_plan': {'quantity': best_candidate.quantity},
+        'stop_order': {},
+        'protection_check': {'status': 'protected'},
+    })
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda **kwargs: {'status': 'closed', 'exit_reason': 'test'})
+
+    result = mod.run_loop(client=object(), args=args)
+
+    assert placed == [('TESTUSDT', 5, 0.3, True)]
+    assert result['cycles'][0]['sim_probe_entry']['allowed'] is True
+    assert result['cycles'][0]['risk_guard']['probe_override'] is True
+
+
 def test_run_loop_skips_live_trade_when_book_ticker_ws_unavailable_and_gate_required(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     args = argparse.Namespace(
@@ -1702,6 +1865,36 @@ def test_build_user_data_stream_position_payload_keeps_monitor_contract():
     }
 
 
+def test_build_user_data_stream_position_payload_masks_listen_key_and_previous_listen_key():
+    payload = mod.build_user_data_stream_position_payload({
+        'status': 'refresh_failed',
+        'listen_key': 'listen-key-123456',
+        'previous_listen_key': 'previous-key-654321',
+        'health': {
+            'symbol': 'TESTUSDT',
+            'listen_key': 'listen-key-123456',
+            'previous_listen_key': 'previous-key-654321',
+            'disconnect_count': 2,
+        },
+        'action': 'restarted_after_missing_listen_key',
+        'now_utc': '2026-05-10T11:31:00+00:00',
+    })
+
+    assert payload == {
+        'status': 'refresh_failed',
+        'listen_key': 'list***3456',
+        'previous_listen_key': 'prev***4321',
+        'health': {
+            'symbol': 'TESTUSDT',
+            'listen_key': 'list***3456',
+            'previous_listen_key': 'prev***4321',
+            'disconnect_count': 2,
+        },
+        'action': 'restarted_after_missing_listen_key',
+        'now_utc': '2026-05-10T11:31:00+00:00',
+    }
+
+
 def test_persist_user_data_stream_monitor_to_positions_updates_only_matching_symbol_records(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     store.save_json('positions', {
@@ -1780,6 +1973,46 @@ def test_emit_user_data_stream_alert_if_needed_builds_notification_payload(monke
         'last_refresh_at': '2026-05-10T11:30:00+00:00',
         'updated_at': '2026-05-10T11:31:00+00:00',
     }
+    assert notifications == [('user_data_stream_alert', payload)]
+
+
+def test_emit_user_data_stream_alert_if_needed_masks_listen_keys(monkeypatch):
+    notifications = []
+    args = argparse.Namespace(disable_notify=False, notify_target='telegram:test')
+
+    monkeypatch.setattr(
+        mod,
+        'emit_notification',
+        lambda args, event_type, payload: notifications.append((event_type, payload)) or {'ok': True},
+    )
+
+    payload = mod.emit_user_data_stream_alert_if_needed(
+        args=args,
+        symbol='TESTUSDT',
+        monitor={
+            'status': 'refresh_failed',
+            'action': 'restarted_after_missing_listen_key',
+            'listen_key': 'listen-key-123456',
+            'previous_listen_key': 'previous-key-654321',
+            'error': 'boom',
+            'now_utc': '2026-05-10T11:31:00+00:00',
+            'health': {
+                'symbol': 'TESTUSDT',
+                'detail': 'boom',
+                'listen_key': 'listen-key-123456',
+                'previous_listen_key': 'previous-key-654321',
+                'disconnect_count': 2,
+                'refresh_failure_count': 3,
+                'reconnect_count': 4,
+                'started_at': '2026-05-10T11:00:00+00:00',
+                'last_refresh_at': '2026-05-10T11:30:00+00:00',
+                'updated_at': '2026-05-10T11:31:00+00:00',
+            },
+        },
+    )
+
+    assert payload['listen_key'] == 'list***3456'
+    assert payload['previous_listen_key'] == 'prev***4321'
     assert notifications == [('user_data_stream_alert', payload)]
 
 
@@ -3129,6 +3362,72 @@ def test_evaluate_management_actions_requires_breakeven_confirmation_buffer_afte
     assert actions[0]['new_stop_price'] == 102.0
 
 
+def test_evaluate_management_actions_triggers_micro_scalp_time_stop_after_min_profit_window():
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.55,
+        realized_r=0.35,
+        opened_at='2026-05-15T12:00:00Z',
+    )
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=101.0,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.45,
+        tp2_trigger_price=110.0,
+        tp2_close_qty=0.30,
+        runner_qty=0.25,
+        micro_scalp_time_stop_sec=300,
+        micro_scalp_min_profit_r=0.3,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=101.0,
+        ema5m=100.8,
+        trailing_reference=101.2,
+        trailing_buffer_pct=0.02,
+        now=datetime.datetime(2026, 5, 15, 12, 6, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    assert [action['type'] for action in actions] == ['move_stop_to_breakeven', 'micro_scalp_time_stop']
+    assert actions[1]['close_qty'] == 0.55
+    assert actions[1]['exit_reason'] == 'micro_scalp_time_stop'
+
+
+def test_build_trade_management_plan_from_position_inherits_micro_scalp_time_stop_args():
+    position = {
+        'symbol': 'TESTUSDT',
+        'position_side': 'LONG',
+        'entry_price': 100.0,
+        'current_stop_price': 95.0,
+        'quantity': 1.2,
+    }
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp1_profit_usdt=0.0,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp2_profit_usdt=0.0,
+        breakeven_r=1.0,
+        breakeven_confirmation_mode='ema_support',
+        breakeven_min_buffer_pct=0.001,
+        micro_scalp_time_stop_sec=420,
+        micro_scalp_min_profit_r=0.25,
+    )
+
+    plan = mod.build_trade_management_plan_from_position(position, args)
+
+    assert plan.micro_scalp_time_stop_sec == 420
+    assert plan.micro_scalp_min_profit_r == 0.25
+
+
 def test_evaluate_management_actions_hits_tp1_before_breakeven_for_long():
     state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=1.0)
     plan = mod.TradeManagementPlan(
@@ -4371,6 +4670,91 @@ def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unkno
     assert result['entry_price'] == 132.5
     assert result['filled_quantity'] == 1.25
     assert any(event_type == 'entry_order_recovered' for event_type, _ in events)
+
+
+def test_place_live_trade_keeps_10u_aggressive_probe_entry_at_profile_leverage(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=18.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0003,
+        funding_rate_avg=0.0002,
+        recent_5m_change_pct=2.4,
+        acceleration_ratio_5m_vs_15m=1.6,
+        breakout_level=128.0,
+        recent_swing_low=124.0,
+        stop_price=126.0,
+        quantity=1.25,
+        risk_per_unit=6.0,
+        recommended_leverage=5,
+        rsi_5m=74.0,
+        volume_multiple=2.1,
+        distance_from_ema20_5m_pct=5.2,
+        distance_from_vwap_15m_pct=4.4,
+        higher_tf_summary={'1h': 'up', '4h': 'up'},
+        score=90.0,
+        reasons=['test'],
+        side='LONG',
+        state='launch',
+        state_reasons=['launch_short_squeeze'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        smart_money_veto=False,
+        atr_stop_distance=6.0,
+        probe_entry=True,
+    )
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        tp1_profit_usdt=5.0,
+        tp2_profit_usdt=10.0,
+        breakeven_r=1.0,
+        profile='10u-aggressive',
+        leverage=5,
+    )
+    args = mod.apply_runtime_profile(args)
+    meta = make_meta()
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {
+                    'orderId': 12345,
+                    'clientOrderId': 'entry-1',
+                    'status': 'FILLED',
+                    'avgPrice': '132.5',
+                    'executedQty': '1.25',
+                    'cumQuote': '165.625',
+                    'updateTime': 1710000000123,
+                }
+            raise AssertionError(path)
+
+    client = FakeClient()
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 999, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 1001, 'clientOrderId': 'tp-1'})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 999})
+
+    result = mod.place_live_trade(client, candidate, leverage=5, meta=meta, args=args)
+
+    leverage_calls = [params['leverage'] for path, params in client.calls if path == '/fapi/v1/leverage']
+    assert result['filled_quantity'] == 1.25
+    assert leverage_calls == [5]
 
 
 def test_place_live_trade_raises_when_timeout_unknown_cannot_be_confirmed(monkeypatch):

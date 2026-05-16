@@ -3733,8 +3733,10 @@ def test_evaluate_risk_guards_blocks_live_entry_for_execution_quality_candidate(
     payload = mod.evaluate_risk_guards(symbol='TESTUSDT', risk_state=mod.default_risk_state(), candidate=candidate)
 
     assert payload['allowed'] is False
-    assert 'candidate_execution_slippage_risk' in payload['reasons']
-    assert payload['reasons'] == ['candidate_execution_slippage_risk']
+    assert payload['reasons'] == [
+        'candidate_execution_slippage_risk',
+        'candidate_execution_liquidity_poor',
+    ]
 
 
 def test_run_loop_records_execution_quality_rejection_event_when_risk_guard_blocks_live_trade(monkeypatch, tmp_path):
@@ -3796,11 +3798,13 @@ def test_run_loop_records_execution_quality_rejection_event_when_risk_guard_bloc
 
     assert result['cycles'][0]['live_skipped_due_to_risk_guard'] == [
         'candidate_execution_slippage_risk',
+        'candidate_execution_liquidity_poor',
     ]
     assert rows[-1]['event_type'] == 'candidate_rejected'
     assert rows[-1]['symbol'] == 'TESTUSDT'
     assert rows[-1]['reasons'] == [
         'candidate_execution_slippage_risk',
+        'candidate_execution_liquidity_poor',
     ]
     assert rows[-1]['reject_reason'] == 'execution_slippage_veto'
     assert rows[-1]['reject_reason_label'] == 'execution_slippage'
@@ -3956,6 +3960,95 @@ def test_merged_candidate_symbols_includes_top_losers_for_short_side_scan():
     assert hot_rank_map == {'DOGEUSDT': 1}
     assert gainer_rank_map == {'1000PEPEUSDT': 1}
     assert loser_rank_map == {'XRPUSDT': 1}
+
+
+def test_merged_candidate_symbols_filters_square_and_ticker_inputs_to_exchange_universe():
+    merged, hot_rank_map, gainer_rank_map, loser_rank_map = mod.merged_candidate_symbols(
+        square_symbols=['DOGEUSDT', 'BUSDT', 'USUSDT'],
+        tickers=[
+            {'symbol': '1000PEPEUSDT', 'priceChangePercent': '22.0'},
+            {'symbol': 'BUSDT', 'priceChangePercent': '18.0'},
+            {'symbol': 'XRPUSDT', 'priceChangePercent': '-9.0'},
+            {'symbol': 'USUSDT', 'priceChangePercent': '-12.0'},
+        ],
+        allowed_symbols={'DOGEUSDT', '1000PEPEUSDT', 'XRPUSDT'},
+        top_gainers=2,
+        top_losers=2,
+    )
+
+    assert merged == ['DOGEUSDT', '1000PEPEUSDT', 'XRPUSDT']
+    assert hot_rank_map == {'DOGEUSDT': 1}
+    assert gainer_rank_map == {'1000PEPEUSDT': 1, 'XRPUSDT': 2}
+    assert loser_rank_map == {'XRPUSDT': 1, '1000PEPEUSDT': 2}
+
+
+def test_resolve_auto_loop_book_ticker_symbols_filters_to_exchange_universe(monkeypatch):
+    args = mod.parse_args([])
+    args.top_gainers = 2
+    args.top_losers = 2
+
+    monkeypatch.setattr(
+        mod,
+        'fetch_exchange_meta',
+        lambda _client: {
+            'DOGEUSDT': mod.SymbolMeta(symbol='DOGEUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'XRPUSDT': mod.SymbolMeta(symbol='XRPUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        'fetch_tickers',
+        lambda _client: [
+            {'symbol': 'DOGEUSDT', 'priceChangePercent': '5.0'},
+            {'symbol': 'BUSDT', 'priceChangePercent': '22.0'},
+            {'symbol': 'USUSDT', 'priceChangePercent': '-11.0'},
+            {'symbol': 'XRPUSDT', 'priceChangePercent': '-8.0'},
+            {'symbol': '币安人生USDT', 'priceChangePercent': '19.0'},
+        ],
+    )
+
+    symbols = mod.resolve_auto_loop_book_ticker_symbols(client=object(), args=args)
+
+    assert symbols == ['DOGEUSDT', 'XRPUSDT']
+
+
+def test_resolve_auto_loop_book_ticker_symbols_filters_to_strategy_safe_ascii_symbols(monkeypatch):
+    args = mod.parse_args([])
+    args.top_gainers = 5
+    args.top_losers = 1
+
+    monkeypatch.setattr(
+        mod,
+        'fetch_exchange_meta',
+        lambda _client: {
+            'DOGEUSDT': mod.SymbolMeta(symbol='DOGEUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'OPUSDT': mod.SymbolMeta(symbol='OPUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            '2ZUSDT': mod.SymbolMeta(symbol='2ZUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            '4USDT': mod.SymbolMeta(symbol='4USDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            '币安人生USDT': mod.SymbolMeta(symbol='币安人生USDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            '龙虾USDT': mod.SymbolMeta(symbol='龙虾USDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'DELISTUSDT': mod.SymbolMeta(symbol='DELISTUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='BREAK', contract_type='PERPETUAL'),
+            'DELIVERYUSDT': mod.SymbolMeta(symbol='DELIVERYUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='CURRENT_QUARTER'),
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        'fetch_tickers',
+        lambda _client: [
+            {'symbol': 'DOGEUSDT', 'priceChangePercent': '5.0'},
+            {'symbol': 'OPUSDT', 'priceChangePercent': '22.0'},
+            {'symbol': '2ZUSDT', 'priceChangePercent': '18.0'},
+            {'symbol': '4USDT', 'priceChangePercent': '17.0'},
+            {'symbol': '币安人生USDT', 'priceChangePercent': '16.0'},
+            {'symbol': '龙虾USDT', 'priceChangePercent': '15.0'},
+            {'symbol': 'DELISTUSDT', 'priceChangePercent': '14.0'},
+            {'symbol': 'DELIVERYUSDT', 'priceChangePercent': '13.0'},
+        ],
+    )
+
+    symbols = mod.resolve_auto_loop_book_ticker_symbols(client=object(), args=args)
+
+    assert symbols == ['OPUSDT', '2ZUSDT', 'DOGEUSDT']
 
 
 def test_normalize_external_signal_map_preserves_portfolio_bucket_aliases():

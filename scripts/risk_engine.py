@@ -84,8 +84,23 @@ def evaluate_risk_guards(
         normalized['portfolio_heat_r_by_theme'] = {}
     if not isinstance(normalized.get('portfolio_heat_r_by_correlation'), dict):
         normalized['portfolio_heat_r_by_correlation'] = {}
+    if not isinstance(normalized.get('daily_symbol_trade_counts'), dict):
+        normalized['daily_symbol_trade_counts'] = {}
+    if not isinstance(normalized.get('recent_closed_trades'), list):
+        normalized['recent_closed_trades'] = []
+
+    def _normalize_candidate_side(value: Any) -> str:
+        text = str(value or '').strip().upper()
+        if text in {'SHORT', 'SELL'}:
+            return 'SHORT'
+        return 'LONG'
 
     reasons = []
+    ts = int(time_module.time()) if now_ts is None else int(now_ts)
+    normalized_symbol = str(symbol or '').strip().upper()
+    candidate_side = _normalize_candidate_side(
+        getattr(candidate, 'position_side', None) or getattr(candidate, 'side', None)
+    ) if candidate is not None else 'LONG'
     if normalized.get('halted'):
         reasons.append('strategy_halted')
     pnl = abs(_to_float(normalized.get('daily_realized_pnl_usdt')))
@@ -95,11 +110,29 @@ def evaluate_risk_guards(
         reasons.append('max_consecutive_losses_reached')
 
     cooldown_until = None
-    if symbol:
-        cooldown_until = normalized['symbol_cooldowns'].get(symbol)
-        ts = int(time_module.time()) if now_ts is None else int(now_ts)
+    if normalized_symbol:
+        cooldown_until = normalized['symbol_cooldowns'].get(normalized_symbol)
         if cooldown_until and ts < int(cooldown_until):
             reasons.append('symbol_cooldown_active')
+        daily_symbol_trade_limit = max(int(kwargs.get('daily_symbol_trade_limit', 0) or 0), 0)
+        if daily_symbol_trade_limit > 0:
+            current_trade_count = int(normalized['daily_symbol_trade_counts'].get(normalized_symbol, 0) or 0)
+            if current_trade_count >= daily_symbol_trade_limit:
+                reasons.append('daily_symbol_trade_limit_reached')
+        aggressive_flip_cooldown_minutes = max(int(kwargs.get('aggressive_flip_cooldown_minutes', 0) or 0), 0)
+        if aggressive_flip_cooldown_minutes > 0:
+            cooldown_seconds = aggressive_flip_cooldown_minutes * 60
+            for closed_trade in reversed(normalized['recent_closed_trades']):
+                if not isinstance(closed_trade, dict):
+                    continue
+                closed_symbol = str(closed_trade.get('symbol') or '').strip().upper()
+                if closed_symbol != normalized_symbol:
+                    continue
+                closed_side = _normalize_candidate_side(closed_trade.get('position_side') or closed_trade.get('side'))
+                closed_at = closed_trade.get('closed_at')
+                if closed_side != candidate_side and closed_at is not None and ts - int(closed_at) < cooldown_seconds:
+                    reasons.append('aggressive_flip_cooldown_active')
+                break
 
     if candidate is not None:
         state = getattr(candidate, 'state', '')
@@ -138,6 +171,15 @@ def evaluate_risk_guards(
         risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
         if execution_slippage_r > risk_slippage_r:
             reasons.append('candidate_execution_slippage_risk')
+        has_explicit_edge_cost_contract = any(
+            hasattr(candidate, field_name)
+            for field_name in (
+                'expected_edge',
+                'expected_total_fee_pct',
+                'execution_slippage_buffer_pct',
+                'min_profit_buffer_pct',
+            )
+        )
         expected_edge = max(_to_float(getattr(candidate, 'expected_edge', 0.0)), 0.0)
         expected_total_fee_pct = max(_to_float(getattr(candidate, 'expected_total_fee_pct', 0.0)), 0.0)
         execution_slippage_buffer_pct = max(
@@ -148,7 +190,7 @@ def evaluate_risk_guards(
         )
         min_profit_buffer_pct = max(_to_float(getattr(candidate, 'min_profit_buffer_pct', 0.0)), 0.0)
         total_cost_floor_pct = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
-        if total_cost_floor_pct > 0 and expected_edge <= total_cost_floor_pct:
+        if has_explicit_edge_cost_contract and total_cost_floor_pct > 0 and expected_edge <= total_cost_floor_pct:
             reasons.append('candidate_edge_after_costs_insufficient')
         liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
         if execution_liquidity_grade == 'D':

@@ -85,6 +85,18 @@ def _normalize_position_key(row: Dict[str, Any]) -> str:
     return symbol
 
 
+def _normalize_position_instance_id(row: Dict[str, Any]) -> str:
+    return _normalize_text(row.get('position_instance_id'))
+
+
+def _build_session_key(row: Dict[str, Any]) -> str:
+    position_key = _normalize_position_key(row)
+    position_instance_id = _normalize_position_instance_id(row)
+    if position_key and position_instance_id:
+        return f'{position_key}#{position_instance_id}'
+    return position_key
+
+
 def filter_symbol_events(rows: Iterable[Dict[str, Any]], symbol: str, side: str = '') -> List[Dict[str, Any]]:
     target_symbol = _normalize_text(symbol).upper()
     target_side = _normalize_text(side).upper()
@@ -112,6 +124,7 @@ def _new_session(position_key: str, row: Dict[str, Any]) -> Dict[str, Any]:
     side = _normalize_text(row.get('side') or row.get('position_side')).upper()
     return {
         'position_key': position_key,
+        'position_instance_id': _normalize_position_instance_id(row),
         'symbol': symbol,
         'side': side,
         'status': 'pending',
@@ -133,6 +146,10 @@ def _new_session(position_key: str, row: Dict[str, Any]) -> Dict[str, Any]:
         'filled_quantity': None,
         'execution_exchange': '',
         'entry_order_id': None,
+        'close_event_type': '',
+        'close_order_id': None,
+        'closed_quantity': None,
+        'realized_pnl': None,
         'exit_reason': '',
         'reject_reason': '',
         'reject_reason_label': '',
@@ -153,6 +170,8 @@ def _apply_row_to_session(session: Dict[str, Any], row: Dict[str, Any]) -> None:
         session['side'] = _normalize_text(row.get('side') or row.get('position_side')).upper()
     if not session.get('position_key'):
         session['position_key'] = _normalize_position_key(row)
+    if not session.get('position_instance_id'):
+        session['position_instance_id'] = _normalize_position_instance_id(row)
 
     session['event_sequence'].append(event_type)
     session['events'].append(dict(row))
@@ -227,6 +246,10 @@ def _apply_row_to_session(session: Dict[str, Any], row: Dict[str, Any]) -> None:
         session['status'] = 'closed'
         session['closed_at'] = recorded_at
         session['exit_reason'] = _normalize_text(row.get('exit_reason'))
+        session['close_event_type'] = _normalize_text(row.get('close_event_type'))
+        session['close_order_id'] = row.get('close_order_id')
+        session['closed_quantity'] = _round(row.get('closed_quantity') or row.get('close_qty'), 10)
+        session['realized_pnl'] = _round(row.get('realized_pnl'), 10)
         return
 
 
@@ -238,30 +261,31 @@ def build_symbol_replay_payload(rows: Iterable[Dict[str, Any]], symbol: str, sid
     for row in filtered:
         event_type = _normalize_text(row.get('event_type'))
         position_key = _normalize_position_key(row)
-        session: Optional[Dict[str, Any]] = active_by_key.get(position_key) if position_key else None
+        session_key = _build_session_key(row)
+        session: Optional[Dict[str, Any]] = active_by_key.get(session_key) if session_key else None
 
         if event_type == 'candidate_selected':
             if session and session.get('status') == 'selected' and not session.get('entry_filled_at') and not session.get('submitted_at'):
                 session['status'] = 'superseded'
             session = _new_session(position_key, row)
             sessions.append(session)
-            if position_key:
-                active_by_key[position_key] = session
+            if session_key:
+                active_by_key[session_key] = session
         elif event_type in ENTRY_START_EVENTS:
             if session is None or session.get('status') in {'closed', 'rejected', 'superseded'} or bool(session.get('entry_filled_at') or session.get('submitted_at')):
                 session = _new_session(position_key, row)
                 sessions.append(session)
-                if position_key:
-                    active_by_key[position_key] = session
+                if session_key:
+                    active_by_key[session_key] = session
         elif session is None:
             session = _new_session(position_key, row)
             sessions.append(session)
-            if position_key:
-                active_by_key[position_key] = session
+            if session_key:
+                active_by_key[session_key] = session
 
         _apply_row_to_session(session, row)
-        if event_type in TERMINAL_EVENTS and position_key:
-            active_by_key.pop(position_key, None)
+        if event_type in TERMINAL_EVENTS and session_key:
+            active_by_key.pop(session_key, None)
 
     event_type_counter: Counter = Counter()
     exit_reason_counter: Counter = Counter()

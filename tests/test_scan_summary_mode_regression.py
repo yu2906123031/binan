@@ -105,6 +105,8 @@ def test_summary_render_module_matches_script_helpers():
     script_rendered = mod.render_cn_scan_summary(result)
     module_rendered = summary_render_mod.render_cn_scan_summary_text(module_summary, mod.format_num, mod.format_pct)
     assert module_rendered == script_rendered
+    assert '市场状态:' not in script_rendered
+    assert '状态原因:' not in script_rendered
 
 
 def test_build_cn_scan_summary_splits_setup_watch_and_trade_candidates():

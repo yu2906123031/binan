@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -8,6 +9,7 @@ import hmac
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -789,6 +791,8 @@ class TradeManagementPlan:
     runner_qty: float
     tp1_profit_usdt: float = 0.0
     tp2_profit_usdt: float = 0.0
+    micro_scalp_time_stop_sec: int = 0
+    micro_scalp_min_profit_r: float = 0.0
     side: str = TRADE_SIDE_LONG
     position_side: str = POSITION_SIDE_LONG
     breakeven_confirmation_mode: str = 'price_only'
@@ -1212,14 +1216,29 @@ def start_user_data_stream_monitor(client: Any, store: RuntimeStateStore, symbol
     }
 
 
+def _sanitize_user_data_stream_monitor_health(health: Any) -> Dict[str, Any]:
+    if not isinstance(health, dict):
+        return {}
+    sanitized = dict(health)
+    if 'listen_key' in sanitized:
+        sanitized['listen_key'] = mask_sensitive_token(sanitized.get('listen_key'))
+    if 'previous_listen_key' in sanitized:
+        sanitized['previous_listen_key'] = mask_sensitive_token(sanitized.get('previous_listen_key'))
+    return sanitized
+
+
 def build_user_data_stream_position_payload(uds_monitor: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    payload = {
         'status': uds_monitor.get('status'),
-        'listen_key': uds_monitor.get('listen_key'),
-        'health': uds_monitor.get('health', {}),
+        'listen_key': mask_sensitive_token(uds_monitor.get('listen_key')),
+        'health': _sanitize_user_data_stream_monitor_health(uds_monitor.get('health', {})),
         'action': uds_monitor.get('action'),
         'now_utc': uds_monitor.get('now_utc'),
     }
+    previous_listen_key = uds_monitor.get('previous_listen_key')
+    if previous_listen_key:
+        payload['previous_listen_key'] = mask_sensitive_token(previous_listen_key)
+    return payload
 
 
 def persist_user_data_stream_monitor_to_positions(store: RuntimeStateStore, uds_monitor: Dict[str, Any]) -> Dict[str, Any]:
@@ -1266,7 +1285,7 @@ def emit_user_data_stream_alert_if_needed(
         'action': str(monitor.get('action') or status).lower(),
         'error': str(monitor.get('error') or ''),
         'detail': str(monitor.get('detail') or health.get('detail') or ''),
-        'listen_key': str(monitor.get('listen_key') or health.get('listen_key') or ''),
+        'listen_key': mask_sensitive_token(monitor.get('listen_key') or health.get('listen_key') or ''),
         'disconnect_count': int(monitor.get('disconnect_count', health.get('disconnect_count', 0)) or 0),
         'refresh_failure_count': int(monitor.get('refresh_failure_count', health.get('refresh_failure_count', 0)) or 0),
         'reconnect_count': int(monitor.get('reconnect_count', health.get('reconnect_count', 0)) or 0),
@@ -1274,6 +1293,9 @@ def emit_user_data_stream_alert_if_needed(
         'last_refresh_at': health.get('last_refresh_at'),
         'updated_at': str(health.get('updated_at') or monitor.get('updated_at') or monitor.get('now_utc') or _isoformat_utc(_utc_now())),
     }
+    previous_listen_key = monitor.get('previous_listen_key') or health.get('previous_listen_key') or ''
+    if previous_listen_key:
+        payload['previous_listen_key'] = mask_sensitive_token(previous_listen_key)
     emit_notification(args, 'user_data_stream_alert', payload)
     return payload
 
@@ -2312,7 +2334,7 @@ def recommend_leverage(entry_price: float, stop_price: float, max_leverage: int 
     return max(1, min(lev, max_leverage))
 
 
-def build_trade_management_plan(entry_price: float, stop_price: float, quantity: float, tp1_r: float, tp1_close_pct: float, tp2_r: float, tp2_close_pct: float, breakeven_r: float = 1.0, atr_stop_distance: Optional[float] = None, side: str = POSITION_SIDE_LONG, breakeven_confirmation_mode: str = 'price_only', breakeven_min_buffer_pct: float = 0.0, tp1_profit_usdt: float = 0.0, tp2_profit_usdt: float = 0.0) -> TradeManagementPlan:
+def build_trade_management_plan(entry_price: float, stop_price: float, quantity: float, tp1_r: float, tp1_close_pct: float, tp2_r: float, tp2_close_pct: float, breakeven_r: float = 1.0, atr_stop_distance: Optional[float] = None, side: str = POSITION_SIDE_LONG, breakeven_confirmation_mode: str = 'price_only', breakeven_min_buffer_pct: float = 0.0, tp1_profit_usdt: float = 0.0, tp2_profit_usdt: float = 0.0, micro_scalp_time_stop_sec: int = 0, micro_scalp_min_profit_r: float = 0.0) -> TradeManagementPlan:
     side_normalized = normalize_position_side(side)
     direction = 1.0 if side_normalized == POSITION_SIDE_LONG else -1.0
     risk = float(atr_stop_distance) if atr_stop_distance and atr_stop_distance > 0 else abs(entry_price - stop_price)
@@ -2343,13 +2365,35 @@ def build_trade_management_plan(entry_price: float, stop_price: float, quantity:
         runner_qty=runner_qty,
         tp1_profit_usdt=max(float(tp1_profit_usdt or 0.0), 0.0),
         tp2_profit_usdt=max(float(tp2_profit_usdt or 0.0), 0.0),
+        micro_scalp_time_stop_sec=max(int(micro_scalp_time_stop_sec or 0), 0),
+        micro_scalp_min_profit_r=float(micro_scalp_min_profit_r or 0.0),
     )
 
 
-def evaluate_management_actions(state: TradeManagementState, plan: TradeManagementPlan, current_price: float, ema5m: float, trailing_reference: float, trailing_buffer_pct: float, allow_runner_exit: bool = False) -> List[Dict[str, Any]]:
+def evaluate_management_actions(state: TradeManagementState, plan: TradeManagementPlan, current_price: float, ema5m: float, trailing_reference: float, trailing_buffer_pct: float, allow_runner_exit: bool = False, now: Optional[datetime.datetime] = None) -> List[Dict[str, Any]]:
     actions: List[Dict[str, Any]] = []
     side = normalize_position_side(getattr(plan, 'side', POSITION_SIDE_LONG))
     is_short = side == POSITION_SIDE_SHORT
+
+    def maybe_append_micro_scalp_time_stop() -> None:
+        opened_at = _parse_iso8601_utc(getattr(state, 'opened_at', None))
+        time_stop_sec = max(int(getattr(plan, 'micro_scalp_time_stop_sec', 0) or 0), 0)
+        min_profit_r = float(getattr(plan, 'micro_scalp_min_profit_r', 0.0) or 0.0)
+        if time_stop_sec <= 0 or opened_at is None or state.remaining_quantity <= 0:
+            return
+        now_dt = now.astimezone(datetime.timezone.utc) if isinstance(now, datetime.datetime) and now.tzinfo else (now.replace(tzinfo=datetime.timezone.utc) if isinstance(now, datetime.datetime) else _utc_now())
+        held_seconds = max((now_dt - opened_at).total_seconds(), 0.0)
+        realized_r = float(getattr(state, 'realized_r', 0.0) or 0.0)
+        if held_seconds < time_stop_sec or realized_r < min_profit_r:
+            return
+        actions.append({
+            'type': 'micro_scalp_time_stop',
+            'close_qty': state.remaining_quantity,
+            'exit_reason': 'micro_scalp_time_stop',
+            'held_seconds': round(held_seconds, 2),
+            'min_profit_r': min_profit_r,
+            'realized_r': realized_r,
+        })
 
     if is_short:
         state.lowest_price_seen = min(state.lowest_price_seen or current_price, current_price)
@@ -2368,6 +2412,7 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
         trailing_ceiling = round(ceiling_ref * (1 + trailing_buffer_pct), 10)
         if allow_runner_exit and (state.tp1_hit or tp1_will_hit) and current_price > trailing_ceiling and state.remaining_quantity > 0:
             actions.append({'type': 'runner_exit', 'close_qty': state.remaining_quantity, 'trailing_floor': round(trailing_ceiling, 2), 'exit_reason': 'runner'})
+        maybe_append_micro_scalp_time_stop()
         return actions
 
     state.highest_price_seen = max(state.highest_price_seen or current_price, current_price)
@@ -2393,6 +2438,7 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
     trailing_floor = round(floor_ref * (1 - trailing_buffer_pct), 10)
     if allow_runner_exit and (state.tp1_hit or tp1_will_hit) and current_price < trailing_floor and state.remaining_quantity > 0:
         actions.append({'type': 'runner_exit', 'close_qty': state.remaining_quantity, 'trailing_floor': round(trailing_floor, 2), 'exit_reason': 'runner'})
+    maybe_append_micro_scalp_time_stop()
     return actions
 
 
@@ -2468,7 +2514,7 @@ def place_stop_market_order(client, symbol: str, stop_price: float, quantity: fl
     try:
         return client.signed_post('/fapi/v1/algoOrder', params)
     except Exception as exc:
-        if 'reduceOnly' in params and is_reduce_only_not_required_error(exc):
+        if 'reduceOnly' in params:
             params.pop('reduceOnly', None)
             try:
                 return client.signed_post('/fapi/v1/algoOrder', params)
@@ -2501,7 +2547,7 @@ def place_take_profit_market_order(client, symbol: str, trigger_price: float, qu
     try:
         return client.signed_post('/fapi/v1/algoOrder', params)
     except Exception as exc:
-        if 'reduceOnly' in params and is_reduce_only_not_required_error(exc):
+        if 'reduceOnly' in params:
             params.pop('reduceOnly', None)
             try:
                 return client.signed_post('/fapi/v1/algoOrder', params)
@@ -2525,7 +2571,7 @@ def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeM
         state.current_stop_price = action['new_stop_price']
         state.moved_to_breakeven = True
         return state, new_stop_order, {**log_payload, 'new_stop_order': new_stop_order}
-    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit', 'stop_exit'}:
+    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit', 'stop_exit', 'micro_scalp_time_stop'}:
         reduce_result = place_reduce_only_market(client, symbol, action['close_qty'], meta, side=side)
         state.remaining_quantity = round(max(state.remaining_quantity - action['close_qty'], 0.0), 10)
         if action['type'] == 'take_profit_1':
@@ -2610,6 +2656,8 @@ def build_trade_management_plan_from_position(position: Dict[str, Any], args: ar
         side=trade_side,
         breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') or 'ema_support'),
         breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
+        micro_scalp_time_stop_sec=int(getattr(args, 'micro_scalp_time_stop_sec', 0) or 0),
+        micro_scalp_min_profit_r=float(getattr(args, 'micro_scalp_min_profit_r', 0.0) or 0.0),
     )
 
 
@@ -3705,6 +3753,8 @@ def normalize_symbol(symbol: Optional[str]) -> Optional[str]:
     s = raw.upper().replace('-', '').replace('/', '').replace('_', '').replace(' ', '')
     if not s or not any(ch.isalnum() for ch in s):
         return None
+    if any(ord(ch) > 127 for ch in s):
+        return None
     if s.endswith('SWAP'):
         s = s[:-4]
     if not s:
@@ -3712,9 +3762,16 @@ def normalize_symbol(symbol: Optional[str]) -> Optional[str]:
     if not s.endswith('USDT'):
         if s.endswith('USD'):
             s += 'T'
-        elif s.isalpha():
+        elif s.isalpha() and s.isascii():
             s += 'USDT'
+    if not re.fullmatch(r'[A-Z0-9]{2,24}USDT', s):
+        return None
     return s
+
+
+def is_strategy_websocket_symbol_allowed(symbol: Optional[str]) -> bool:
+    normalized = normalize_symbol(symbol)
+    return bool(normalized and normalized.endswith('USDT'))
 
 
 def load_manual_square_symbols(args: argparse.Namespace) -> List[str]:
@@ -3879,7 +3936,7 @@ def fetch_exchange_meta(client: BinanceFuturesClient) -> Dict[str, SymbolMeta]:
         if row.get('quoteAsset') != 'USDT':
             continue
         filters = {f['filterType']: f for f in row.get('filters', [])}
-        metas[row['symbol']] = SymbolMeta(
+        meta = SymbolMeta(
             symbol=row['symbol'],
             price_precision=int(row.get('pricePrecision', 2)),
             quantity_precision=int(row.get('quantityPrecision', 3)),
@@ -3890,7 +3947,55 @@ def fetch_exchange_meta(client: BinanceFuturesClient) -> Dict[str, SymbolMeta]:
             status=row.get('status', ''),
             contract_type=row.get('contractType', ''),
         )
+        metas[row['symbol']] = meta
     return metas
+
+
+def filter_strategy_websocket_symbol_meta(metas: Dict[str, SymbolMeta]) -> Dict[str, SymbolMeta]:
+    filtered: Dict[str, SymbolMeta] = {}
+    for symbol, meta in dict(metas or {}).items():
+        normalized = normalize_symbol(symbol)
+        if not normalized or meta is None:
+            continue
+        if str(getattr(meta, 'quote_asset', '') or '').upper() != 'USDT':
+            continue
+        if str(getattr(meta, 'status', '') or '').upper() != 'TRADING':
+            continue
+        if str(getattr(meta, 'contract_type', '') or '').upper() != 'PERPETUAL':
+            continue
+        if not is_strategy_websocket_symbol_allowed(normalized):
+            continue
+        filtered[normalized] = meta
+    return filtered
+
+
+def fetch_public_exchange_symbol_set(timeout: float = 10.0) -> Set[str]:
+    try:
+        response = requests.get('https://fapi.binance.com/fapi/v1/exchangeInfo', timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return set()
+    metas: Dict[str, SymbolMeta] = {}
+    for row in data.get('symbols', []):
+        if row.get('quoteAsset') != 'USDT':
+            continue
+        normalized = normalize_symbol(row.get('symbol'))
+        if not normalized:
+            continue
+        filters = {f['filterType']: f for f in row.get('filters', [])}
+        metas[normalized] = SymbolMeta(
+            symbol=normalized,
+            price_precision=int(row.get('pricePrecision', 2)),
+            quantity_precision=int(row.get('quantityPrecision', 3)),
+            tick_size=_to_float(filters.get('PRICE_FILTER', {}).get('tickSize', 0.01)),
+            step_size=_to_float(filters.get('LOT_SIZE', {}).get('stepSize', 0.001)),
+            min_qty=_to_float(filters.get('LOT_SIZE', {}).get('minQty', 0.001)),
+            quote_asset=row.get('quoteAsset', 'USDT'),
+            status=row.get('status', ''),
+            contract_type=row.get('contractType', ''),
+        )
+    return set(filter_strategy_websocket_symbol_meta(metas).keys())
 
 
 def fetch_tickers(client: BinanceFuturesClient) -> List[Dict[str, Any]]:
@@ -4451,8 +4556,20 @@ def fetch_top_account_long_short_ratio(client: BinanceFuturesClient, symbol: str
 
 
 def merged_candidate_symbols(**kwargs) -> Tuple[List[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
+    allowed_symbols = {
+        str(symbol).strip().upper()
+        for symbol in (kwargs.get('allowed_symbols') or [])
+        if str(symbol).strip()
+    }
     square_symbols = kwargs.get('square_symbols', [])
+    if allowed_symbols:
+        square_symbols = [symbol for symbol in square_symbols if str(symbol).strip().upper() in allowed_symbols]
     tickers = kwargs.get('tickers', [])
+    if allowed_symbols:
+        tickers = [
+            row for row in tickers
+            if str(row.get('symbol', '')).strip().upper() in allowed_symbols
+        ]
     top_gainers = int(kwargs.get('top_gainers', 20) or 20)
     top_losers = int(kwargs.get('top_losers', top_gainers) or 0)
     hot_rank_map = {symbol: idx + 1 for idx, symbol in enumerate(square_symbols)}
@@ -4739,6 +4856,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     merged_payload = merged_candidate_symbols(
         square_symbols=square_symbols,
         tickers=tickers,
+        allowed_symbols=metas.keys(),
         top_gainers=getattr(args, 'top_gainers', 20),
         top_losers=getattr(args, 'top_losers', getattr(args, 'top_gainers', 20)),
     )
@@ -5199,6 +5317,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'risk_usdt': 1.2,
             'max_notional_usdt': 500.0,
             'leverage': 5,
+            'probe_max_leverage': 5,
             'breakeven_r': 0.8,
             'tp1_r': 5.0,
             'tp1_close_pct': 0.5,
@@ -5208,20 +5327,24 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'entry_tp2_offset_abs': 10.0,
             'lookback_bars': 4,
             'swing_bars': 4,
-            'min_quote_volume': 5_000_000,
+            'min_quote_volume': 3_000_000,
             'top_gainers': 45,
             'top_losers': 45,
-            'max_candidates': 16,
+            'max_candidates': 24,
             'max_open_positions': 3,
             'max_long_positions': 3,
             'max_short_positions': 3,
             'max_rsi_5m': 84.0,
-            'min_volume_multiple': 0.8,
-            'min_5m_change_pct': 0.35,
-            'watch_breakout_tolerance_pct': 1.0,
-            'setup_breakout_tolerance_pct': 0.6,
-            'oi_hard_reversal_threshold_pct': 1.0,
-            'extended_chase_threshold_pct': 18.0,
+            'min_volume_multiple': 0.5,
+            'min_5m_change_pct': 0.2,
+            'watch_breakout_tolerance_pct': 1.2,
+            'setup_breakout_tolerance_pct': 0.8,
+            'oi_hard_reversal_threshold_pct': 1.2,
+            'extended_chase_threshold_pct': 22.0,
+            'sim_probe_entry_enabled': True,
+            'sim_probe_size_ratio': 0.3,
+            'sim_probe_min_score': 58.0,
+            'sim_probe_max_breakout_distance_pct': 0.6,
             'trigger_min_confirmations': 1,
             'max_distance_from_ema_pct': 9.0,
             'max_distance_from_vwap_pct': 8.0,
@@ -5428,8 +5551,18 @@ def load_env_value(key: str, default: str = '') -> str:
 
 def parse_notification_target(target: str) -> Dict[str, Any]:
     raw = (target or '').strip()
-    if not raw or ':' not in raw:
+    if not raw:
         raise ValueError(f'invalid notification target: {target}')
+    if ':' not in raw:
+        platform = raw.lower()
+        home_env = {
+            'weixin': 'WEIXIN_HOME_CHANNEL',
+            'telegram': 'TELEGRAM_HOME_CHANNEL',
+        }.get(platform)
+        home_chat_id = load_env_value(home_env) if home_env else ''
+        if not home_chat_id:
+            raise ValueError(f'invalid notification target: {target}')
+        return {'platform': platform, 'chat_id': home_chat_id, 'thread_id': None}
     platform, remainder = raw.split(':', 1)
     platform = platform.strip().lower()
     thread_id = None
@@ -5495,9 +5628,30 @@ def send_telegram_notification(bot_token: str, chat_id: str, message: str, threa
 def send_weixin_notification(chat_id: str, message: str, send_func=None) -> Dict[str, Any]:
     if send_func is None:
         try:
-            from hermes.platforms.weixin.direct import send_message as direct_send_message
+            from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
         except Exception as exc:
-            raise RuntimeError('weixin direct adapter unavailable') from exc
+            hermes_agent_root = Path('/root/.hermes/hermes-agent')
+            hermes_agent_root_text = str(hermes_agent_root)
+            if hermes_agent_root.exists() and hermes_agent_root_text not in sys.path:
+                sys.path.insert(0, hermes_agent_root_text)
+            try:
+                from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
+            except Exception as inner_exc:
+                raise RuntimeError('weixin direct adapter unavailable') from inner_exc
+        if not check_weixin_requirements():
+            raise RuntimeError('weixin adapter requirements not met')
+
+        def direct_send_message(*, extra, token, chat_id, message, media_files=None):
+            return asyncio.run(
+                send_weixin_direct(
+                    extra=extra,
+                    token=token,
+                    chat_id=chat_id,
+                    message=message,
+                    media_files=media_files,
+                )
+            )
+
         send_func = direct_send_message
     result = send_func(extra={}, token='', chat_id=chat_id, message=message, media_files=None)
     return {'ok': bool(result.get('success', result.get('ok', True))), 'platform': 'weixin', 'message_id': result.get('message_id')}
@@ -5512,13 +5666,16 @@ def emit_notification(args: argparse.Namespace, event_type: str, payload: Dict[s
     results = []
     for target in targets:
         parsed = parse_notification_target(target)
-        if parsed['platform'] == 'telegram':
-            bot_token = load_env_value(getattr(args, 'telegram_bot_token_env', 'TELEGRAM_BOT_TOKEN'))
-            results.append(send_telegram_notification(bot_token, parsed['chat_id'], message, thread_id=parsed.get('thread_id'), post_func=post_func))
-        elif parsed['platform'] == 'weixin':
-            results.append(send_weixin_notification(parsed['chat_id'], message))
-        else:
-            results.append({'ok': False, 'platform': parsed['platform'], 'error': 'unsupported_platform'})
+        try:
+            if parsed['platform'] == 'telegram':
+                bot_token = load_env_value(getattr(args, 'telegram_bot_token_env', 'TELEGRAM_BOT_TOKEN'))
+                results.append(send_telegram_notification(bot_token, parsed['chat_id'], message, thread_id=parsed.get('thread_id'), post_func=post_func))
+            elif parsed['platform'] == 'weixin':
+                results.append(send_weixin_notification(parsed['chat_id'], message))
+            else:
+                results.append({'ok': False, 'platform': parsed['platform'], 'error': 'unsupported_platform'})
+        except Exception as exc:
+            results.append({'ok': False, 'platform': parsed.get('platform', 'unknown'), 'error': str(exc)})
     if not results:
         return {'ok': True, 'event_type': event_type, 'target': target_text, 'results': []}
     if len(results) == 1:
@@ -5774,6 +5931,47 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         store.append_event('reconcile', result)
         result['ok'] = False
     return result
+
+
+def apply_reconcile_close_risk_state_updates(store: RuntimeStateStore, reconcile_result: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    closed_position_keys = [
+        str(item or '').strip()
+        for item in list((reconcile_result or {}).get('closed_tracked_positions') or [])
+        if str(item or '').strip()
+    ]
+    if not closed_position_keys:
+        return load_risk_state(store)
+
+    risk_state = load_risk_state(store)
+    now_ts = int(time.time())
+    cooldown_minutes = max(int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), 0)
+    cooldown_until = now_ts + cooldown_minutes * 60 if cooldown_minutes > 0 else None
+    symbol_cooldowns = risk_state.setdefault('symbol_cooldowns', {})
+    recent_closed_trades = risk_state.setdefault('recent_closed_trades', [])
+
+    for position_key in closed_position_keys:
+        symbol, position_side = split_position_key(position_key)
+        normalized_symbol = str(symbol or '').strip().upper()
+        normalized_side = normalize_position_side(position_side or POSITION_SIDE_LONG)
+        if not normalized_symbol:
+            continue
+        if cooldown_until is not None:
+            existing_until = symbol_cooldowns.get(normalized_symbol)
+            if existing_until is None or int(existing_until) < cooldown_until:
+                symbol_cooldowns[normalized_symbol] = cooldown_until
+        recent_closed_trades.append({
+            'symbol': normalized_symbol,
+            'position_side': normalized_side,
+            'side': position_side_to_trade_side(normalized_side),
+            'closed_at': now_ts,
+            'exit_reason': 'exchange_position_missing',
+            'closed_via_reconcile': True,
+        })
+
+    if len(recent_closed_trades) > 50:
+        risk_state['recent_closed_trades'] = recent_closed_trades[-50:]
+    store.save_json('risk_state', risk_state)
+    return risk_state
 
 
 def build_position_exposure_snapshot(open_positions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -6153,10 +6351,22 @@ def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: ar
     top_gainers = int(getattr(args, 'top_gainers', 20) or 20)
     top_losers = int(getattr(args, 'top_losers', top_gainers) or 0)
     try:
+        metas = filter_strategy_websocket_symbol_meta(fetch_exchange_meta(client))
+    except Exception:
+        metas = {}
+    allowed_symbols = list(metas.keys())
+    if not allowed_symbols:
+        allowed_symbols = sorted(fetch_public_exchange_symbol_set())
+    allowed_symbol_set = set(allowed_symbols)
+    try:
         square_rows = []
     except Exception:
         square_rows = []
-    square_symbols = [str(row.get('symbol', '')).upper() for row in list(square_rows or []) if str(row.get('symbol', '')).strip()]
+    square_symbols = [
+        str(row.get('symbol', '')).upper()
+        for row in list(square_rows or [])
+        if str(row.get('symbol', '')).strip() and is_strategy_websocket_symbol_allowed(row.get('symbol'))
+    ]
     try:
         tickers = fetch_tickers(client)
     except Exception:
@@ -6164,15 +6374,20 @@ def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: ar
     merged_payload = merged_candidate_symbols(
         square_symbols=square_symbols,
         tickers=tickers,
+        allowed_symbols=allowed_symbols,
         top_gainers=top_gainers,
         top_losers=top_losers,
     )
     merged_symbols = merged_payload[0]
-    symbols = [str(symbol).upper() for symbol in list(merged_symbols or []) if str(symbol).strip()]
+    symbols = [
+        str(symbol).upper()
+        for symbol in list(merged_symbols or [])
+        if str(symbol).strip() and is_strategy_websocket_symbol_allowed(symbol)
+    ]
     if symbols:
         return symbols
     if square_symbols:
-        return square_symbols
+        return [symbol for symbol in square_symbols if not allowed_symbols or symbol in allowed_symbol_set]
     return ['BTCUSDT']
 
 
@@ -6382,8 +6597,8 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         return result
     scan_result, best_candidate, meta_map = run_scan_once(client, args)
     cycle['scan'] = scan_result
+    risk_state = apply_reconcile_close_risk_state_updates(store, reconcile, args)
     if best_candidate is None:
-        risk_state = load_risk_state(store)
         cycle['risk_guard'] = evaluate_risk_guards(
             risk_state=risk_state,
             daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0),
@@ -6403,7 +6618,6 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             'execution_exchange': execution_exchange,
         },
     )
-    risk_state = load_risk_state(store)
     risk_guard = evaluate_risk_guards(
         symbol=best_candidate.symbol,
         risk_state=risk_state,
@@ -6494,7 +6708,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             'overextension_flag': bool(getattr(best_candidate, 'overextension_flag', False)),
         }
         cycle['triggered_but_risk_rejected'] = [risk_reject_detail] if bool(getattr(best_candidate, 'trigger_fired', False)) or bool(getattr(best_candidate, 'setup_ready', False)) else []
-        probe_entry = evaluate_sim_probe_entry(best_candidate, risk_guard, args) if binance_simulated_trading else {'allowed': False, 'reasons': ['not_simulated_trading']}
+        probe_entry = evaluate_sim_probe_entry(best_candidate, risk_guard, args)
         cycle['sim_probe_entry'] = probe_entry
         if not bool(probe_entry.get('allowed', False)):
             cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']

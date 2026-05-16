@@ -277,11 +277,7 @@ def render_cn_scan_summary(summary: Dict[str, Any], format_num, format_pct) -> s
     selected = summary.get('首选标的')
     lines = [
         f"扫描模式: {summary.get('模式', 'dry-run')}",
-        f"市场状态: {market.get('标签', '-')} ×{format_num(market.get('乘数', 1.0), 2)}",
     ]
-    reasons = market.get('原因', []) or []
-    if reasons:
-        lines.append(f"状态原因: {', '.join(str(x) for x in reasons[:4])}")
     lines.append(f"扫描结果: 候选 {overview.get('候选数', 0)} 个 | 拒绝 {overview.get('拒绝数', 0)} 个")
     reject_items = overview.get('主要拒绝原因', []) or []
     if reject_items:
