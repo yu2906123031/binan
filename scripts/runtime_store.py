@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 import contextlib
-import fcntl
+import portalocker
 import json
 import os
 import uuid
@@ -388,11 +388,11 @@ class RuntimeStateStore:
     def _file_lock(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock_path(path).open('a+', encoding='utf-8') as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            portalocker.lock(lock_fh, portalocker.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                portalocker.unlock(lock_fh)
 
     def _atomic_write_json(self, path: Path, payload: Any) -> Any:
         path.parent.mkdir(parents=True, exist_ok=True)

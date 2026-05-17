@@ -765,20 +765,99 @@ def test_main_single_run_prints_scan_payload(monkeypatch, capsys):
     assert 'DOGEUSDT' in captured.out
 
 
+
+def test_resident_runtime_uses_split_cycles_instead_of_run_loop(monkeypatch, capsys):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, poll_interval_sec=0, base_url='https://example.com')
+    calls = []
+    store = mod.RuntimeStateStore(runtime_state_dir='/tmp/runtime-split-cycle-test')
+
+    monkeypatch.setattr(mod, 'parse_args', lambda argv=None: args)
+    monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'run_loop', lambda *a, **k: (_ for _ in ()).throw(AssertionError('resident runtime must not call monolithic run_loop')))
+
+    def fake_scan_only_cycle(client, passed_args, *, store=None, cycle_no=None, websocket_status=None):
+        calls.append(('scan', cycle_no, websocket_status))
+        return {'ok': True, 'cycle': {'scan': {'candidate_count': 1}}, 'execution_request': {'symbol': 'DOGEUSDT'}, 'manager_update': {'state': 'SCAN_READY', 'cycle': {'scan': {'candidate_count': 1}}}}
+
+    def fake_execution_cycle(client, passed_args, execution_request, *, store=None):
+        calls.append(('execution', execution_request.get('symbol')))
+        return {'ok': True, 'live_execution': {'symbol': execution_request.get('symbol')}}
+
+    def fake_management_cycle(passed_args, manager_update, *, store=None):
+        calls.append(('manager', manager_update.get('state')))
+        return {'ok': True, 'state': manager_update.get('state')}
+
+    monkeypatch.setattr(mod, 'scan_only_cycle', fake_scan_only_cycle)
+    monkeypatch.setattr(mod, 'execution_cycle', fake_execution_cycle)
+    monkeypatch.setattr(mod, 'management_cycle', fake_management_cycle)
+
+    exit_code = mod.main([])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert ('scan', 1, None) in calls
+    assert ('execution', 'DOGEUSDT') in calls
+    assert ('manager', 'SCAN_READY') in calls
+    assert '"auto_loop": true' in captured.out
+    assert '"cycle_no": 1' in captured.out
+
+
+
+def test_resident_ws_task_starts_monitor_once_across_multiple_scan_cycles(monkeypatch, capsys):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=3, poll_interval_sec=0, base_url='https://example.com', require_book_ticker_ws=True)
+    store = mod.RuntimeStateStore(runtime_state_dir='/tmp/runtime-single-ws-task-test')
+    scan_ws_statuses = []
+    monitor_calls = []
+
+    monkeypatch.setattr(mod, 'parse_args', lambda argv=None: args)
+    monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'run_loop', lambda *a, **k: (_ for _ in ()).throw(AssertionError('resident runtime must not call monolithic run_loop')))
+
+    def fake_monitor(*, client, store, args):
+        monitor_calls.append('started')
+        store.save_json('book_ticker_ws_status', {
+            'status': 'healthy',
+            'updated_at': mod._isoformat_utc(mod._utc_now()),
+            'messages_processed': 1,
+            'samples_written': 1,
+        })
+        return {'status': 'resident_started', 'summary': {'running': True}, 'health': store.load_json('book_ticker_ws_status', {})}
+
+    def fake_scan_only_cycle(client, passed_args, *, store=None, cycle_no=None, websocket_status=None):
+        scan_ws_statuses.append(websocket_status)
+        return {'ok': True, 'cycle': {'cycle_no': cycle_no}, 'manager_update': {'state': 'SCAN', 'cycle': {'cycle_no': cycle_no}}}
+
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', fake_monitor)
+    monkeypatch.setattr(mod, 'scan_only_cycle', fake_scan_only_cycle)
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    exit_code = mod.main([])
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert monitor_calls == ['started']
+    assert len(scan_ws_statuses) == 3
+
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=7, base_url='https://example.com')
     cycle_calls = []
     sleeps = []
+    store = mod.RuntimeStateStore(runtime_state_dir='/tmp/runtime-split-main-loop-test')
 
     monkeypatch.setattr(mod, 'parse_args', lambda argv=None: args)
     monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
 
-    def fake_run_loop(client, passed_args):
-        cycle_calls.append(len(cycle_calls) + 1)
-        return {'ok': True, 'cycles': [{'scan': {'candidate_count': len(cycle_calls)}}], 'cycle_no': len(cycle_calls)}
+    def fake_scan_only_cycle(client, passed_args, *, store=None, cycle_no=None, websocket_status=None):
+        cycle_calls.append(cycle_no)
+        return {'ok': True, 'cycle': {'cycle_no': cycle_no, 'scan': {'candidate_count': cycle_no}}, 'manager_update': {'state': 'SCAN', 'cycle': {'cycle_no': cycle_no, 'scan': {'candidate_count': cycle_no}}}}
 
-    monkeypatch.setattr(mod, 'run_loop', fake_run_loop)
+    monkeypatch.setattr(mod, 'scan_only_cycle', fake_scan_only_cycle)
     monkeypatch.setattr(mod.time, 'sleep', lambda seconds: sleeps.append(seconds))
 
     exit_code = mod.main([])
@@ -790,24 +869,27 @@ def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     assert '"auto_loop": true' in captured.out
     assert '"cycle_no": 2' in captured.out
 
+
 def test_main_auto_loop_zero_cycles_runs_forever_until_keyboard_interrupt(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=0, poll_interval_sec=5, base_url='https://example.com')
     cycle_calls = []
     sleeps = []
+    store = mod.RuntimeStateStore(runtime_state_dir='/tmp/runtime-split-interrupt-sleep-test')
 
     monkeypatch.setattr(mod, 'parse_args', lambda argv=None: args)
     monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
 
-    def fake_run_loop(client, passed_args):
-        cycle_calls.append(len(cycle_calls) + 1)
-        return {'ok': True, 'cycles': [], 'cycle_no': len(cycle_calls)}
+    def fake_scan_only_cycle(client, passed_args, *, store=None, cycle_no=None, websocket_status=None):
+        cycle_calls.append(cycle_no)
+        return {'ok': True, 'cycle': {'cycle_no': cycle_no}, 'manager_update': {'state': 'SCAN', 'cycle': {'cycle_no': cycle_no}}}
 
     def fake_sleep(seconds):
         sleeps.append(seconds)
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(mod, 'run_loop', fake_run_loop)
+    monkeypatch.setattr(mod, 'scan_only_cycle', fake_scan_only_cycle)
     monkeypatch.setattr(mod.time, 'sleep', fake_sleep)
 
     exit_code = mod.main([])
@@ -819,21 +901,23 @@ def test_main_auto_loop_zero_cycles_runs_forever_until_keyboard_interrupt(monkey
     assert 'interrupted' in captured.out
 
 
-def test_main_auto_loop_zero_cycles_exits_cleanly_when_run_loop_interrupts(monkeypatch, capsys):
+def test_main_auto_loop_zero_cycles_exits_cleanly_when_scan_cycle_interrupts(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=0, poll_interval_sec=5, base_url='https://example.com')
     cycle_calls = []
     sleeps = []
+    store = mod.RuntimeStateStore(runtime_state_dir='/tmp/runtime-split-interrupt-scan-test')
 
     monkeypatch.setattr(mod, 'parse_args', lambda argv=None: args)
     monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
     monkeypatch.setattr(mod.time, 'sleep', lambda seconds: sleeps.append(seconds))
 
-    def fake_run_loop(client, passed_args):
-        cycle_calls.append(len(cycle_calls) + 1)
+    def fake_scan_only_cycle(client, passed_args, *, store=None, cycle_no=None, websocket_status=None):
+        cycle_calls.append(cycle_no)
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(mod, 'run_loop', fake_run_loop)
+    monkeypatch.setattr(mod, 'scan_only_cycle', fake_scan_only_cycle)
 
     exit_code = mod.main([])
     captured = capsys.readouterr()

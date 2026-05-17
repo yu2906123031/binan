@@ -7844,33 +7844,177 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     return result
 
 
-async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]], stop_event: asyncio.Event) -> None:
+def _persist_resident_cycle_snapshot(store: RuntimeStateStore, args: argparse.Namespace, cycle_payload: Dict[str, Any]) -> None:
+    try:
+        store.save_json('last_cycle', {
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'profile': getattr(args, 'profile', 'default'),
+            'live_requested': bool(getattr(args, 'live', False)),
+            'execution_exchange': execution_exchange_label(args),
+            'scan_only': bool(getattr(args, 'scan_only', False)),
+            'auto_loop': bool(getattr(args, 'auto_loop', False)),
+            'cycle': cycle_payload,
+        })
+    except Exception:
+        pass
+
+
+def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[RuntimeStateStore] = None, cycle_no: Optional[int] = None, websocket_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Scanner actor step: reconcile, generate candidates, evaluate gates, and emit execution work."""
+    store = store or get_runtime_state_store(args)
+    scanner_timeout_seconds = float(getattr(args, 'scanner_timeout_seconds', 45.0) or 45.0)
+    cleanup_symbol_runtime_state_ttl(store, ttl_seconds=float(getattr(args, 'runtime_ttl_seconds', 900.0) or 900.0))
+    binance_simulated_trading = is_binance_simulated_trading(args)
+    execution_exchange = execution_exchange_label(args)
+    if binance_simulated_trading:
+        reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'binance_simulated_trading', 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
+    else:
+        try:
+            try:
+                reconcile = reconcile_runtime_state(client, store, halt_on_orphan_position=getattr(args, 'halt_on_orphan_position', False), repair_missing_protection_enabled=getattr(args, 'repair_missing_protection', True), args=args)
+            except TypeError as exc:
+                if "unexpected keyword argument 'args'" not in str(exc):
+                    raise
+                reconcile = reconcile_runtime_state(client, store, halt_on_orphan_position=getattr(args, 'halt_on_orphan_position', False), repair_missing_protection_enabled=getattr(args, 'repair_missing_protection', True))
+        except BinanceAPIError as exc:
+            if str(exc) == 'api_secret is required for signed requests' and not getattr(args, 'live', False) and not getattr(args, 'reconcile_only', False):
+                reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'missing_api_secret', 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
+            else:
+                raise
+    cycle: Dict[str, Any] = {'reconcile': reconcile}
+    if cycle_no is not None:
+        cycle['cycle_no'] = cycle_no
+    if websocket_status is not None:
+        cycle['book_ticker_websocket'] = websocket_status
+    if getattr(args, 'reconcile_only', False) or not reconcile.get('ok', True):
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': bool(reconcile.get('ok', True)), 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'reconcile': reconcile}}
+    scan_call_result = run_with_deadman_timeout(run_scan_once, client, args, timeout_seconds=scanner_timeout_seconds, store=store, component='scanner', operation='scan_cycle')
+    if isinstance(scan_call_result, dict) and scan_call_result.get('reason') == 'deadman_timeout':
+        cycle['scan'] = {'ok': False, 'blocked_reason': 'scanner_timeout', 'deadman': scan_call_result}
+        cycle['blocked_reason'] = 'scanner_timeout'
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'scanner_timeout'}}
+    scan_result, best_candidate, meta_map = scan_call_result
+    cycle['scan'] = scan_result
+    record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', extra={'candidate_found': best_candidate is not None, 'cycle_no': cycle_no})
+    risk_state = apply_reconcile_close_risk_state_updates(store, reconcile, args)
+    if best_candidate is None:
+        cycle['risk_guard'] = evaluate_risk_guards(risk_state=risk_state, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0))
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'no_candidate'}}
+    append_candidate_selected_event(store, best_candidate, regime_payload=scan_result.get('market_regime', {}) if isinstance(scan_result, dict) else {}, extra={'profile': getattr(args, 'profile', 'default'), 'live_requested': bool(getattr(args, 'live', False)), 'scan_only': bool(getattr(args, 'scan_only', False)), 'execution_exchange': execution_exchange})
+    risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''))
+    open_positions = fetch_open_positions(client) if getattr(args, 'live', False) and not binance_simulated_trading else []
+    portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=open_positions, candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
+    risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard}
+    cycle['risk_guard'] = risk_guard
+    cycle['scan_only'] = bool(getattr(args, 'scan_only', False))
+    cycle['live_requested'] = bool(getattr(args, 'live', False))
+    cycle['execution_exchange'] = execution_exchange
+    if isinstance(cycle.get('scan'), dict) and isinstance(cycle['scan'].get('funnel'), dict):
+        cycle['scan']['funnel']['selected_risk_allowed_count'] = 1 if risk_guard['allowed'] else 0
+        cycle['scan']['funnel']['order_submitted_count'] = 0
+    if (not getattr(args, 'live', False)) or getattr(args, 'scan_only', False):
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': choose_auto_loop_state_for_candidate(best_candidate, risk_guard), 'reason': 'scan_only'}}
+    if bool(getattr(args, 'require_book_ticker_ws', True)) and websocket_status:
+        health = websocket_status.get('health') if isinstance(websocket_status.get('health'), dict) else websocket_status
+        freshness = evaluate_websocket_freshness(health, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
+        cycle['book_ticker_websocket_freshness'] = freshness
+        if not freshness.get('fresh'):
+            reason = str(freshness.get('reason') or 'stale_websocket')
+            cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{reason}']
+            append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
+            _persist_resident_cycle_snapshot(store, args, cycle)
+            return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}'}}
+    if len(open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
+        cycle['live_skipped_due_to_existing_positions'] = open_positions
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached'}}
+    if not risk_guard['allowed']:
+        cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']
+        append_candidate_rejected_event(store, best_candidate, risk_guard['reasons'])
+        append_missed_trade_event(store, best_candidate, risk_guard['reasons'])
+        _persist_resident_cycle_snapshot(store, args, cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'risk_guard_blocked'}}
+    meta = meta_map.get(best_candidate.symbol)
+    if meta is None:
+        raise ValueError(f'missing symbol meta for {best_candidate.symbol}')
+    execution_request = {'candidate': best_candidate, 'meta': meta, 'risk_guard': risk_guard, 'reconcile': reconcile, 'cycle': cycle, 'requested_leverage': int(getattr(args, 'leverage', getattr(best_candidate, 'recommended_leverage', 1)) or getattr(best_candidate, 'recommended_leverage', 1)), 'cycle_no': cycle_no}
+    _persist_resident_cycle_snapshot(store, args, cycle)
+    return {'ok': True, 'cycle': cycle, 'execution_request': execution_request, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'ENTERING', 'reason': 'execution_gate_passed'}}
+
+
+def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Dict[str, Any], *, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
+    """Execution actor step: place/manage a trade isolated from scanner progress."""
+    store = store or get_runtime_state_store(args)
+    candidate = execution_request['candidate']
+    meta = execution_request['meta']
+    cycle = dict(execution_request.get('cycle') or {})
+    execution_timeout_seconds = float(getattr(args, 'execution_timeout_seconds', 30.0) or 30.0)
+    persist_auto_loop_state(store, args=args, state='ENTERING', candidate=candidate, reason='execution_gate_passed', risk_guard=execution_request.get('risk_guard'), reconcile=execution_request.get('reconcile'))
+    try:
+        live_execution = run_with_deadman_timeout(place_live_trade, client, candidate, int(execution_request.get('requested_leverage') or 1), meta, args, timeout_seconds=execution_timeout_seconds, store=store, component='execution', operation='place_live_trade')
+    except BinanceAPIError as exc:
+        error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': str(exc)}
+        append_candidate_rejected_event(store, candidate, ['binance_execution_preflight_failed'], error)
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error)}
+    if isinstance(live_execution, dict) and live_execution.get('reason') == 'deadman_timeout':
+        error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': 'execution_timeout', 'deadman': live_execution}
+        append_candidate_rejected_event(store, candidate, ['execution_timeout'], error)
+        persist_auto_loop_state(store, args=args, state='SCAN', candidate=candidate, reason='execution_timeout', risk_guard=execution_request.get('risk_guard'), reconcile=execution_request.get('reconcile'), extra={'blocked_reason': 'execution_timeout'})
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error)}
+    cycle['live_execution'] = live_execution
+    persist_auto_loop_state(store, args=args, state='POSITION_OPEN', candidate=candidate, reason='entry_order_submitted', risk_guard=execution_request.get('risk_guard'), reconcile=execution_request.get('reconcile'), extra={'live_execution': live_execution})
+    positions_state, position_key = persist_live_open_position(store, candidate, live_execution)
+    if getattr(args, 'auto_loop', False):
+        thread = start_trade_monitor_thread(client=client, symbol=candidate.symbol, meta=meta, args=args, trade=live_execution, store=store)
+        positions_state = store.load_json('positions', {}) if isinstance(store.load_json('positions', {}), dict) else positions_state
+        positions_state.setdefault(position_key, {})['monitor_thread_name'] = getattr(thread, 'name', 'trade-monitor')
+        store.save_json('positions', positions_state)
+        append_buy_fill_confirmed_event(store, candidate.symbol, positions_state, position_key)
+        cycle['trade_management'] = {'mode': 'background_thread', 'thread_name': getattr(thread, 'name', 'trade-monitor')}
+    else:
+        cycle['trade_management'] = monitor_live_trade(client=client, symbol=candidate.symbol, meta=meta, args=args, trade=live_execution, store=store)
+    _persist_resident_cycle_snapshot(store, args, cycle)
+    return {'ok': True, 'live_execution': live_execution, 'cycle': cycle, 'manager_update': {'kind': 'execution_result', 'cycle': cycle, 'position_key': position_key}}
+
+
+def management_cycle(args: argparse.Namespace, manager_update: Dict[str, Any], *, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
+    """Manager actor step: single FSM/runtime-state update boundary."""
+    store = store or get_runtime_state_store(args)
+    cycle = manager_update.get('cycle') if isinstance(manager_update, dict) else None
+    if isinstance(cycle, dict):
+        store.save_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycle_no': cycle.get('cycle_no'), 'cycles': [cycle]})
+    append_runtime_event(store, 'resident_manager_update', manager_update if isinstance(manager_update, dict) else {'update': manager_update})
+    return {'ok': True, 'state': manager_update.get('state') if isinstance(manager_update, dict) else None}
+
+
+async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], run_loop_fn: Optional[Callable[[Any, argparse.Namespace], Dict[str, Any]]], stop_event: asyncio.Event) -> None:
     cycle_no = 0
     scanner_timeout_seconds = float(getattr(args, 'scanner_timeout_seconds', 45.0) or 45.0)
     poll_interval = max(0, int(getattr(args, 'poll_interval_sec', 60) or 60))
     while not stop_event.is_set():
         cycle_no += 1
         try:
-            await asyncio.wait_for(queues['scanner'].put({'cycle_no': cycle_no, 'kind': 'scan_cycle'}), timeout=1.0)
-            work_item = await asyncio.wait_for(queues['scanner'].get(), timeout=1.0)
-            record_runtime_heartbeat(store, component='scanner', status='running', blocked_reason='', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
-            result = await await_component_with_timeout(
-                asyncio.to_thread(run_loop_fn, client, args),
+            websocket_status = store.load_json('book_ticker_ws_status', None)
+            record_runtime_heartbeat(store, component='scanner', status='running', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no})
+            scan_result = await await_component_with_timeout(
+                asyncio.to_thread(scan_only_cycle, client, args, store=store, cycle_no=cycle_no, websocket_status=websocket_status if isinstance(websocket_status, dict) else None),
                 scanner_timeout_seconds,
                 store=store,
                 component='scanner',
-                operation='resident_scan_cycle',
+                operation='resident_scan_only_cycle',
             )
-            queues['scanner'].task_done()
-            await asyncio.wait_for(queues['manager'].put({'kind': 'cycle_result', 'cycle_no': cycle_no, 'result': result, 'work_item': work_item}), timeout=1.0)
-            if isinstance(result, dict):
-                cycles = result.get('cycles') if isinstance(result.get('cycles'), list) else []
-                for cycle in cycles:
-                    if isinstance(cycle, dict) and cycle.get('live_execution'):
-                        await asyncio.wait_for(queues['execution'].put({'kind': 'execution_result', 'cycle_no': cycle_no, 'live_execution': cycle.get('live_execution')}), timeout=1.0)
-            record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
+            cycle = scan_result.get('cycle') if isinstance(scan_result, dict) else {}
+            if isinstance(scan_result, dict) and scan_result.get('execution_request'):
+                await asyncio.wait_for(queues['execution'].put({'kind': 'execution_request', 'cycle_no': cycle_no, 'request': scan_result['execution_request']}), timeout=1.0)
+            if isinstance(scan_result, dict) and scan_result.get('manager_update'):
+                await asyncio.wait_for(queues['manager'].put({'kind': 'manager_update', 'cycle_no': cycle_no, 'update': scan_result['manager_update']}), timeout=1.0)
+            record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no, 'candidate_found': bool(cycle.get('scan'))})
         except asyncio.TimeoutError:
-            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='scanner_queue_timeout', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
+            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='scanner_queue_timeout', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no})
         except KeyboardInterrupt:
             store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
             stop_event.set()
@@ -7885,8 +8029,8 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
             stop_event.set()
             break
 
-
-async def execution_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+async def execution_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+    execution_timeout_seconds = float(getattr(args, 'execution_timeout_seconds', 30.0) or 30.0) + 5.0
     while not stop_event.is_set() or not queues['execution'].empty():
         try:
             item = await asyncio.wait_for(queues['execution'].get(), timeout=1.0)
@@ -7894,13 +8038,22 @@ async def execution_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Que
             record_runtime_heartbeat(store, component='execution', status='idle', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize)
             continue
         try:
-            record_runtime_heartbeat(store, component='execution', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'kind': item.get('kind'), 'cycle_no': item.get('cycle_no')})
-            append_runtime_event(store, 'resident_execution_observed', item)
+            record_runtime_heartbeat(store, component='execution', status='running', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'kind': item.get('kind'), 'cycle_no': item.get('cycle_no')})
+            result = await await_component_with_timeout(
+                asyncio.to_thread(execution_cycle, client, args, item.get('request') or {}, store=store),
+                execution_timeout_seconds,
+                store=store,
+                component='execution',
+                operation='resident_execution_cycle',
+            )
+            if isinstance(result, dict) and result.get('manager_update'):
+                await asyncio.wait_for(queues['manager'].put({'kind': 'manager_update', 'cycle_no': item.get('cycle_no'), 'update': result['manager_update']}), timeout=1.0)
+            append_runtime_event(store, 'resident_execution_completed', result if isinstance(result, dict) else {'result': result})
+            record_runtime_heartbeat(store, component='execution', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': item.get('cycle_no')})
         finally:
             queues['execution'].task_done()
 
-
-async def manager_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+async def manager_task(args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
     last_result: Dict[str, Any] = {'ok': True, 'cycles': []}
     while not stop_event.is_set() or not queues['manager'].empty():
         try:
@@ -7909,26 +8062,61 @@ async def manager_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue
             record_runtime_heartbeat(store, component='manager', status='idle', blocked_reason='', queue_depth=queues['manager'].qsize(), queue_maxsize=queues['manager'].maxsize)
             continue
         try:
-            if item.get('kind') == 'cycle_result' and isinstance(item.get('result'), dict):
-                last_result = dict(item['result'], cycle_no=item.get('cycle_no'), auto_loop=True)
-                store.save_json('resident_last_result', last_result)
+            update = item.get('update') if item.get('kind') == 'manager_update' else item.get('result')
+            if isinstance(update, dict):
+                management_result = management_cycle(args, update, store=store)
+                cycle = update.get('cycle') if isinstance(update.get('cycle'), dict) else None
+                if cycle is not None:
+                    last_result = {'ok': True, 'cycles': [cycle], 'cycle_no': item.get('cycle_no'), 'auto_loop': True}
+                    store.save_json('resident_last_result', last_result)
             record_runtime_heartbeat(store, component='manager', status='healthy', blocked_reason='', queue_depth=queues['manager'].qsize(), queue_maxsize=queues['manager'].maxsize, extra={'kind': item.get('kind'), 'cycle_no': item.get('cycle_no')})
         finally:
             queues['manager'].task_done()
 
 
 async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, stop_event: asyncio.Event) -> None:
+    """Single resident websocket actor: start one supervisor, then monitor freshness."""
     interval = max(1.0, float(getattr(args, 'websocket_healthcheck_interval_seconds', 15.0) or 15.0))
+    timeout_seconds = float(getattr(args, 'websocket_healthcheck_timeout_seconds', 10.0) or 10.0)
+    stale_seconds = float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0)
+    restart_backoff_seconds = max(1.0, float(getattr(args, 'websocket_restart_backoff_seconds', 5.0) or 5.0))
+    last_restart_at = 0.0
+
+    async def start_or_recover_supervisor(trigger: str) -> None:
+        nonlocal last_restart_at
+        now = time.monotonic()
+        if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
+            return
+        last_restart_at = now
+        result = await await_component_with_timeout(
+            asyncio.to_thread(run_auto_loop_book_ticker_websocket_monitor, client=client, store=store, args=args),
+            timeout_seconds,
+            store=store,
+            component='ws',
+            operation='book_ticker_resident_supervisor_start',
+        )
+        record_runtime_heartbeat(store, component='ws', status='healthy', blocked_reason='', extra={'trigger': trigger, 'summary': result.get('summary') if isinstance(result, dict) else {}})
+
+    try:
+        await start_or_recover_supervisor('initial_start')
+    except Exception as exc:
+        record_runtime_heartbeat(store, component='ws', status='restarting', blocked_reason='websocket_initial_start_exception', extra={'error': str(exc), 'error_type': type(exc).__name__})
+
     while not stop_event.is_set():
         try:
-            result = await await_component_with_timeout(
-                asyncio.to_thread(run_auto_loop_book_ticker_websocket_monitor, client=client, store=store, args=args),
-                float(getattr(args, 'websocket_healthcheck_timeout_seconds', 10.0) or 10.0),
-                store=store,
-                component='ws',
-                operation='book_ticker_healthcheck',
+            health = store.load_json('book_ticker_ws_status', {})
+            freshness = evaluate_websocket_freshness(
+                health if isinstance(health, dict) else {},
+                max_age_seconds=stale_seconds,
+                require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)),
             )
-            record_runtime_heartbeat(store, component='ws', status='healthy', blocked_reason='', extra={'summary': result.get('summary') if isinstance(result, dict) else {}})
+            if freshness.get('fresh'):
+                record_runtime_heartbeat(store, component='ws', status='healthy', blocked_reason='', extra={'freshness': freshness})
+            else:
+                reason = str(freshness.get('reason') or 'stale_websocket')
+                payload = record_runtime_heartbeat(store, component='ws', status='restarting', blocked_reason=f'websocket_stale:{reason}', extra={'freshness': freshness, 'health': health if isinstance(health, dict) else {}})
+                append_runtime_event(store, 'book_ticker_ws_stale_recovery', payload)
+                await start_or_recover_supervisor(f'stale:{reason}')
         except Exception as exc:
             record_runtime_heartbeat(store, component='ws', status='restarting', blocked_reason='websocket_healthcheck_exception', extra={'error': str(exc), 'error_type': type(exc).__name__})
         try:
@@ -7957,16 +8145,21 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     queues = build_async_runtime_task_queues(int(getattr(args, 'runtime_queue_maxsize', 128) or 128))
     stop_event = asyncio.Event()
     record_runtime_heartbeat(store, component='resident', status='starting', blocked_reason='', extra={'tasks': ['scanner', 'execution', 'manager', 'ws', 'watchdog']})
-    tasks = [
-        asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task'),
-        asyncio.create_task(execution_task(store, queues, stop_event), name='execution_task'),
-        asyncio.create_task(manager_task(store, queues, stop_event), name='manager_task'),
-        asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
-    ]
+    tasks = []
     if bool(getattr(args, 'require_book_ticker_ws', True)):
         tasks.append(asyncio.create_task(ws_task(client, args, store, stop_event), name='ws_task'))
+        await asyncio.sleep(0)
+    tasks.extend([
+        asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task'),
+        asyncio.create_task(execution_task(client, args, store, queues, stop_event), name='execution_task'),
+        asyncio.create_task(manager_task(args, store, queues, stop_event), name='manager_task'),
+        asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
+    ])
+    scanner_runtime_task = next(task for task in tasks if task.get_name() == 'scanner_task')
     try:
-        await tasks[0]
+        await scanner_runtime_task
+        await queues['execution'].join()
+        await queues['manager'].join()
     finally:
         stop_event.set()
         await asyncio.gather(*tasks[1:], return_exceptions=True)
@@ -7975,8 +8168,24 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     return last_result if isinstance(last_result, dict) else {'ok': True, 'auto_loop': True, 'cycles': []}
 
 
-def run_resident_runtime(client: Any, args: argparse.Namespace, run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]]) -> Dict[str, Any]:
-    return asyncio.run(run_resident_runtime_async(client, args, run_loop_fn))
+def run_resident_runtime(client: Any, args: argparse.Namespace, run_loop_fn: Optional[Callable[[Any, argparse.Namespace], Dict[str, Any]]] = None) -> Dict[str, Any]:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run_resident_runtime_async(client, args, run_loop_fn))
+    result_holder: Dict[str, Any] = {}
+    error_holder: Dict[str, BaseException] = {}
+    def runner() -> None:
+        try:
+            result_holder['result'] = asyncio.run(run_resident_runtime_async(client, args, run_loop_fn))
+        except BaseException as exc:
+            error_holder['error'] = exc
+    thread = threading.Thread(target=runner, name='resident-runtime-event-loop', daemon=True)
+    thread.start()
+    thread.join()
+    if 'error' in error_holder:
+        raise error_holder['error']
+    return result_holder.get('result', {'ok': True, 'auto_loop': True, 'cycles': []})
 
 
 def run_supervised_auto_loop(client: Any, args: argparse.Namespace, run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]]) -> Dict[str, Any]:
