@@ -7898,11 +7898,14 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     scan_result, best_candidate, meta_map = scan_call_result
     cycle['scan'] = scan_result
     record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', extra={'candidate_found': best_candidate is not None, 'cycle_no': cycle_no})
-    risk_state = apply_reconcile_close_risk_state_updates(store, reconcile, args)
+    try:
+        risk_state = load_risk_state(store)
+    except AttributeError:
+        risk_state = default_risk_state()
     if best_candidate is None:
         cycle['risk_guard'] = evaluate_risk_guards(risk_state=risk_state, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0))
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'no_candidate'}}
-    append_candidate_selected_event(store, best_candidate, regime_payload=scan_result.get('market_regime', {}) if isinstance(scan_result, dict) else {}, extra={'profile': getattr(args, 'profile', 'default'), 'live_requested': bool(getattr(args, 'live', False)), 'scan_only': bool(getattr(args, 'scan_only', False)), 'execution_exchange': execution_exchange})
+    event_updates: List[Dict[str, Any]] = [append_candidate_selected_event(None, best_candidate, regime_payload=scan_result.get('market_regime', {}) if isinstance(scan_result, dict) else {}, extra={'profile': getattr(args, 'profile', 'default'), 'live_requested': bool(getattr(args, 'live', False)), 'scan_only': bool(getattr(args, 'scan_only', False)), 'execution_exchange': execution_exchange})]
     risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''))
     open_positions = fetch_open_positions(client) if getattr(args, 'live', False) and not binance_simulated_trading else []
     portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=open_positions, candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
@@ -7915,7 +7918,7 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         cycle['scan']['funnel']['selected_risk_allowed_count'] = 1 if risk_guard['allowed'] else 0
         cycle['scan']['funnel']['order_submitted_count'] = 0
     if (not getattr(args, 'live', False)) or getattr(args, 'scan_only', False):
-        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': choose_auto_loop_state_for_candidate(best_candidate, risk_guard), 'reason': 'scan_only'}}
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': choose_auto_loop_state_for_candidate(best_candidate, risk_guard), 'reason': 'scan_only', 'reconcile': reconcile, 'event_updates': event_updates}}
     if bool(getattr(args, 'require_book_ticker_ws', True)) and websocket_status:
         health = websocket_status.get('health') if isinstance(websocket_status.get('health'), dict) else websocket_status
         freshness = evaluate_websocket_freshness(health, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
@@ -7923,21 +7926,23 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         if not freshness.get('fresh'):
             reason = str(freshness.get('reason') or 'stale_websocket')
             cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{reason}']
-            append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
-            return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}'}}
+            event_updates.append(append_candidate_rejected_event(None, best_candidate, cycle['live_skipped_due_to_websocket_gate']))
+            return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'reconcile': reconcile, 'event_updates': event_updates}}
     if len(open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
         cycle['live_skipped_due_to_existing_positions'] = open_positions
-        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached'}}
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached', 'reconcile': reconcile, 'event_updates': event_updates}}
     if not risk_guard['allowed']:
         cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']
-        append_candidate_rejected_event(store, best_candidate, risk_guard['reasons'])
-        append_missed_trade_event(store, best_candidate, risk_guard['reasons'])
-        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'risk_guard_blocked'}}
+        event_updates.append(append_candidate_rejected_event(None, best_candidate, risk_guard['reasons']))
+        missed_event = append_missed_trade_event(None, best_candidate, risk_guard['reasons'])
+        if missed_event:
+            event_updates.append(missed_event)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'risk_guard_blocked', 'reconcile': reconcile, 'event_updates': event_updates}}
     meta = meta_map.get(best_candidate.symbol)
     if meta is None:
         raise ValueError(f'missing symbol meta for {best_candidate.symbol}')
     execution_request = {'candidate': best_candidate, 'meta': meta, 'risk_guard': risk_guard, 'reconcile': reconcile, 'cycle': cycle, 'requested_leverage': int(getattr(args, 'leverage', getattr(best_candidate, 'recommended_leverage', 1)) or getattr(best_candidate, 'recommended_leverage', 1)), 'cycle_no': cycle_no}
-    return {'ok': True, 'cycle': cycle, 'execution_request': execution_request, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'ENTERING', 'reason': 'execution_gate_passed'}}
+    return {'ok': True, 'cycle': cycle, 'execution_request': execution_request, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'ENTERING', 'reason': 'execution_gate_passed', 'reconcile': reconcile, 'event_updates': event_updates}}
 
 
 def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Dict[str, Any], *, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
@@ -7979,6 +7984,14 @@ def management_cycle(args: argparse.Namespace, manager_update: Dict[str, Any], *
     store = store or get_runtime_state_store(args)
     update = manager_update if isinstance(manager_update, dict) else {'update': manager_update}
     cycle = update.get('cycle') if isinstance(update.get('cycle'), dict) else None
+    if isinstance(update.get('reconcile'), dict):
+        apply_reconcile_close_risk_state_updates(store, update['reconcile'], args)
+    for event_update in list(update.get('event_updates') or []):
+        if isinstance(event_update, dict):
+            event_type = str(event_update.get('event_type') or 'runtime_event')
+            append_runtime_event(store, event_type, {k: v for k, v in event_update.items() if k != 'event_type'})
+    if update.get('kind') == 'runtime_event':
+        append_runtime_event(store, str(update.get('event_type') or 'runtime_event'), update.get('payload') if isinstance(update.get('payload'), dict) else {})
     if isinstance(update.get('state_transition'), dict):
         transition = update['state_transition']
         persist_auto_loop_state(
@@ -8093,9 +8106,17 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
             cycle = scan_result.get('cycle') if isinstance(scan_result, dict) else {}
             scan_delay_multiplier = 1.0
             if isinstance(scan_result, dict) and scan_result.get('execution_request'):
-                bp_result = await apply_queue_backpressure(queues['execution'], store=store, component='scanner', reason='execution_queue_full', item={'kind': 'execution_request', 'cycle_no': cycle_no, 'request': scan_result['execution_request']})
-                if isinstance(bp_result, dict) and bp_result.get('degraded'):
-                    scan_delay_multiplier = max(scan_delay_multiplier, float((bp_result.get('policy') or {}).get('scan_delay_multiplier', 1.0) or 1.0))
+                execution_item = {'kind': 'execution_request', 'cycle_no': cycle_no, 'request': scan_result['execution_request']}
+                policy = build_backpressure_policy('scanner', 'execution_queue_full', scan_result['execution_request'])
+                candidate_score = float(scan_result['execution_request'].get('candidate_score', getattr(scan_result['execution_request'].get('candidate'), 'score', 1.0)) or 0.0)
+                min_candidate_score = float(policy.get('min_candidate_score', 0.2) or 0.2)
+                if policy.get('drop_candidate') and (queues['execution'].full() or candidate_score < min_candidate_score):
+                    append_runtime_event(store, 'runtime_candidate_dropped_by_backpressure', {'cycle_no': cycle_no, 'policy': policy, 'reason': 'execution_queue_full' if queues['execution'].full() else 'candidate_score_below_backpressure_minimum', 'candidate_score': candidate_score})
+                    scan_delay_multiplier = max(scan_delay_multiplier, float(policy.get('scan_delay_multiplier', 1.0) or 1.0))
+                else:
+                    bp_result = await apply_queue_backpressure(queues['execution'], store=store, component='scanner', reason='execution_queue_full', item=execution_item)
+                    if isinstance(bp_result, dict) and bp_result.get('degraded'):
+                        scan_delay_multiplier = max(scan_delay_multiplier, float((bp_result.get('policy') or {}).get('scan_delay_multiplier', 1.0) or 1.0))
             if isinstance(scan_result, dict) and scan_result.get('manager_update'):
                 bp_result = await apply_queue_backpressure(queues['manager'], store=store, component='scanner', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': cycle_no, 'update': scan_result['manager_update']})
                 if isinstance(bp_result, dict) and bp_result.get('degraded'):
@@ -8108,7 +8129,6 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
             stop_event.set()
             break
         if int(getattr(args, 'max_scan_cycles', 0) or 0) and cycle_no >= int(getattr(args, 'max_scan_cycles', 0) or 0):
-            stop_event.set()
             break
         try:
             await asyncio.to_thread(time.sleep, poll_interval * locals().get('scan_delay_multiplier', 1.0))
@@ -8138,7 +8158,7 @@ async def execution_task(client: Any, args: argparse.Namespace, store: RuntimeSt
                 await apply_queue_backpressure(queues['manager'], store=store, component='execution', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': item.get('cycle_no'), 'update': result['manager_update']})
             if isinstance(result, dict) and result.get('position_manager_request'):
                 await apply_queue_backpressure(queues['position_manager'], store=store, component='execution', reason='position_manager_queue_full', item={'kind': 'position_manager_request', 'cycle_no': item.get('cycle_no'), 'request': result['position_manager_request']})
-            append_runtime_event(store, 'resident_execution_completed', result if isinstance(result, dict) else {'result': result})
+            await apply_queue_backpressure(queues['manager'], store=store, component='execution', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': item.get('cycle_no'), 'update': {'kind': 'runtime_event', 'event_type': 'resident_execution_completed', 'payload': result if isinstance(result, dict) else {'result': result}}})
             record_runtime_heartbeat(store, component='execution', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': item.get('cycle_no')})
         finally:
             queues['execution'].task_done()
@@ -8179,9 +8199,12 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
     async def start_or_recover_supervisor(trigger: str) -> None:
         nonlocal last_restart_at
         global _BOOK_TICKER_WS_SUPERVISOR_ACTIVE
-        if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
-            append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'keep_existing_singleton'})
-            return
+        if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE and trigger == 'initial_start':
+            append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'forced_restart'})
+            _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
+        elif _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
+            append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'forced_restart'})
+            _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
         now = time.monotonic()
         if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
             return
@@ -8290,13 +8313,28 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     ])
     scanner_runtime_task = next(task for task in tasks if task.get_name() == 'scanner_task')
     try:
+        recovery_request = store.load_json('runtime_recovery_request', {})
+        if isinstance(recovery_request, dict) and recovery_request.get('action') == 'supervisor_restart' and not recovery_request.get('consumed'):
+            consumed = dict(recovery_request, consumed=True, consumed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            store.save_json('runtime_recovery_request', consumed)
+            append_runtime_event(store, 'resident_supervisor_restart_consumed', consumed)
+            record_runtime_heartbeat(store, component='resident', status='restarting', blocked_reason='watchdog_recovery_request', extra={'recovery_request': consumed})
         await scanner_runtime_task
         await queues['execution'].join()
         await queues['manager'].join()
         await queues['position_manager'].join()
     finally:
         stop_event.set()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        shutdown_timeout = max(0.01, float(getattr(args, 'resident_shutdown_timeout_seconds', 5.0) or 5.0))
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=shutdown_timeout)
+        except asyncio.TimeoutError:
+            stuck = [task.get_name() for task in tasks if not task.done()]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            append_runtime_event(store, 'resident_shutdown_forced_cancel', {'stuck_tasks': stuck, 'timeout_seconds': shutdown_timeout})
+            await asyncio.gather(*tasks, return_exceptions=True)
     record_runtime_heartbeat(store, component='resident', status='stopped', blocked_reason='')
     last_result = store.load_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycles': []})
     return last_result if isinstance(last_result, dict) else {'ok': True, 'auto_loop': True, 'cycles': []}

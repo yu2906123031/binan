@@ -1131,6 +1131,160 @@ def test_watchdog_persists_recovery_request_for_supervisor(monkeypatch):
     assert recovery['action'] == 'supervisor_restart'
     assert {'scanner_stale', 'ws_stale', 'execution_stale', 'event_loop_lag'} <= set(recovery['actions'])
 
+
+def test_scan_only_cycle_emits_manager_side_effects_without_direct_event_or_risk_writes(monkeypatch):
+    mod = load_module()
+    candidate = mod.Candidate(symbol='DOGEUSDT', last_price=1.0, price_change_pct_24h=5.0, quote_volume_24h=1000000.0, hot_rank=None, gainer_rank=None, funding_rate=None, funding_rate_avg=None, recent_5m_change_pct=1.0, acceleration_ratio_5m_vs_15m=1.0, breakout_level=1.0, recent_swing_low=0.9, stop_price=0.9, quantity=1.0, risk_per_unit=0.1, recommended_leverage=3, rsi_5m=60.0, volume_multiple=2.0, distance_from_ema20_5m_pct=1.0, distance_from_vwap_15m_pct=1.0, higher_tf_summary={}, score=0.9, reasons=[], side='LONG', position_side='LONG', setup_missing=['waiting_breakout'])
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
+
+    class GuardedStore(DummyStore):
+        def append_event(self, event_type, payload):
+            raise AssertionError(f'scanner direct event write: {event_type}')
+        def save_json(self, name, payload):
+            if name == 'runtime_heartbeat':
+                return super().save_json(name, payload)
+            raise AssertionError(f'scanner direct state write: {name}')
+
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'is_binance_simulated_trading', lambda args: False)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'closed_positions': ['OLD:LONG']})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'candidate_count': 1, 'market_regime': {}}, candidate, {'DOGEUSDT': {'symbol': 'DOGEUSDT'}}))
+    monkeypatch.setattr(mod, 'apply_reconcile_close_risk_state_updates', lambda *a, **k: (_ for _ in ()).throw(AssertionError('scanner direct risk-state write')))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': False, 'reasons': ['unit_risk_block'], 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+
+    result = mod.scan_only_cycle(DummyClient(), args, store=GuardedStore(), cycle_no=9)
+
+    update = result['manager_update']
+    assert update['reason'] == 'risk_guard_blocked'
+    assert update['reconcile'] == {'ok': True, 'closed_positions': ['OLD:LONG']}
+    assert any(e['event_type'] == 'candidate_selected' for e in update['event_updates'])
+    assert any(e['event_type'] == 'candidate_rejected' for e in update['event_updates'])
+    assert any(e['event_type'] == 'missed_trade' for e in update['event_updates'])
+
+
+def test_execution_task_routes_completion_event_through_manager_queue(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, execution_timeout_seconds=0.1)
+    store = DummyStore()
+    queues = {'execution': __import__('asyncio').Queue(maxsize=4), 'manager': __import__('asyncio').Queue(maxsize=4), 'position_manager': __import__('asyncio').Queue(maxsize=4)}
+    queues['execution'].put_nowait({'kind': 'execution_request', 'cycle_no': 7, 'request': {'x': 1}})
+    seen = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return {'ok': True, 'manager_update': {'kind': 'execution_result', 'cycle': {'cycle_no': 7}}}
+
+    def forbidden_event(*args, **kwargs):
+        raise AssertionError('execution direct runtime event write')
+
+    monkeypatch.setattr(mod.asyncio, 'to_thread', fake_to_thread)
+    monkeypatch.setattr(mod, 'append_runtime_event', forbidden_event)
+    stop = __import__('asyncio').Event()
+    stop.set()
+    __import__('asyncio').run(mod.execution_task(DummyClient(), args, store, queues, stop))
+
+    while not queues['manager'].empty():
+        seen.append(queues['manager'].get_nowait())
+    kinds = [item['update']['kind'] for item in seen]
+    assert 'execution_result' in kinds
+    assert 'runtime_event' in kinds
+    assert any(item['update'].get('event_type') == 'resident_execution_completed' for item in seen)
+
+
+def test_ws_task_forces_restart_when_singleton_guard_is_stale(monkeypatch):
+    mod = load_module()
+    args = make_args(require_book_ticker_ws=True, websocket_healthcheck_interval_seconds=0.001, websocket_healthcheck_timeout_seconds=0.1, book_ticker_ws_stale_seconds=0.001, websocket_restart_backoff_seconds=0.001)
+    store = DummyStore()
+    calls = []
+
+    def fake_monitor(*, client, store, args):
+        calls.append('start')
+        store.save_json('book_ticker_ws_status', {'status': 'healthy', 'updated_at': (mod.datetime.now(mod.timezone.utc) - mod.timedelta(seconds=10)).isoformat(), 'messages_processed': len(calls)})
+        return {'status': 'started'}
+
+    async def run_once():
+        stop = __import__('asyncio').Event()
+        task = __import__('asyncio').create_task(mod.ws_task(DummyClient(), args, store, stop))
+        await __import__('asyncio').sleep(0.01)
+        stop.set()
+        await task
+
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', fake_monitor)
+    mod._BOOK_TICKER_WS_SUPERVISOR_ACTIVE = True
+    __import__('asyncio').run(run_once())
+    assert len(calls) >= 1
+    assert any(e['event_type'] == 'book_ticker_ws_singleton_recovery_requested' and e.get('action') == 'forced_restart' for e in store.events)
+
+
+def test_resident_runtime_consumes_recovery_request_and_restarts_tasks(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.1)
+    store = DummyStore()
+    store.save_json('runtime_recovery_request', {'action': 'supervisor_restart', 'actions': ['scanner_stale']})
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+
+    async def one_tick(*args, **kwargs):
+        return None
+    async def scanner(client, args, store, queues, run_loop_fn, stop_event):
+        stop_event.set()
+    monkeypatch.setattr(mod, 'scanner_task', scanner)
+    monkeypatch.setattr(mod, 'execution_task', one_tick)
+    monkeypatch.setattr(mod, 'manager_task', one_tick)
+    monkeypatch.setattr(mod, 'position_manager_task', one_tick)
+    monkeypatch.setattr(mod, 'watchdog_task', one_tick)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', one_tick)
+
+    result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
+    assert result.get('ok') is True
+    assert store.load_json('runtime_recovery_request', {}).get('consumed') is True
+    assert any(e['event_type'] == 'resident_supervisor_restart_consumed' for e in store.events)
+
+
+def test_resident_runtime_shutdown_cancels_stuck_tasks_with_timeout(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.01)
+    store = DummyStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+
+    async def scanner(client, args, store, queues, run_loop_fn, stop_event):
+        stop_event.set()
+    async def stuck(*args, **kwargs):
+        await __import__('asyncio').sleep(10)
+    async def one_tick(*args, **kwargs):
+        return None
+    monkeypatch.setattr(mod, 'scanner_task', scanner)
+    monkeypatch.setattr(mod, 'execution_task', stuck)
+    monkeypatch.setattr(mod, 'manager_task', one_tick)
+    monkeypatch.setattr(mod, 'position_manager_task', one_tick)
+    monkeypatch.setattr(mod, 'watchdog_task', one_tick)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', one_tick)
+
+    result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
+    assert result.get('ok') is True
+    assert any(e['event_type'] == 'resident_shutdown_forced_cancel' for e in store.events)
+
+
+def test_scanner_task_drops_low_score_candidate_under_backpressure(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, poll_interval_sec=0, require_book_ticker_ws=False)
+    store = DummyStore()
+    queues = {'execution': __import__('asyncio').Queue(maxsize=1), 'manager': __import__('asyncio').Queue(maxsize=4)}
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        if fn is mod.scan_only_cycle:
+            return {'ok': True, 'cycle': {'cycle_no': 1}, 'execution_request': {'candidate_score': 0.01, 'candidate': SimpleNamespace(score=0.01)}, 'manager_update': {'kind': 'cycle', 'cycle': {'cycle_no': 1}}}
+        return None
+
+    monkeypatch.setattr(mod.asyncio, 'to_thread', fake_to_thread)
+    monkeypatch.setattr(mod, 'build_backpressure_policy', lambda component, reason, item=None: {'scan_delay_multiplier': 3.0, 'drop_candidate': True, 'pause_non_core_tasks': True, 'min_candidate_score': 0.2})
+    __import__('asyncio').run(mod.scanner_task(DummyClient(), args, store, queues, None, __import__('asyncio').Event()))
+
+    assert queues['execution'].empty()
+    assert any(e['event_type'] == 'runtime_candidate_dropped_by_backpressure' for e in store.events)
+
+
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=7, base_url='https://example.com')
