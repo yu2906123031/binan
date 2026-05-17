@@ -842,6 +842,83 @@ def test_resident_ws_task_starts_monitor_once_across_multiple_scan_cycles(monkey
     assert monitor_calls == ['started']
     assert len(scan_ws_statuses) == 3
 
+
+
+def test_resident_scanner_execution_do_not_write_runtime_state_directly(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=False, scan_only=True, max_scan_cycles=1, require_book_ticker_ws=False)
+
+    class GuardedStore(DummyStore):
+        def save_json(self, name, payload):
+            raise AssertionError(f'non-manager actor wrote runtime state: {name}')
+
+    store = GuardedStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda passed_args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed': {}})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'funnel': {}}, None, {}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'record_runtime_heartbeat', lambda *a, **k: {'ok': True})
+
+    result = mod.scan_only_cycle(DummyClient(), args, store=store, cycle_no=1)
+
+    assert result['manager_update']['kind'] == 'cycle'
+
+
+def test_execution_cycle_emits_position_manager_message_without_starting_monitor(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
+    store = DummyStore()
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3)
+    execution_request = {
+        'candidate': candidate,
+        'meta': {'symbol': 'DOGEUSDT'},
+        'risk_guard': {'allowed': True, 'reasons': []},
+        'reconcile': {'ok': True},
+        'cycle': {'cycle_no': 7},
+        'requested_leverage': 3,
+    }
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: {'symbol': 'DOGEUSDT', 'side': 'LONG', 'quantity': 1})
+    monkeypatch.setattr(mod, 'persist_auto_loop_state', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'persist_live_open_position', lambda *a, **k: ({'DOGEUSDT:LONG': {}}, 'DOGEUSDT:LONG'))
+    monkeypatch.setattr(mod, 'start_trade_monitor_thread', lambda *a, **k: (_ for _ in ()).throw(AssertionError('execution actor must not start long trade monitor')))
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda *a, **k: (_ for _ in ()).throw(AssertionError('execution actor must not monitor trade inline')))
+
+    result = mod.execution_cycle(DummyClient(), args, execution_request, store=store)
+
+    assert result['ok'] is True
+    assert result['position_manager_request']['position_key'] == 'DOGEUSDT:LONG'
+    assert result['manager_update']['kind'] == 'execution_result'
+
+
+def test_runtime_backpressure_triggers_degrade_instead_of_only_logging(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    queue = __import__('asyncio').Queue(maxsize=1)
+    queue.put_nowait({'existing': True})
+    events = []
+    monkeypatch.setattr(mod, 'append_runtime_event', lambda store, event_type, payload: events.append((event_type, payload)) or payload)
+
+    result = __import__('asyncio').run(mod.apply_queue_backpressure(queue, store=store, component='scanner', reason='execution_queue_full'))
+
+    assert result['accepted'] is False
+    assert result['degraded'] is True
+    assert events[-1][0] == 'runtime_backpressure_degrade'
+
+
+def test_event_loop_latency_monitor_records_lag_metric(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    samples = []
+    monkeypatch.setattr(mod, 'record_runtime_heartbeat', lambda store, component, status, blocked_reason='', **kwargs: samples.append({'component': component, 'status': status, 'blocked_reason': blocked_reason, **kwargs}) or samples[-1])
+
+    __import__('asyncio').run(mod.event_loop_latency_task(store, __import__('asyncio').Event(), interval=0.001, warn_threshold_seconds=0.0, max_samples=1))
+
+    assert samples
+    assert samples[-1]['component'] == 'event_loop'
+    assert 'lag_seconds' in samples[-1]['extra']
+
+
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=7, base_url='https://example.com')
