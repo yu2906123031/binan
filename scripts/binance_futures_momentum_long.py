@@ -7955,18 +7955,15 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
     meta = execution_request['meta']
     cycle = dict(execution_request.get('cycle') or {})
     execution_timeout_seconds = float(getattr(args, 'execution_timeout_seconds', 30.0) or 30.0)
-    persist_auto_loop_state(store, args=args, state='ENTERING', candidate=candidate, reason='execution_gate_passed', risk_guard=execution_request.get('risk_guard'), reconcile=execution_request.get('reconcile'))
+    state_transition = {'state': 'ENTERING', 'candidate_symbol': getattr(candidate, 'symbol', ''), 'reason': 'execution_gate_passed', 'risk_guard': execution_request.get('risk_guard'), 'reconcile': execution_request.get('reconcile')}
     try:
-        live_execution = run_with_deadman_timeout(place_live_trade, client, candidate, int(execution_request.get('requested_leverage') or 1), meta, args, timeout_seconds=execution_timeout_seconds, store=store, component='execution', operation='place_live_trade')
+        live_execution = run_with_deadman_timeout(place_live_trade, client, candidate, int(execution_request.get('requested_leverage') or 1), meta, args, timeout_seconds=execution_timeout_seconds, store=None, component='execution', operation='place_live_trade')
     except BinanceAPIError as exc:
         error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': str(exc)}
-        append_candidate_rejected_event(store, candidate, ['binance_execution_preflight_failed'], error)
-        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error)}
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error}}
     if isinstance(live_execution, dict) and live_execution.get('reason') == 'deadman_timeout':
         error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': 'execution_timeout', 'deadman': live_execution}
-        append_candidate_rejected_event(store, candidate, ['execution_timeout'], error)
-        persist_auto_loop_state(store, args=args, state='SCAN', candidate=candidate, reason='execution_timeout', risk_guard=execution_request.get('risk_guard'), reconcile=execution_request.get('reconcile'), extra={'blocked_reason': 'execution_timeout'})
-        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error)}
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error, 'state_transition': {'state': 'SCAN', 'reason': 'execution_timeout', 'blocked_reason': 'execution_timeout'}}}
     cycle['live_execution'] = live_execution
     position_side = getattr(candidate, 'position_side', getattr(candidate, 'side', POSITION_SIDE_LONG))
     position_key = build_position_key(candidate.symbol, position_side)
@@ -7982,37 +7979,69 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
         'reconcile': execution_request.get('reconcile'),
         'cycle': cycle,
     }
-    _persist_resident_cycle_snapshot(store, args, cycle)
-    return {'ok': True, 'live_execution': live_execution, 'cycle': cycle, 'position_manager_request': position_manager_request, 'manager_update': {'kind': 'execution_result', 'cycle': cycle, 'position_key': position_key}}
+    return {'ok': True, 'live_execution': live_execution, 'cycle': cycle, 'position_manager_request': position_manager_request, 'manager_update': {'kind': 'execution_result', 'cycle': cycle, 'position_key': position_key, 'state_transition': state_transition}}
 
 
 def management_cycle(args: argparse.Namespace, manager_update: Dict[str, Any], *, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
     """Manager actor step: single FSM/runtime-state update boundary."""
     store = store or get_runtime_state_store(args)
-    cycle = manager_update.get('cycle') if isinstance(manager_update, dict) else None
+    update = manager_update if isinstance(manager_update, dict) else {'update': manager_update}
+    cycle = update.get('cycle') if isinstance(update.get('cycle'), dict) else None
+    if isinstance(update.get('state_transition'), dict):
+        transition = update['state_transition']
+        persist_auto_loop_state(
+            store,
+            args=args,
+            state=str(transition.get('state') or ''),
+            candidate=None,
+            reason=str(transition.get('reason') or ''),
+            risk_guard=transition.get('risk_guard'),
+            reconcile=transition.get('reconcile'),
+            extra={k: v for k, v in transition.items() if k not in {'state', 'reason', 'risk_guard', 'reconcile'}},
+        )
+    if update.get('kind') == 'position_opened':
+        candidate = update.get('candidate')
+        trade = update.get('trade') or {}
+        positions_state, position_key = persist_live_open_position(store, candidate, trade)
+        append_buy_fill_confirmed_event(store, getattr(candidate, 'symbol', update.get('symbol', '')), positions_state, position_key)
+        update = dict(update, position_key=position_key)
     if isinstance(cycle, dict):
         store.save_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycle_no': cycle.get('cycle_no'), 'cycles': [cycle]})
-    append_runtime_event(store, 'resident_manager_update', manager_update if isinstance(manager_update, dict) else {'update': manager_update})
-    return {'ok': True, 'state': manager_update.get('state') if isinstance(manager_update, dict) else None}
+    append_runtime_event(store, 'resident_manager_update', update)
+    return {'ok': True, 'state': update.get('state'), 'kind': update.get('kind')}
 
+
+
+def build_backpressure_policy(component: str, reason: str, item: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    score = 1.0
+    if isinstance(item, dict):
+        score = float(item.get('candidate_score', item.get('score', 1.0)) or 0.0)
+    return {
+        'scan_delay_multiplier': 3.0 if component == 'scanner' else 1.5,
+        'drop_candidate': score < 0.2 or 'queue_full' in str(reason),
+        'pause_non_core_tasks': True,
+        'min_candidate_score': 0.2,
+    }
 
 
 async def apply_queue_backpressure(queue: asyncio.Queue, *, store: RuntimeStateStore, component: str, reason: str, item: Optional[Dict[str, Any]] = None, timeout_seconds: float = 1.0) -> Dict[str, Any]:
+    policy = build_backpressure_policy(component, reason, item)
     payload = {
         'component': component,
         'reason': reason,
         'queue_depth': queue.qsize(),
         'queue_maxsize': queue.maxsize,
+        'policy': policy,
     }
     if queue.full():
-        degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True})
+        degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True, 'policy': policy})
         append_runtime_event(store, 'runtime_backpressure_degrade', {**payload, **degraded, 'degraded': True})
         return {'accepted': False, 'degraded': True, **payload}
     if item is not None:
         try:
             await asyncio.wait_for(queue.put(item), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True})
+            degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True, 'policy': policy})
             append_runtime_event(store, 'runtime_backpressure_degrade', {**payload, **degraded, 'degraded': True})
             return {'accepted': False, 'degraded': True, **payload}
     return {'accepted': True, 'degraded': False, **payload}
@@ -8047,14 +8076,8 @@ async def position_manager_task(client: Any, args: argparse.Namespace, store: Ru
                 candidate = req.get('candidate')
                 trade = req.get('trade') or {}
                 meta = req.get('meta') or {}
-                positions_state, position_key = persist_live_open_position(store, candidate, trade)
-                append_buy_fill_confirmed_event(store, getattr(candidate, 'symbol', req.get('symbol', '')), positions_state, position_key)
-                if getattr(args, 'auto_loop', False):
-                    thread = start_trade_monitor_thread(client=client, symbol=getattr(candidate, 'symbol', req.get('symbol', '')), meta=meta, args=args, trade=trade, store=store)
-                    positions_state = store.load_json('positions', {}) if isinstance(store.load_json('positions', {}), dict) else positions_state
-                    positions_state.setdefault(position_key, {})['monitor_thread_name'] = getattr(thread, 'name', 'trade-monitor')
-                    store.save_json('positions', positions_state)
-                record_runtime_heartbeat(store, component='position_manager', status='healthy', blocked_reason='', queue_depth=queues['position_manager'].qsize(), queue_maxsize=queues['position_manager'].maxsize, extra={'position_key': req.get('position_key')})
+                position_key = req.get('position_key') or build_position_key(getattr(candidate, 'symbol', req.get('symbol', '')), getattr(candidate, 'position_side', getattr(candidate, 'side', POSITION_SIDE_LONG)))
+                await apply_queue_backpressure(queues['manager'], store=store, component='position_manager', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': item.get('cycle_no') if isinstance(item, dict) else None, 'update': {'kind': 'position_opened', 'candidate': candidate, 'symbol': getattr(candidate, 'symbol', req.get('symbol', '')), 'position_key': position_key, 'meta': meta, 'trade': trade, 'cycle': req.get('cycle')}})
         finally:
             queues['position_manager'].task_done()
 
@@ -8144,6 +8167,9 @@ async def manager_task(args: argparse.Namespace, store: RuntimeStateStore, queue
             queues['manager'].task_done()
 
 
+_BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
+
+
 async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, stop_event: asyncio.Event) -> None:
     """Single resident websocket actor: start one supervisor, then monitor freshness."""
     interval = max(1.0, float(getattr(args, 'websocket_healthcheck_interval_seconds', 15.0) or 15.0))
@@ -8154,10 +8180,15 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
 
     async def start_or_recover_supervisor(trigger: str) -> None:
         nonlocal last_restart_at
+        global _BOOK_TICKER_WS_SUPERVISOR_ACTIVE
+        if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
+            append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'keep_existing_singleton'})
+            return
         now = time.monotonic()
         if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
             return
         last_restart_at = now
+        _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = True
         result = await await_component_with_timeout(
             asyncio.to_thread(run_auto_loop_book_ticker_websocket_monitor, client=client, store=store, args=args),
             timeout_seconds,
@@ -8195,13 +8226,42 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
             pass
 
 
-async def watchdog_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
-    interval = 5.0
-    while not stop_event.is_set():
+async def watchdog_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event, *, interval: float = 5.0, max_samples: Optional[int] = None, stale_seconds: float = 120.0, event_loop_lag_seconds: float = 2.0) -> None:
+    samples = 0
+    while not stop_event.is_set() or (max_samples is not None and samples < int(max_samples)):
+        actions: List[str] = []
         for name, queue in queues.items():
             if queue.full():
                 payload = record_runtime_heartbeat(store, component='watchdog', status='blocked', blocked_reason=f'{name}_queue_full', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
                 append_runtime_event(store, 'resident_queue_backlog', payload)
+                actions.append(f'{name}_queue_backlog')
+        heartbeat = store.load_json('runtime_heartbeat', {})
+        components = heartbeat.get('components') if isinstance(heartbeat, dict) and isinstance(heartbeat.get('components'), dict) else heartbeat if isinstance(heartbeat, dict) else {}
+        now_ts = time.time()
+        checks = [('scanner', 'last_scan_ts', 'scanner_stale'), ('ws', 'last_ws_msg_ts', 'ws_stale'), ('execution', 'last_execution_ts', 'execution_stale')]
+        for component, key, action in checks:
+            row = components.get(component, {}) if isinstance(components, dict) else {}
+            extra = row.get('extra', {}) if isinstance(row, dict) else {}
+            ts = extra.get(key, row.get('updated_at_ts') if isinstance(row, dict) else None)
+            try:
+                stale = ts is None or now_ts - float(ts) > float(stale_seconds)
+            except (TypeError, ValueError):
+                stale = True
+            if stale:
+                actions.append(action)
+        event_loop_row = components.get('event_loop', {}) if isinstance(components, dict) else {}
+        event_loop_extra = event_loop_row.get('extra', {}) if isinstance(event_loop_row, dict) else {}
+        try:
+            if float(event_loop_extra.get('lag_seconds', 0.0) or 0.0) >= float(event_loop_lag_seconds):
+                actions.append('event_loop_lag')
+        except (TypeError, ValueError):
+            pass
+        if actions:
+            payload = record_runtime_heartbeat(store, component='watchdog', status='recovering', blocked_reason=';'.join(sorted(set(actions))), extra={'actions': sorted(set(actions))})
+            append_runtime_event(store, 'resident_watchdog_recovery', {**payload, 'actions': sorted(set(actions))})
+        samples += 1
+        if max_samples is not None and samples >= int(max_samples):
+            return
         await asyncio.sleep(interval)
 
 

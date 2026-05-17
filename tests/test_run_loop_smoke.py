@@ -919,6 +919,122 @@ def test_event_loop_latency_monitor_records_lag_metric(monkeypatch):
     assert 'lag_seconds' in samples[-1]['extra']
 
 
+
+def test_execution_cycle_returns_manager_writes_without_direct_runtime_state(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
+
+    class GuardedStore(DummyStore):
+        def save_json(self, name, payload):
+            raise AssertionError(f'execution actor direct write: {name}')
+        def append_event(self, event_type, payload):
+            raise AssertionError(f'execution actor direct event write: {event_type}')
+
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3)
+    req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 9}, 'requested_leverage': 3}
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: {'symbol': 'DOGEUSDT', 'quantity': 1})
+    monkeypatch.setattr(mod, 'start_trade_monitor_thread', lambda *a, **k: (_ for _ in ()).throw(AssertionError('execution actor started monitor thread')))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=GuardedStore())
+
+    assert result['ok'] is True
+    assert result['manager_update']['kind'] == 'execution_result'
+    assert result['manager_update'].get('state_transition', {}).get('state') == 'ENTERING'
+    assert result['position_manager_request']['kind'] == 'position_opened'
+
+
+def test_position_manager_actor_does_not_write_state_or_start_background_thread(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
+
+    class GuardedStore(DummyStore):
+        def save_json(self, name, payload):
+            raise AssertionError(f'position manager direct write: {name}')
+        def append_event(self, event_type, payload):
+            raise AssertionError(f'position manager direct event write: {event_type}')
+
+    async def run_case():
+        q = {'position_manager': __import__('asyncio').Queue(maxsize=4), 'manager': __import__('asyncio').Queue(maxsize=4)}
+        stop = __import__('asyncio').Event()
+        candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG')
+        await q['position_manager'].put({'kind': 'position_manager_request', 'cycle_no': 3, 'request': {'kind': 'position_opened', 'candidate': candidate, 'symbol': 'DOGEUSDT', 'position_key': 'DOGEUSDT:LONG', 'meta': {}, 'trade': {'symbol': 'DOGEUSDT'}, 'cycle': {'cycle_no': 3}}})
+        stop.set()
+        await mod.position_manager_task(DummyClient(), args, GuardedStore(), q, stop)
+        return await q['manager'].get()
+
+    monkeypatch.setattr(mod, 'start_trade_monitor_thread', lambda *a, **k: (_ for _ in ()).throw(AssertionError('position manager started background monitor thread')))
+    monkeypatch.setattr(mod, 'monitor_live_trade', lambda *a, **k: (_ for _ in ()).throw(AssertionError('position manager delegated FSM to monitor thread')))
+
+    item = __import__('asyncio').run(run_case())
+
+    assert item['kind'] == 'manager_update'
+    assert item['update']['kind'] == 'position_opened'
+    assert item['update']['position_key'] == 'DOGEUSDT:LONG'
+
+
+def test_ws_task_stale_recovery_uses_singleton_and_does_not_start_duplicate_monitor(monkeypatch):
+    mod = load_module()
+    args = make_args(require_book_ticker_ws=True, websocket_healthcheck_interval_seconds=0.001, websocket_healthcheck_timeout_seconds=0.1, book_ticker_ws_stale_seconds=0.0, websocket_restart_backoff_seconds=0.0)
+    store = DummyStore()
+    calls = []
+
+    def fake_monitor(*, client, store, args):
+        calls.append('start')
+        store.save_json('book_ticker_ws_status', {'status': 'stale', 'updated_at': '2000-01-01T00:00:00Z', 'messages_processed': 0})
+        return {'status': 'resident_started', 'summary': {'running': True}}
+
+    async def run_case():
+        stop = __import__('asyncio').Event()
+        task = __import__('asyncio').create_task(mod.ws_task(DummyClient(), args, store, stop))
+        await __import__('asyncio').sleep(0.01)
+        stop.set()
+        await task
+
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', fake_monitor)
+    __import__('asyncio').run(run_case())
+
+    assert calls == ['start']
+
+
+def test_backpressure_policy_degrades_scan_rate_and_drops_low_score_candidates(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    q = __import__('asyncio').Queue(maxsize=1)
+    q.put_nowait({'existing': True})
+    low_score_item = {'candidate_score': 0.01, 'candidate_rank': 99}
+
+    result = __import__('asyncio').run(mod.apply_queue_backpressure(q, store=store, component='scanner', reason='execution_queue_full', item=low_score_item))
+
+    assert result['accepted'] is False
+    assert result['policy']['scan_delay_multiplier'] > 1
+    assert result['policy']['drop_candidate'] is True
+    assert result['policy']['pause_non_core_tasks'] is True
+
+
+def test_watchdog_detects_stale_core_heartbeats_and_emits_recovery(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    store.save_json('runtime_heartbeat', {
+        'scanner': {'updated_at_ts': 1.0, 'extra': {'last_scan_ts': 1.0}},
+        'ws': {'updated_at_ts': 1.0, 'extra': {'last_ws_msg_ts': 1.0}},
+        'execution': {'updated_at_ts': 1.0, 'extra': {'last_execution_ts': 1.0}},
+        'event_loop': {'updated_at_ts': 1.0, 'extra': {'lag_seconds': 9.0}},
+    })
+    events = []
+    monkeypatch.setattr(mod.time, 'time', lambda: 100.0)
+    monkeypatch.setattr(mod, 'append_runtime_event', lambda store, event_type, payload: events.append((event_type, payload)) or payload)
+
+    async def run_case():
+        stop = __import__('asyncio').Event()
+        task = __import__('asyncio').create_task(mod.watchdog_task(store, {'scanner': __import__('asyncio').Queue(maxsize=1)}, stop, interval=0.001, max_samples=1, stale_seconds=10.0, event_loop_lag_seconds=1.0))
+        await task
+
+    __import__('asyncio').run(run_case())
+
+    assert any(event_type == 'resident_watchdog_recovery' for event_type, payload in events)
+    recovery = [payload for event_type, payload in events if event_type == 'resident_watchdog_recovery'][-1]
+    assert {'scanner_stale', 'ws_stale', 'execution_stale', 'event_loop_lag'} <= set(recovery['actions'])
+
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=7, base_url='https://example.com')
