@@ -52,12 +52,19 @@ _OKX_SWAP_INST_ID_CACHE: Dict[str, Any] = {
     'inst_ids': set(),
 }
 
+# Runtime heartbeat is intentionally actor-writable: each actor may publish only its own
+# component heartbeat. Durable trading state and risk state remain manager-owned.
+_RUNTIME_HEARTBEAT_WRITER_MODE = 'actor_component_owner'
+
 _BOOK_TICKER_WS_SUPERVISOR_LOCK = threading.Lock()
 _BOOK_TICKER_WS_SUPERVISOR_STATE: Dict[str, Any] = {
     'thread': None,
     'thread_name': '',
     'started_at': '',
     'symbols': [],
+    'generation_id': 0,
+    'ws': None,
+    'force_restart_requested_at': '',
 }
 
 
@@ -1033,6 +1040,7 @@ def record_runtime_heartbeat(
             payload['queue_backlog_ratio'] = round(float(queue_depth) / max(float(queue_maxsize), 1.0), 6)
     if isinstance(extra, dict):
         payload.update(extra)
+    payload['writer_mode'] = _RUNTIME_HEARTBEAT_WRITER_MODE
     if store is not None:
         cache_key = id(store)
         cached = _RUNTIME_HEARTBEAT_CACHE.get(cache_key)
@@ -1905,6 +1913,31 @@ def _book_ticker_websocket_supervisor_target(
         )
 
 
+def force_close_book_ticker_websocket_supervisor(store: Optional[RuntimeStateStore] = None, *, reason: str = 'forced_restart') -> Dict[str, Any]:
+    closed = False
+    error = ''
+    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        previous_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['generation_id'] = previous_generation + 1
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['force_restart_requested_at'] = _isoformat_utc(_utc_now())
+        ws = _BOOK_TICKER_WS_SUPERVISOR_STATE.get('ws')
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] = None
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['thread_name'] = ''
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['started_at'] = ''
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = None
+    if ws is not None and hasattr(ws, 'close'):
+        try:
+            ws.close()
+            closed = True
+        except Exception as exc:
+            error = str(exc)
+    payload = {'reason': reason, 'previous_generation_id': previous_generation, 'generation_id': previous_generation + 1, 'closed': closed}
+    if error:
+        payload['error'] = error
+    append_runtime_event(store, 'book_ticker_ws_forced_restart', payload)
+    return payload
+
+
 def ensure_auto_loop_book_ticker_websocket_supervisor_running(
     *,
     store: RuntimeStateStore,
@@ -1922,9 +1955,11 @@ def ensure_auto_loop_book_ticker_websocket_supervisor_running(
                 'thread_name': str(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('thread_name') or existing_thread.name),
                 'started_at': _BOOK_TICKER_WS_SUPERVISOR_STATE.get('started_at', ''),
                 'symbols': list(normalized_symbols),
+                'generation_id': int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0),
                 'running': True,
             }
         started_at = _isoformat_utc(_utc_now())
+        generation_id = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
         thread = threading.Thread(
             target=_book_ticker_websocket_supervisor_target,
             kwargs={
@@ -1932,7 +1967,7 @@ def ensure_auto_loop_book_ticker_websocket_supervisor_running(
                 'symbol_provider': symbol_provider,
                 'ws_module': ws_module,
             },
-            name='book-ticker-ws-supervisor',
+            name=f'book-ticker-ws-supervisor-g{generation_id}',
             daemon=True,
         )
         _BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] = thread
@@ -1945,6 +1980,7 @@ def ensure_auto_loop_book_ticker_websocket_supervisor_running(
             'thread_name': thread.name,
             'started_at': started_at,
             'symbols': list(normalized_symbols),
+            'generation_id': generation_id,
             'running': True,
         }
 
@@ -4896,6 +4932,8 @@ def run_book_ticker_websocket_supervisor(
         'subscription_version': 1,
     }
     state['ws'] = open_websocket_fn(normalized_symbols, ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
     update_book_ticker_ws_health_state(
         store,
         status='connecting',
@@ -4957,6 +4995,8 @@ def run_book_ticker_websocket_supervisor(
             if backoff_seconds > 0:
                 sleep_fn(backoff_seconds)
             state['ws'] = open_websocket_fn(state['symbols'], ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+            with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+                _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
             state['reconnect_count'] = int(state.get('reconnect_count', 0) or 0) + 1
             append_runtime_event(store, 'book_ticker_ws_reconnected', {
                 'event_source': 'book_ticker_websocket',
@@ -5036,6 +5076,8 @@ def run_book_ticker_websocket_supervisor(
             if backoff_seconds > 0:
                 sleep_fn(backoff_seconds)
             state['ws'] = open_websocket_fn(state['symbols'], ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+            with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+                _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
             state['reconnect_count'] = int(state.get('reconnect_count', 0) or 0) + 1
             append_runtime_event(store, 'book_ticker_ws_reconnected', {
                 'event_source': 'book_ticker_websocket',
@@ -8029,6 +8071,40 @@ def build_backpressure_policy(component: str, reason: str, item: Optional[Dict[s
     }
 
 
+def is_coalescable_manager_update(item: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(item, dict) or item.get('kind') != 'manager_update':
+        return False
+    update = item.get('update')
+    if not isinstance(update, dict):
+        return False
+    kind = str(update.get('kind') or update.get('state') or '').lower()
+    return kind in {'cycle', 'scan_cycle', 'runtime_event', 'heartbeat', 'metrics', 'scan'} or bool(update.get('cycle'))
+
+
+def coalesce_manager_queue_update(queue: asyncio.Queue, item: Dict[str, Any]) -> Dict[str, Any]:
+    if not is_coalescable_manager_update(item):
+        return {'coalesced': False, 'dropped': 0}
+    kept: List[Any] = []
+    dropped = 0
+    while True:
+        try:
+            existing = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if is_coalescable_manager_update(existing):
+            dropped += 1
+            queue.task_done()
+        else:
+            kept.append(existing)
+    for existing in kept:
+        queue.put_nowait(existing)
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        return {'coalesced': dropped > 0, 'dropped': dropped, 'accepted': False}
+    return {'coalesced': dropped > 0, 'dropped': dropped, 'accepted': True}
+
+
 async def apply_queue_backpressure(queue: asyncio.Queue, *, store: RuntimeStateStore, component: str, reason: str, item: Optional[Dict[str, Any]] = None, timeout_seconds: float = 1.0) -> Dict[str, Any]:
     policy = build_backpressure_policy(component, reason, item)
     payload = {
@@ -8039,6 +8115,11 @@ async def apply_queue_backpressure(queue: asyncio.Queue, *, store: RuntimeStateS
         'policy': policy,
     }
     if queue.full():
+        if reason == 'manager_queue_full' and item is not None:
+            coalesced = coalesce_manager_queue_update(queue, item)
+            if coalesced.get('accepted'):
+                append_runtime_event(store, 'manager_queue_coalesced', {**payload, **coalesced})
+                return {'accepted': True, 'degraded': False, **payload, **coalesced}
         degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True, 'policy': policy})
         append_runtime_event(store, 'runtime_backpressure_degrade', {**payload, **degraded, 'degraded': True})
         return {'accepted': False, 'degraded': True, **payload}
@@ -8199,11 +8280,11 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
     async def start_or_recover_supervisor(trigger: str) -> None:
         nonlocal last_restart_at
         global _BOOK_TICKER_WS_SUPERVISOR_ACTIVE
-        if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE and trigger == 'initial_start':
+        if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
+            if trigger == 'initial_start':
+                return
             append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'forced_restart'})
-            _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
-        elif _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
-            append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'forced_restart'})
+            force_close_book_ticker_websocket_supervisor(store, reason=trigger)
             _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
         now = time.monotonic()
         if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
@@ -8298,33 +8379,22 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     store = get_runtime_state_store(args)
     queues = build_async_runtime_task_queues(int(getattr(args, 'runtime_queue_maxsize', 128) or 128))
     stop_event = asyncio.Event()
-    record_runtime_heartbeat(store, component='resident', status='starting', blocked_reason='', extra={'tasks': ['scanner', 'execution', 'manager', 'position_manager', 'ws', 'watchdog', 'event_loop']})
-    tasks = []
-    if bool(getattr(args, 'require_book_ticker_ws', True)):
-        tasks.append(asyncio.create_task(ws_task(client, args, store, stop_event), name='ws_task'))
-        await asyncio.sleep(0)
-    tasks.extend([
-        asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task'),
-        asyncio.create_task(execution_task(client, args, store, queues, stop_event), name='execution_task'),
-        asyncio.create_task(manager_task(args, store, queues, stop_event), name='manager_task'),
-        asyncio.create_task(position_manager_task(client, args, store, queues, stop_event), name='position_manager_task'),
-        asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
-        asyncio.create_task(event_loop_latency_task(store, stop_event, interval=float(getattr(args, 'event_loop_lag_interval_seconds', 1.0) or 1.0), warn_threshold_seconds=float(getattr(args, 'event_loop_lag_warn_seconds', 0.25) or 0.25)), name='event_loop_latency_task'),
-    ])
-    scanner_runtime_task = next(task for task in tasks if task.get_name() == 'scanner_task')
-    try:
-        recovery_request = store.load_json('runtime_recovery_request', {})
-        if isinstance(recovery_request, dict) and recovery_request.get('action') == 'supervisor_restart' and not recovery_request.get('consumed'):
-            consumed = dict(recovery_request, consumed=True, consumed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-            store.save_json('runtime_recovery_request', consumed)
-            append_runtime_event(store, 'resident_supervisor_restart_consumed', consumed)
-            record_runtime_heartbeat(store, component='resident', status='restarting', blocked_reason='watchdog_recovery_request', extra={'recovery_request': consumed})
-        await scanner_runtime_task
-        await queues['execution'].join()
-        await queues['manager'].join()
-        await queues['position_manager'].join()
-    finally:
+    resident_started_at = _utc_now()
+    record_runtime_heartbeat(store, component='resident', status='starting', blocked_reason='', extra={'tasks': ['scanner', 'execution', 'manager', 'position_manager', 'ws', 'watchdog', 'event_loop'], 'resident_started_at': _isoformat_utc(resident_started_at)})
+    tasks: List[asyncio.Task] = []
+
+    def drain_runtime_queues() -> None:
+        for queue in queues.values():
+            while True:
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def stop_runtime_tasks(reason: str) -> None:
         stop_event.set()
+        force_close_book_ticker_websocket_supervisor(store, reason=reason)
         shutdown_timeout = max(0.01, float(getattr(args, 'resident_shutdown_timeout_seconds', 5.0) or 5.0))
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=shutdown_timeout)
@@ -8333,8 +8403,52 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            append_runtime_event(store, 'resident_shutdown_forced_cancel', {'stuck_tasks': stuck, 'timeout_seconds': shutdown_timeout})
+            append_runtime_event(store, 'resident_shutdown_forced_cancel', {'stuck_tasks': stuck, 'timeout_seconds': shutdown_timeout, 'reason': reason})
             await asyncio.gather(*tasks, return_exceptions=True)
+        tasks.clear()
+        drain_runtime_queues()
+
+    async def start_runtime_tasks() -> asyncio.Task:
+        nonlocal stop_event
+        stop_event = asyncio.Event()
+        if bool(getattr(args, 'require_book_ticker_ws', True)):
+            tasks.append(asyncio.create_task(ws_task(client, args, store, stop_event), name='ws_task'))
+            await asyncio.sleep(0)
+        tasks.extend([
+            asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task'),
+            asyncio.create_task(execution_task(client, args, store, queues, stop_event), name='execution_task'),
+            asyncio.create_task(manager_task(args, store, queues, stop_event), name='manager_task'),
+            asyncio.create_task(position_manager_task(client, args, store, queues, stop_event), name='position_manager_task'),
+            asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
+            asyncio.create_task(event_loop_latency_task(store, stop_event, interval=float(getattr(args, 'event_loop_lag_interval_seconds', 1.0) or 1.0), warn_threshold_seconds=float(getattr(args, 'event_loop_lag_warn_seconds', 0.25) or 0.25)), name='event_loop_latency_task'),
+        ])
+        return next(task for task in tasks if task.get_name() == 'scanner_task')
+
+    scanner_runtime_task = await start_runtime_tasks()
+    try:
+        while True:
+            recovery_request = store.load_json('runtime_recovery_request', {})
+            if isinstance(recovery_request, dict) and recovery_request.get('action') == 'supervisor_restart' and not recovery_request.get('consumed'):
+                request_updated_at = _parse_iso8601_utc(recovery_request.get('updated_at'))
+                if request_updated_at is not None and request_updated_at < resident_started_at:
+                    stale_consumed = dict(recovery_request, consumed=True, ignored=True, consumed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), ignore_reason='stale_recovery_request_from_previous_runtime')
+                    store.save_json('runtime_recovery_request', stale_consumed)
+                    append_runtime_event(store, 'resident_supervisor_restart_ignored_stale', stale_consumed)
+                else:
+                    consumed = dict(recovery_request, consumed=True, consumed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                    store.save_json('runtime_recovery_request', consumed)
+                    append_runtime_event(store, 'resident_supervisor_restart_consumed', consumed)
+                    record_runtime_heartbeat(store, component='resident', status='restarting', blocked_reason='watchdog_recovery_request', extra={'recovery_request': consumed})
+                    await stop_runtime_tasks('watchdog_recovery_request')
+                    scanner_runtime_task = await start_runtime_tasks()
+            done, _pending = await asyncio.wait({scanner_runtime_task}, timeout=1.0)
+            if done:
+                break
+        await queues['execution'].join()
+        await queues['manager'].join()
+        await queues['position_manager'].join()
+    finally:
+        await stop_runtime_tasks('runtime_shutdown')
     record_runtime_heartbeat(store, component='resident', status='stopped', blocked_reason='')
     last_result = store.load_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycles': []})
     return last_result if isinstance(last_result, dict) else {'ok': True, 'auto_loop': True, 'cycles': []}

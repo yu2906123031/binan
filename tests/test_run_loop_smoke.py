@@ -1227,7 +1227,9 @@ def test_resident_runtime_consumes_recovery_request_and_restarts_tasks(monkeypat
 
     async def one_tick(*args, **kwargs):
         return None
+    scanner_starts = []
     async def scanner(client, args, store, queues, run_loop_fn, stop_event):
+        scanner_starts.append(stop_event)
         stop_event.set()
     monkeypatch.setattr(mod, 'scanner_task', scanner)
     monkeypatch.setattr(mod, 'execution_task', one_tick)
@@ -1239,6 +1241,7 @@ def test_resident_runtime_consumes_recovery_request_and_restarts_tasks(monkeypat
     result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
     assert result.get('ok') is True
     assert store.load_json('runtime_recovery_request', {}).get('consumed') is True
+    assert len(scanner_starts) >= 2
     assert any(e['event_type'] == 'resident_supervisor_restart_consumed' for e in store.events)
 
 
@@ -3564,3 +3567,49 @@ async def test_runtime_task_queue_consumer_put_get_executes_handler():
     assert handled == [{'cycle': 1}]
     assert queues['scanner'].qsize() == 0
     assert store.json_state['runtime_heartbeat']['components']['scanner']['status'] == 'idle'
+
+
+def test_force_close_book_ticker_websocket_supervisor_closes_handle_and_bumps_generation():
+    mod = load_module()
+    store = DummyStore()
+    closed = []
+
+    class Ws:
+        def close(self):
+            closed.append(True)
+
+    mod._BOOK_TICKER_WS_SUPERVISOR_STATE.update({'thread': object(), 'thread_name': 'old', 'started_at': 'old', 'ws': Ws(), 'generation_id': 4})
+
+    result = mod.force_close_book_ticker_websocket_supervisor(store, reason='unit_forced_restart')
+
+    assert result['closed'] is True
+    assert result['previous_generation_id'] == 4
+    assert result['generation_id'] == 5
+    assert closed == [True]
+    assert mod._BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] is None
+    assert mod._BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] is None
+    assert any(e['event_type'] == 'book_ticker_ws_forced_restart' for e in store.events)
+
+
+def test_apply_queue_backpressure_coalesces_low_priority_manager_updates():
+    mod = load_module()
+    store = DummyStore()
+    queue = __import__('asyncio').Queue(maxsize=2)
+    queue.put_nowait({'kind': 'manager_update', 'cycle_no': 1, 'update': {'kind': 'cycle', 'cycle': {'cycle_no': 1}}})
+    queue.put_nowait({'kind': 'manager_update', 'cycle_no': 2, 'update': {'kind': 'cycle', 'cycle': {'cycle_no': 2}}})
+
+    result = __import__('asyncio').run(mod.apply_queue_backpressure(
+        queue,
+        store=store,
+        component='scanner',
+        reason='manager_queue_full',
+        item={'kind': 'manager_update', 'cycle_no': 3, 'update': {'kind': 'cycle', 'cycle': {'cycle_no': 3}}},
+    ))
+
+    assert result['accepted'] is True
+    assert result['coalesced'] is True
+    assert result['dropped'] == 2
+    assert queue.qsize() == 1
+    latest = queue.get_nowait()
+    assert latest['cycle_no'] == 3
+    assert any(e['event_type'] == 'manager_queue_coalesced' for e in store.events)
