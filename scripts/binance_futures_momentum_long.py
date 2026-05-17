@@ -8344,8 +8344,19 @@ async def watchdog_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queu
         checks = [('scanner', 'last_scan_ts', 'scanner_stale'), ('ws', 'last_ws_msg_ts', 'ws_stale'), ('execution', 'last_execution_ts', 'execution_stale')]
         for component, key, action in checks:
             row = components.get(component, {}) if isinstance(components, dict) else {}
-            extra = row.get('extra', {}) if isinstance(row, dict) else {}
-            ts = extra.get(key, row.get('updated_at_ts') if isinstance(row, dict) else None)
+            extra = row.get('extra', {}) if isinstance(row, dict) and isinstance(row.get('extra'), dict) else {}
+            ts = extra.get(key) if isinstance(extra, dict) else None
+            if ts is None and isinstance(row, dict):
+                ts = row.get(key)
+            if ts is None and isinstance(row, dict):
+                ts = row.get('updated_at_ts')
+            if ts is None and isinstance(row, dict):
+                updated_at = row.get('updated_at')
+                if updated_at:
+                    try:
+                        ts = datetime.datetime.fromisoformat(str(updated_at).replace('Z', '+00:00')).timestamp()
+                    except ValueError:
+                        ts = None
             try:
                 stale = ts is None or now_ts - float(ts) > float(stale_seconds)
             except (TypeError, ValueError):

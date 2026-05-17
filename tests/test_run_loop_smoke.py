@@ -1036,6 +1036,28 @@ def test_watchdog_detects_stale_core_heartbeats_and_emits_recovery(monkeypatch):
     assert {'scanner_stale', 'ws_stale', 'execution_stale', 'event_loop_lag'} <= set(recovery['actions'])
 
 
+def test_watchdog_accepts_component_updated_at_iso_as_fresh(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    now = datetime.datetime.fromtimestamp(100.0, tz=datetime.timezone.utc).isoformat()
+    store.save_json('runtime_heartbeat', {
+        'components': {
+            'scanner': {'updated_at': now, 'status': 'healthy'},
+            'ws': {'updated_at': now, 'status': 'healthy'},
+            'execution': {'updated_at': now, 'status': 'idle'},
+            'event_loop': {'updated_at': now, 'lag_seconds': 0.0},
+        }
+    })
+    events = []
+    monkeypatch.setattr(mod.time, 'time', lambda: 100.0)
+    monkeypatch.setattr(mod, 'append_runtime_event', lambda store, event_type, payload: events.append((event_type, payload)) or payload)
+
+    __import__('asyncio').run(mod.watchdog_task(store, {'manager': __import__('asyncio').Queue(maxsize=1)}, __import__('asyncio').Event(), interval=0.001, max_samples=1, stale_seconds=10.0, event_loop_lag_seconds=1.0))
+
+    assert store.load_json('runtime_recovery_request', {}) == {}
+    assert not any(event_type == 'resident_watchdog_recovery' for event_type, _payload in events)
+
+
 def test_scan_only_cycle_no_candidate_returns_manager_update_without_direct_state_write(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
