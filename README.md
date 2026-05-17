@@ -58,6 +58,54 @@ python main.py --scan-only --top-gainers 15 --top-losers 15 --output-format json
 - 默认 runtime 状态目录为 `~/.hermes/binance-futures-momentum-long/runtime-state`。
 - Windows 控制台如果中文摘要显示异常，优先使用 `--output-format json`。
 
+## aggressive-fee-aware-scalp profiles
+
+- 这组三个 profile 面向高频、激进、高胜率场景，核心目标是有效仓位、覆盖手续费、止损留出普通波动空间、保本节奏适中、`TP1 >= 1R`。
+- 滑点、流动性、OI、CVD、funding、heat 与连亏风控继续生效。
+- `aggressive-fee-aware-scalp-long-short` 同时评估 `long` 与 `short`。
+- `aggressive-fee-aware-scalp-long-only` 只评估 `long`。
+- `aggressive-fee-aware-scalp-short-only` 只评估 `short`。
+- 原 `10u-aggressive` profile 保留。
+- `10u-aggressive-v2` 在 `10u-aggressive` 基础上打开 v2 结构化过滤，默认启用 `market regime gate`、`direction lock`、`fee-aware edge filter`、`symbol quality tier` 与 ATR stop。
+- `10u-aggressive-v2` 默认关闭 live sim probe，显式 CLI 参数仍然优先生效。
+
+扫描命令：
+
+```powershell
+python main.py --scan-only --profile aggressive-fee-aware-scalp-long-short --output-format json
+python main.py --scan-only --profile aggressive-fee-aware-scalp-long-only --output-format json
+python main.py --scan-only --profile aggressive-fee-aware-scalp-short-only --output-format json
+python main.py --scan-only --profile 10u-aggressive-v2 --output-format json
+```
+
+自动运行命令：
+
+```powershell
+python main.py --live --auto-loop --profile aggressive-fee-aware-scalp-long-short
+python main.py --live --auto-loop --profile aggressive-fee-aware-scalp-long-only
+python main.py --live --auto-loop --profile aggressive-fee-aware-scalp-short-only
+python main.py --live --auto-loop --profile 10u-aggressive-v2
+```
+
+## 扫描输出补充字段
+
+- `candidate_alerts` / `selected_alert` 现在会暴露：
+  - `tradeability_score`
+  - `expected_edge`
+  - `expected_total_fee_pct`
+  - `execution_slippage_buffer_pct`
+  - `min_profit_buffer_pct`
+- `scan.summary_counters` 会汇总：
+  - `raw_scan_symbol_count`
+  - `evaluated_symbol_count`
+  - `evaluated_side_count`
+  - `early_filter_passed_count`
+  - `setup_ready_count`
+  - `trigger_fired_count`
+  - `candidate_pool_count`
+  - `hard_rejected_count`
+- 中文摘要会追加一行 `扫描计数`，方便直接看扫描漏斗。
+
 ## 环境变量
 
 可参考 `.env.example` 创建本地 `.env`：

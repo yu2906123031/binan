@@ -50,6 +50,14 @@ _OKX_SWAP_INST_ID_CACHE: Dict[str, Any] = {
     'inst_ids': set(),
 }
 
+_BOOK_TICKER_WS_SUPERVISOR_LOCK = threading.Lock()
+_BOOK_TICKER_WS_SUPERVISOR_STATE: Dict[str, Any] = {
+    'thread': None,
+    'thread_name': '',
+    'started_at': '',
+    'symbols': [],
+}
+
 
 def _strip_dotenv_value(value: str) -> str:
     value = str(value or '').strip()
@@ -421,6 +429,19 @@ def normalize_trade_side(side: Any, default: str = TRADE_SIDE_LONG) -> str:
     return TRADE_SIDE_SHORT if normalized == TRADE_SIDE_SHORT else default
 
 
+def resolve_allowed_trade_sides(raw: Any) -> Tuple[str, ...]:
+    tokens = [str(part or '').strip().lower() for part in str(raw or '').split(',')]
+    allowed: List[str] = []
+    for token in tokens:
+        if token == TRADE_SIDE_LONG and TRADE_SIDE_LONG not in allowed:
+            allowed.append(TRADE_SIDE_LONG)
+        elif token == TRADE_SIDE_SHORT and TRADE_SIDE_SHORT not in allowed:
+            allowed.append(TRADE_SIDE_SHORT)
+    if not allowed:
+        return (TRADE_SIDE_LONG, TRADE_SIDE_SHORT)
+    return tuple(allowed)
+
+
 def position_side_to_trade_side(side: Any, default: str = TRADE_SIDE_LONG) -> str:
     normalized = normalize_position_side(side, POSITION_SIDE_SHORT if str(default).lower() == TRADE_SIDE_SHORT else POSITION_SIDE_LONG)
     return TRADE_SIDE_SHORT if normalized == POSITION_SIDE_SHORT else TRADE_SIDE_LONG
@@ -770,6 +791,10 @@ class Candidate:
     high_vol_alt_mode: bool = False
     probe_entry: bool = False
     tradeability_score: float = 0.0
+    expected_edge: float = 0.0
+    expected_total_fee_pct: float = 0.0
+    execution_slippage_buffer_pct: float = 0.0
+    min_profit_buffer_pct: float = 0.0
 
     def __post_init__(self) -> None:
         self.side = normalize_trade_side(self.side)
@@ -925,6 +950,8 @@ def normalize_user_data_stream_order_update(payload: Dict[str, Any]) -> Optional
         return None
     update_time = int(_to_float(order.get('T') or payload.get('T') or payload.get('E'), default=0.0)) or None
     event_time = int(_to_float(payload.get('E'), default=0.0)) or update_time
+    reduce_only = bool(order.get('R'))
+    position_side = normalize_position_side(order.get('ps') or order.get('positionSide') or '', POSITION_SIDE_LONG)
     return {
         'event_type': 'order_trade_update',
         'event_source': 'user_data_stream',
@@ -946,7 +973,50 @@ def normalize_user_data_stream_order_update(payload: Dict[str, Any]) -> Optional
         'entry_cum_quote': _to_float(order.get('zq'), default=0.0),
         'entry_fee_amount': _to_float(order.get('n'), default=0.0),
         'entry_fee_asset': str(order.get('N') or ''),
+        'position_side': position_side,
+        'reduce_only': reduce_only,
+        'realized_pnl': _to_float(order.get('rp'), default=0.0),
     }
+
+
+def emit_position_closed_runtime_event(
+    store: Optional[RuntimeStateStore],
+    tracked: Dict[str, Any],
+    *,
+    exit_reason: str,
+    exit_price: Optional[float] = None,
+    exit_source: Optional[str] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    tracked = dict(tracked or {})
+    selected_score = _to_float(tracked.get('selected_score', tracked.get('score')), default=0.0)
+    payload = {
+        'symbol': str(tracked.get('symbol') or '').upper(),
+        'side': position_side_to_trade_side(normalize_position_side(tracked.get('position_side') or tracked.get('side'))),
+        'position_side': normalize_position_side(tracked.get('position_side') or tracked.get('side')),
+        'position_key': str(tracked.get('position_key') or build_position_key(tracked.get('symbol'), tracked.get('position_side') or tracked.get('side'))),
+        'exit_reason': str(exit_reason or tracked.get('exit_reason') or 'flat'),
+        'remaining_quantity': round(abs(_to_float(tracked.get('remaining_quantity'), default=0.0)), 10),
+        'protection_status': str(tracked.get('protection_status') or 'flat'),
+        'exit_price': round(_to_float(exit_price), 10) if _to_float(exit_price) > 0 else None,
+        'score': round(selected_score, 4),
+        'score_decile': str(tracked.get('score_decile') or score_to_decile_label(selected_score)),
+        'state': str(tracked.get('selected_state') or tracked.get('state') or ''),
+        'alert_tier': str(tracked.get('selected_alert_tier') or tracked.get('alert_tier') or ''),
+        'candidate_stage': str(tracked.get('candidate_stage') or ''),
+        'trigger_class': str(tracked.get('trigger_class') or resolve_trigger_class(tracked)),
+        'market_regime_label': str(tracked.get('market_regime_label') or ''),
+        'market_regime_multiplier': round(_to_float(tracked.get('market_regime_multiplier'), default=0.0), 4),
+        'setup_ready': bool(tracked.get('setup_ready', False)),
+        'trigger_fired': bool(tracked.get('trigger_fired', False)),
+        'opened_at': tracked.get('opened_at'),
+        'closed_at': tracked.get('closed_at'),
+    }
+    if exit_source:
+        payload['exit_source'] = str(exit_source)
+    if extra_payload:
+        payload.update(extra_payload)
+    return append_runtime_event(store, 'trade_invalidated', payload)
 
 
 def apply_user_data_stream_order_update(store: RuntimeStateStore, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -958,8 +1028,12 @@ def apply_user_data_stream_order_update(store: RuntimeStateStore, payload: Dict[
         positions_state = {}
     symbol = row['symbol']
     entry_side = str(row.get('entry_side') or '').upper()
-    inferred_position_side = POSITION_SIDE_SHORT if entry_side == 'SELL' else POSITION_SIDE_LONG
+    inferred_position_side = normalize_position_side(
+        row.get('position_side') or (POSITION_SIDE_SHORT if entry_side == 'SELL' else POSITION_SIDE_LONG),
+        POSITION_SIDE_SHORT if entry_side == 'SELL' else POSITION_SIDE_LONG,
+    )
     position_key, position = get_position_by_symbol_side(positions_state, symbol, inferred_position_side)
+    is_reduce_only_close = bool(row.get('reduce_only')) and row.get('entry_execution_type') == 'TRADE' and row.get('entry_order_status') == 'FILLED'
     if isinstance(position, dict) and position:
         position = dict(position)
         rest_entry_price = _to_float(position.get('entry_price'), default=0.0)
@@ -1000,6 +1074,32 @@ def apply_user_data_stream_order_update(store: RuntimeStateStore, payload: Dict[
                 'reconciled_at': _isoformat_utc(_utc_now()),
             },
         })
+        if is_reduce_only_close:
+            position['status'] = 'closed'
+            position['monitor_mode'] = 'closed'
+            position['protection_status'] = 'flat'
+            position['remaining_quantity'] = 0.0
+            position['quantity'] = 0.0
+            position['filled_quantity'] = 0.0
+            position['active_stop_order'] = {}
+            position['stop_order_id'] = None
+            position['trade_management_plan'] = {}
+            position['closed_at'] = str(position.get('closed_at') or _isoformat_utc(_utc_now()))
+            position['exit_reason'] = 'order_trade_update_reduce_only_filled'
+            positions_state, _ = upsert_position_record(positions_state, position, key=position_key)
+            store.save_json('positions', positions_state)
+            return emit_position_closed_runtime_event(
+                store,
+                position,
+                exit_reason='order_trade_update_reduce_only_filled',
+                exit_price=row.get('entry_average_price') or row.get('entry_last_price'),
+                exit_source='user_data_stream',
+                extra_payload={
+                    'event_time': row.get('event_time'),
+                    'entry_update_time': row.get('entry_update_time'),
+                    'realized_pnl': row.get('realized_pnl'),
+                },
+            )
         positions_state, _ = upsert_position_record(positions_state, position, key=position_key)
         store.save_json('positions', positions_state)
     event_payload = {key: value for key, value in row.items() if key != 'event_type'}
@@ -1405,7 +1505,7 @@ def build_auto_loop_book_ticker_websocket_monitor_config(
         unavailable_event_emitter=optional_store_seams['unavailable_event_emitter'],
         unavailable_summary_builder=default_seams['unavailable_summary_builder'],
         unavailable_reason='websocket_client_missing',
-        max_supervisor_cycles=1,
+        max_supervisor_cycles=0,
     )
 
 
@@ -1475,6 +1575,76 @@ def resolve_auto_loop_book_ticker_max_supervisor_cycles(
     return config.max_supervisor_cycles
 
 
+def _book_ticker_websocket_supervisor_target(
+    *,
+    store: RuntimeStateStore,
+    symbol_provider: Callable[[], Sequence[str]],
+    ws_module: Any,
+) -> None:
+    try:
+        build_auto_loop_book_ticker_supervisor_summary(
+            store=store,
+            symbol_provider=symbol_provider,
+            ws_module=ws_module,
+            max_supervisor_cycles=0,
+        )
+    except Exception as exc:
+        append_runtime_event(store, 'book_ticker_ws_supervisor_crashed', {
+            'event_source': 'book_ticker_websocket',
+            'error': str(exc),
+        })
+        update_book_ticker_ws_health_state(
+            store,
+            status='error',
+            symbols=list(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('symbols') or []),
+            last_error=str(exc),
+        )
+
+
+def ensure_auto_loop_book_ticker_websocket_supervisor_running(
+    *,
+    store: RuntimeStateStore,
+    symbol_provider: Callable[[], Sequence[str]],
+    ws_module: Any,
+) -> Dict[str, Any]:
+    current_symbols = list(symbol_provider())
+    normalized_symbols = [str(symbol).strip().upper() for symbol in current_symbols if str(symbol).strip()]
+    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        existing_thread = _BOOK_TICKER_WS_SUPERVISOR_STATE.get('thread')
+        if isinstance(existing_thread, threading.Thread) and existing_thread.is_alive():
+            _BOOK_TICKER_WS_SUPERVISOR_STATE['symbols'] = normalized_symbols
+            return {
+                'mode': 'background_thread',
+                'thread_name': str(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('thread_name') or existing_thread.name),
+                'started_at': _BOOK_TICKER_WS_SUPERVISOR_STATE.get('started_at', ''),
+                'symbols': list(normalized_symbols),
+                'running': True,
+            }
+        started_at = _isoformat_utc(_utc_now())
+        thread = threading.Thread(
+            target=_book_ticker_websocket_supervisor_target,
+            kwargs={
+                'store': store,
+                'symbol_provider': symbol_provider,
+                'ws_module': ws_module,
+            },
+            name='book-ticker-ws-supervisor',
+            daemon=True,
+        )
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] = thread
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['thread_name'] = thread.name
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['started_at'] = started_at
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['symbols'] = normalized_symbols
+        thread.start()
+        return {
+            'mode': 'background_thread',
+            'thread_name': thread.name,
+            'started_at': started_at,
+            'symbols': list(normalized_symbols),
+            'running': True,
+        }
+
+
 def run_auto_loop_book_ticker_websocket_monitor_core(
     *,
     store: RuntimeStateStore,
@@ -1518,12 +1688,19 @@ def run_auto_loop_book_ticker_websocket_monitor_available_branch(
     if symbol_provider is None:
         raise ValueError('AutoLoopBookTickerWebsocketMonitorConfig.symbol_provider is required for available branch')
     max_supervisor_cycles = resolve_auto_loop_book_ticker_max_supervisor_cycles(config)
-    summary = build_auto_loop_book_ticker_supervisor_summary(
-        store=store,
-        symbol_provider=symbol_provider,
-        ws_module=ws_module,
-        max_supervisor_cycles=max_supervisor_cycles,
-    )
+    if max_supervisor_cycles == 0:
+        summary = ensure_auto_loop_book_ticker_websocket_supervisor_running(
+            store=store,
+            symbol_provider=symbol_provider,
+            ws_module=ws_module,
+        )
+    else:
+        summary = build_auto_loop_book_ticker_supervisor_summary(
+            store=store,
+            symbol_provider=symbol_provider,
+            ws_module=ws_module,
+            max_supervisor_cycles=max_supervisor_cycles,
+        )
     health = read_auto_loop_book_ticker_health(store=store, config=config)
     return build_auto_loop_book_ticker_available_result(summary=summary, health=health)
 
@@ -1544,12 +1721,15 @@ def build_auto_loop_book_ticker_supervisor_summary(
     max_supervisor_cycles: Optional[int],
 ) -> Dict[str, Any]:
     initial_symbols = list(symbol_provider())
+    target_sample_count = 6
+    max_messages_per_cycle = max(100, len(initial_symbols) * target_sample_count)
     return run_book_ticker_websocket_supervisor(
         store,
         initial_symbols=initial_symbols,
         symbol_provider=symbol_provider,
         ws_module=ws_module,
         max_supervisor_cycles=max_supervisor_cycles,
+        max_messages_per_cycle=max_messages_per_cycle,
     )
 
 
@@ -4353,13 +4533,23 @@ def refresh_book_ticker_websocket_subscription(
         'subscription_version': state['subscription_version'],
         'reconnect_count': state['reconnect_count'],
     })
+    previous_health = store.load_json('book_ticker_ws_status', {}) if store is not None else {}
+    if not isinstance(previous_health, dict):
+        previous_health = {}
+    previous_messages_processed = int(previous_health.get('messages_processed', 0) or 0)
+    previous_samples_written = int(previous_health.get('samples_written', 0) or 0)
+    previous_status = str(previous_health.get('status') or '').strip().lower()
+    next_status = 'healthy' if previous_status == 'healthy' and (previous_messages_processed > 0 or previous_samples_written > 0) else 'connecting'
     update_book_ticker_ws_health_state(
         store,
-        status='connecting',
+        status=next_status,
         symbols=next_symbols,
         reconnect_count=state['reconnect_count'],
         subscription_version=state['subscription_version'],
+        messages_processed=previous_messages_processed,
+        samples_written=previous_samples_written,
         active_streams=state['streams'],
+        last_error=str(previous_health.get('last_error') or ''),
     )
     return {'reopened': True, 'symbols': next_symbols, 'subscription_version': state['subscription_version']}
 
@@ -4739,6 +4929,11 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
         'trigger_confirmation_flags': dict(candidate.trigger_confirmation_flags or {}),
         'trigger_confirmation_count': int(candidate.trigger_confirmation_count or 0),
         'trigger_min_confirmations': int(candidate.trigger_min_confirmations or 0),
+        'tradeability_score': round(float(getattr(candidate, 'tradeability_score', 0.0) or 0.0), 1),
+        'expected_edge': round(float(getattr(candidate, 'expected_edge', 0.0) or 0.0), 4),
+        'expected_total_fee_pct': round(float(getattr(candidate, 'expected_total_fee_pct', 0.0) or 0.0), 4),
+        'execution_slippage_buffer_pct': round(float(getattr(candidate, 'execution_slippage_buffer_pct', 0.0) or 0.0), 4),
+        'min_profit_buffer_pct': round(float(getattr(candidate, 'min_profit_buffer_pct', 0.0) or 0.0), 4),
         'expected_slippage_pct': round(candidate.expected_slippage_pct, 4),
         'expected_slippage_r': execution_quality['expected_slippage_r'],
         'book_depth_fill_ratio': round(candidate.book_depth_fill_ratio, 4),
@@ -4882,6 +5077,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     candidate_alerts: List[Dict[str, Any]] = []
     max_candidates = int(getattr(args, 'max_candidates', 8) or 8)
     evaluated_symbols = merged_symbols[: max(max_candidates * 2, max_candidates)]
+    allowed_trade_sides = resolve_allowed_trade_sides(getattr(args, 'allowed_trade_sides', 'long,short'))
     evaluated_side_count = 0
     for symbol in evaluated_symbols:
         meta = metas.get(symbol)
@@ -4909,7 +5105,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         )
         okx_payload = okx_map.get(symbol, {})
         external_signal = external_signal_map.get(symbol, {})
-        for candidate_side in (TRADE_SIDE_LONG, TRADE_SIDE_SHORT):
+        for candidate_side in allowed_trade_sides:
             evaluated_side_count += 1
             candidate = build_candidate(
                 symbol=symbol,
@@ -4924,6 +5120,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                 loser_rank=loser_rank_map.get(symbol),
                 risk_usdt=float(getattr(args, 'risk_usdt', 10.0) or 10.0),
                 max_notional_usdt=float(getattr(args, 'max_notional_usdt', 0.0) or 0.0),
+                min_notional_usdt=float(getattr(args, 'min_notional_usdt', 0.0) or 0.0),
                 lookback_bars=int(getattr(args, 'lookback_bars', 12) or 12),
                 swing_bars=int(getattr(args, 'swing_bars', 6) or 6),
                 min_5m_change_pct=float(getattr(args, 'min_5m_change_pct', 2.0) or 0.0),
@@ -5019,12 +5216,10 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
 
     candidates.sort(key=lambda item: item.score, reverse=True)
     candidate_alerts = [build_standardized_alert(item, regime_payload) for item in candidates]
+    execution_candidates = [item for item in candidates if bool(getattr(item, 'trigger_fired', False))]
     execution_priority = sorted(
-        candidates,
-        key=lambda item: (
-            2 if bool(getattr(item, 'trigger_fired', False)) else (1 if bool(getattr(item, 'setup_ready', False)) else 0),
-            float(getattr(item, 'score', 0.0) or 0.0),
-        ),
+        execution_candidates,
+        key=lambda item: float(getattr(item, 'score', 0.0) or 0.0),
         reverse=True,
     )
     best = execution_priority[0] if execution_priority else None
@@ -5095,6 +5290,16 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'top_trade_missing': dict(sorted(trade_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
     }
     blocked_tradeability = build_blocked_tradeability_rows(rejected_events)
+    summary_counters = {
+        'raw_scan_symbol_count': funnel['raw_scan_symbol_count'],
+        'evaluated_symbol_count': funnel['evaluated_symbol_count'],
+        'evaluated_side_count': funnel['evaluated_side_count'],
+        'early_filter_passed_count': funnel['early_filter_passed_count'],
+        'setup_ready_count': funnel['setup_ready_count'],
+        'trigger_fired_count': funnel['trigger_fired_count'],
+        'candidate_pool_count': funnel['candidate_pool_count'],
+        'hard_rejected_count': funnel['hard_rejected_count'],
+    }
     payload = {
         'ok': True,
         'candidate_count': len(candidates),
@@ -5113,6 +5318,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'blocked_tradeability': blocked_tradeability,
         'early_rejected_stats': early_reject_stats,
         'funnel': funnel,
+        'summary_counters': summary_counters,
     }
     return payload, best, metas
 
@@ -5189,6 +5395,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--swing-bars', type=int, default=6)
     parser.add_argument('--risk-usdt', type=float, default=10.0)
     parser.add_argument('--max-notional-usdt', type=float, default=0.0)
+    parser.add_argument('--min-notional-usdt', type=float, default=0.0)
     parser.add_argument('--min-5m-change-pct', type=float, default=2.0)
     parser.add_argument('--base-acceleration-ratio', type=float, default=1.25, help='Base acceleration ratio for regime entry thresholds.')
     parser.add_argument('--min-quote-volume', type=float, default=50_000_000.0)
@@ -5215,6 +5422,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--scan-only', action='store_true')
     parser.add_argument('--profile', default='default')
+    parser.add_argument('--allowed-trade-sides', default='long,short')
     parser.add_argument('--tp1-r', type=float, default=1.5)
     parser.add_argument('--tp1-close-pct', type=float, default=0.3)
     parser.add_argument('--tp1-profit-usdt', type=float, default=0.0)
@@ -5303,12 +5511,28 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'halt_on_orphan_position': False,
         'repair_missing_protection': True,
         'output_format': 'cn',
+        'allowed_trade_sides': 'long,short',
+        'enable_symbol_quality_tier': False,
+        'enable_market_regime_gate': False,
+        'enable_direction_lock': False,
+        'enable_fee_aware_edge_filter': False,
+        'atr_stop_multiplier': 1.5,
     }
     for key, value in defaults.items():
         if not hasattr(args, key):
             setattr(args, key, value)
     profile = getattr(args, 'profile', 'default')
-    valid_profiles = {'default', '10u-aggressive', '10u-active', 'binance-sim-active', 'high_vol_alt_mode'}
+    valid_profiles = {
+        'default',
+        '10u-aggressive',
+        '10u-aggressive-v2',
+        '10u-active',
+        'binance-sim-active',
+        'high_vol_alt_mode',
+        'aggressive-fee-aware-scalp-long-short',
+        'aggressive-fee-aware-scalp-long-only',
+        'aggressive-fee-aware-scalp-short-only',
+    }
     if profile not in valid_profiles:
         raise ValueError(f'Unknown profile: {profile}')
     profile_overrides: Dict[str, Any] = {}
@@ -5350,6 +5574,51 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_distance_from_vwap_pct': 8.0,
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
+        }
+    elif profile == '10u-aggressive-v2':
+        profile_overrides = {
+            'risk_usdt': 1.2,
+            'max_notional_usdt': 500.0,
+            'leverage': 5,
+            'probe_max_leverage': 5,
+            'breakeven_r': 0.8,
+            'tp1_r': 5.0,
+            'tp1_close_pct': 0.5,
+            'tp2_r': 10.0,
+            'tp2_close_pct': 0.5,
+            'entry_tp1_offset_abs': 5.0,
+            'entry_tp2_offset_abs': 10.0,
+            'lookback_bars': 4,
+            'swing_bars': 4,
+            'min_quote_volume': 3_000_000,
+            'top_gainers': 45,
+            'top_losers': 45,
+            'max_candidates': 24,
+            'max_open_positions': 3,
+            'max_long_positions': 3,
+            'max_short_positions': 3,
+            'max_rsi_5m': 84.0,
+            'min_volume_multiple': 0.5,
+            'min_5m_change_pct': 0.2,
+            'watch_breakout_tolerance_pct': 1.2,
+            'setup_breakout_tolerance_pct': 0.8,
+            'oi_hard_reversal_threshold_pct': 1.2,
+            'extended_chase_threshold_pct': 22.0,
+            'sim_probe_entry_enabled': False,
+            'sim_probe_size_ratio': 0.3,
+            'sim_probe_min_score': 58.0,
+            'sim_probe_max_breakout_distance_pct': 0.6,
+            'trigger_min_confirmations': 1,
+            'max_distance_from_ema_pct': 9.0,
+            'max_distance_from_vwap_pct': 8.0,
+            'max_funding_rate': 0.0008,
+            'max_funding_rate_avg': 0.0005,
+            'enable_symbol_quality_tier': True,
+            'enable_market_regime_gate': True,
+            'enable_direction_lock': True,
+            'enable_fee_aware_edge_filter': True,
+            'atr_stop_multiplier': 1.5,
+            'allowed_trade_sides': 'long,short',
         }
     elif profile == '10u-active':
         profile_overrides = {
@@ -5423,6 +5692,52 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             })
         elif profile == 'high_vol_alt_mode':
             profile_overrides['high_vol_alt_mode'] = True
+    elif profile in {
+        'aggressive-fee-aware-scalp-long-short',
+        'aggressive-fee-aware-scalp-long-only',
+        'aggressive-fee-aware-scalp-short-only',
+    }:
+        profile_overrides = {
+            'risk_usdt': 2.0,
+            'max_notional_usdt': 80.0,
+            'leverage': 5,
+            'max_open_positions': 1,
+            'max_long_positions': 1,
+            'max_short_positions': 1,
+            'poll_interval_sec': 30,
+            'monitor_poll_interval_sec': 3,
+            'stop_buffer_pct': 0.025,
+            'breakeven_r': 0.55,
+            'tp1_r': 1.0,
+            'tp1_close_pct': 0.55,
+            'tp2_r': 1.8,
+            'tp2_close_pct': 0.35,
+            'trailing_buffer_pct': 0.01,
+            'trigger_min_confirmations': 1,
+            'min_5m_change_pct': 0.45,
+            'min_volume_multiple': 1.1,
+            'watch_breakout_tolerance_pct': 0.7,
+            'setup_breakout_tolerance_pct': 0.35,
+            'max_rsi_5m': 86.0,
+            'max_distance_from_ema_pct': 5.0,
+            'max_distance_from_vwap_pct': 4.5,
+            'extended_chase_threshold_pct': 10.0,
+            'execution_slippage_hard_veto_r': 0.25,
+            'execution_slippage_risk_threshold_r': 0.15,
+            'daily_max_loss_usdt': 6.0,
+            'max_consecutive_losses': 2,
+            'symbol_cooldown_minutes': 30,
+            'opposite_side_flip_cooldown_minutes': 90,
+            'gross_heat_cap_r': 1.2,
+            'same_theme_heat_cap_r': 0.8,
+            'same_correlation_heat_cap_r': 0.8,
+            'sim_probe_size_ratio': 0.3,
+            'allowed_trade_sides': 'long,short',
+        }
+        if profile == 'aggressive-fee-aware-scalp-long-only':
+            profile_overrides['allowed_trade_sides'] = 'long'
+        elif profile == 'aggressive-fee-aware-scalp-short-only':
+            profile_overrides['allowed_trade_sides'] = 'short'
     for key, value in profile_overrides.items():
         if key not in explicit:
             setattr(args, key, value)
@@ -5576,7 +5891,22 @@ def build_notification_message(event_type: str, payload: Dict[str, Any]) -> str:
     symbol = payload.get('symbol', '-')
     profile = payload.get('profile', '')
     if event_type == 'entry_filled':
-        return f"开单 {symbol} entry={payload.get('entry_price')} stop={payload.get('stop_price')} qty={payload.get('quantity')} profile={profile}".strip()
+        side_text = {
+            'LONG': '做多',
+            'SHORT': '做空',
+        }.get(str(payload.get('side', '')).upper(), str(payload.get('side') or ''))
+        parts = [f"开单成交 {symbol}"]
+        if side_text:
+            parts.append(f"方向={side_text}")
+        if payload.get('entry_price') is not None:
+            parts.append(f"成交价={payload.get('entry_price')}")
+        if payload.get('stop_price') is not None:
+            parts.append(f"止损价={payload.get('stop_price')}")
+        if payload.get('quantity') is not None:
+            parts.append(f"数量={payload.get('quantity')}")
+        if profile:
+            parts.append(f"策略={profile}")
+        return ' '.join(str(part) for part in parts if str(part).strip())
     if event_type == 'user_data_stream_alert':
         status_labels = {
             'refresh_failed': '续期失败',
@@ -5804,17 +6134,33 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             report_key = symbol
         exchange_row = exchange_map.get(position_key)
         if exchange_row is None:
-            was_openish = tracked.get('status') not in {'closed', 'orphan'} or any(
-                abs(_to_float(tracked.get(field))) > 0
-                for field in ('quantity', 'remaining_quantity', 'exchange_position_amt', 'notional', 'unrealized_pnl', 'mark_price')
+            live_quantity_value = abs(_to_float(tracked.get('quantity')))
+            remaining_quantity_value = abs(_to_float(tracked.get('remaining_quantity')))
+            quantity_value = max(
+                live_quantity_value,
+                remaining_quantity_value,
+                abs(_to_float(tracked.get('filled_quantity'))),
             )
+            status_text = str(tracked.get('status') or '').lower()
+            already_reconciled_closed = (
+                str(tracked.get('exchange_reconcile_reason') or '') == 'exchange_position_missing'
+                and str(tracked.get('closed_at') or '').strip() != ''
+                and live_quantity_value <= 0
+                and remaining_quantity_value <= 0
+            )
+            was_openish = (
+                status_text in {'monitoring', 'orphan', 'recovery_pending', 'protected_recovery_pending'}
+                or live_quantity_value > 0
+                or remaining_quantity_value > 0
+            ) and not already_reconciled_closed
             tracked['status'] = 'closed'
-            tracked['remaining_quantity'] = 0.0
             tracked['quantity'] = 0.0
+            tracked['remaining_quantity'] = 0.0
             tracked['exchange_position_amt'] = 0.0
             tracked['notional'] = 0.0
             tracked['unrealized_pnl'] = 0.0
             tracked['mark_price'] = 0.0
+            tracked['entry_price'] = _to_float(tracked.get('entry_price'), default=0.0)
             tracked['stop_order_id'] = None
             tracked['protection_status'] = 'flat'
             tracked['recovery_incomplete'] = False
@@ -5830,8 +6176,16 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             tracked['exit_reason'] = str(tracked.get('exit_reason') or 'exchange_position_missing')
             if was_openish:
                 closed_symbols.append(report_key)
+                emit_position_closed_runtime_event(
+                    store,
+                    tracked,
+                    exit_reason=tracked['exit_reason'],
+                    exit_source='exchange_reconcile',
+                    extra_payload={'exchange_reconcile_reason': 'exchange_position_missing'},
+                )
             normalized_positions[position_key] = tracked
             continue
+
         tracked.update(exchange_position_runtime_fields(exchange_row))
         tracked['protection_status'] = 'protected' if position_key in protected_keys or symbol in protected_symbol_names else tracked.get('protection_status')
         if tracked.get('status') == 'orphan':
@@ -6358,36 +6712,48 @@ def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: ar
     if not allowed_symbols:
         allowed_symbols = sorted(fetch_public_exchange_symbol_set())
     allowed_symbol_set = set(allowed_symbols)
+
+    def _normalize_allowed_symbol_list(raw_symbols: Any) -> List[str]:
+        normalized_symbols: List[str] = []
+        for raw_symbol in list(raw_symbols or []):
+            normalized = normalize_symbol(raw_symbol)
+            if not normalized or not is_strategy_websocket_symbol_allowed(normalized):
+                continue
+            if allowed_symbol_set and normalized not in allowed_symbol_set:
+                continue
+            normalized_symbols.append(normalized)
+        return list(dict.fromkeys(normalized_symbols))
+
     try:
-        square_rows = []
+        square_symbols = _normalize_allowed_symbol_list(load_manual_square_symbols(args))
     except Exception:
-        square_rows = []
-    square_symbols = [
-        str(row.get('symbol', '')).upper()
-        for row in list(square_rows or [])
-        if str(row.get('symbol', '')).strip() and is_strategy_websocket_symbol_allowed(row.get('symbol'))
-    ]
+        square_symbols = []
+
+    try:
+        external_signal_payload = load_external_signal_payload(args)
+    except Exception:
+        external_signal_payload = {}
+    external_signal_symbols = _normalize_allowed_symbol_list((external_signal_payload or {}).get('symbols', []))
+    external_signal_map_symbols = _normalize_allowed_symbol_list(((external_signal_payload or {}).get('signal_map') or {}).keys())
+
     try:
         tickers = fetch_tickers(client)
     except Exception:
         tickers = []
     merged_payload = merged_candidate_symbols(
-        square_symbols=square_symbols,
+        square_symbols=list(dict.fromkeys(square_symbols + external_signal_symbols + external_signal_map_symbols)),
         tickers=tickers,
         allowed_symbols=allowed_symbols,
         top_gainers=top_gainers,
         top_losers=top_losers,
     )
     merged_symbols = merged_payload[0]
-    symbols = [
-        str(symbol).upper()
-        for symbol in list(merged_symbols or [])
-        if str(symbol).strip() and is_strategy_websocket_symbol_allowed(symbol)
-    ]
+    symbols = _normalize_allowed_symbol_list(merged_symbols)
     if symbols:
         return symbols
-    if square_symbols:
-        return [symbol for symbol in square_symbols if not allowed_symbols or symbol in allowed_symbol_set]
+    fallback_symbols = _normalize_allowed_symbol_list(square_symbols + external_signal_symbols + external_signal_map_symbols)
+    if fallback_symbols:
+        return fallback_symbols
     return ['BTCUSDT']
 
 

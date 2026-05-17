@@ -320,6 +320,25 @@ def test_evaluate_risk_guards_blocks_daily_symbol_trade_limit():
 
 
 
+def test_evaluate_risk_guards_blocks_fee_aware_edge_shortfall_when_cost_floor_exceeds_edge():
+    candidate = make_candidate(
+        expected_edge=0.05,
+        expected_total_fee_pct=0.02,
+        execution_slippage_buffer_pct=0.02,
+        min_profit_buffer_pct=0.02,
+    )
+
+    payload = evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        risk_state=default_risk_state(),
+        candidate=candidate,
+    )
+
+    assert payload['allowed'] is False
+    assert 'candidate_edge_after_costs_insufficient' in payload['reasons']
+
+
+
 def test_evaluate_risk_guards_blocks_aggressive_flip_reentry_inside_cooldown_window():
     candidate = make_candidate(
         side='SHORT',

@@ -793,6 +793,7 @@ def monitor_live_trade(
         'entry_price': round(entry_price, 10),
         'stop_price': round(plan.stop_price, 10),
         'quantity': round(state.initial_quantity, 10),
+        'leverage': requested_leverage,
     })
     record_event('protection_confirmed', {
         'protection_status': protection_check.get('status') if isinstance(protection_check, dict) else None,

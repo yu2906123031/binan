@@ -96,6 +96,8 @@ def make_candidate_request(**overrides):
         market_regime={'risk_on': True, 'score_multiplier': 1.1, 'reasons': ['btc_above_ema20'], 'label': 'risk_on'},
         legacy_kwargs={
             'risk_usdt': 10.0,
+            'min_notional_usdt': 20.0,
+            'max_notional_usdt': 30.0,
             'lookback_bars': 12,
             'swing_bars': 6,
             'min_5m_change_pct': 0.5,
@@ -226,6 +228,8 @@ def test_build_candidate_runtime_inputs_copies_sequences_and_injects_dependencie
     assert captured['okx_sentiment'] == {'okx_sentiment_score': 0.28}
     assert captured['smart_money_context'] == {'smart_money_flow_score': 0.45}
     assert captured['risk_usdt'] == 10.0
+    assert captured['min_notional_usdt'] == 20.0
+    assert captured['max_notional_usdt'] == 30.0
     assert captured['Candidate'] is mod.Candidate
     assert captured['TRADE_SIDE_LONG'] == mod.TRADE_SIDE_LONG
     assert captured['TRADE_SIDE_SHORT'] == mod.TRADE_SIDE_SHORT
@@ -284,6 +288,8 @@ def test_build_candidate_request_path_preserves_trade_management_plan_fields(mon
     assert candidate is sentinel
     assert captured['build_trade_management_plan'] is mod.build_trade_management_plan
     assert captured['risk_usdt'] == 10.0
+    assert captured['min_notional_usdt'] == 20.0
+    assert captured['max_notional_usdt'] == 30.0
     assert captured['lookback_bars'] == 12
     assert captured['swing_bars'] == 6
     assert captured['funding_rate_threshold'] == 0.0005
@@ -811,6 +817,34 @@ def test_build_candidate_request_path_sets_staged_entry_and_slippage_fields():
     assert 0.0 <= candidate.book_depth_fill_ratio <= 1.0
 
 
+def test_apply_candidate_diagnostics_surfaces_pullback_stage_requirements_for_high_elastic_long():
+    candidate = build_candidate_from_request()
+    candidate = mod.apply_candidate_diagnostics(candidate)
+
+    assert candidate.candidate_stage == 'watch_candidate'
+    assert 'elastic_pullback_not_confirmed' in candidate.setup_missing
+    assert 'candidate_setup_not_ready' in candidate.trade_missing
+    assert candidate.trigger_confirmation_flags['breakout_close_confirmed'] is True
+    assert candidate.trigger_confirmation_flags['high_elastic_long_pullback_confirmed'] is False
+
+
+def test_build_candidate_request_path_records_atr_stop_and_fee_aware_edge_contract():
+    candidate = build_candidate_from_request()
+
+    assert candidate is not None
+    assert candidate.atr_stop_distance > 0
+    assert candidate.stop_model in {'atr', 'blended'}
+    assert candidate.expected_edge > 0
+    assert candidate.expected_total_fee_pct > 0
+    assert candidate.execution_slippage_buffer_pct > 0
+    assert candidate.min_profit_buffer_pct > 0
+    assert candidate.expected_edge > (
+        candidate.expected_total_fee_pct
+        + candidate.execution_slippage_buffer_pct
+        + candidate.min_profit_buffer_pct
+    )
+
+
 def test_build_candidate_request_path_blocks_when_expected_slippage_and_overextension_stay_high():
     request = make_candidate_request(
         ticker={'symbol': 'TESTUSDT', 'priceChangePercent': '12', 'quoteVolume': '80000000', 'lastPrice': '141.0'},
@@ -1047,6 +1081,11 @@ def test_build_standardized_alert_exposes_candidate_three_layer_fields():
         trigger_fired=True,
         expected_slippage_pct=1.44,
         book_depth_fill_ratio=0.83,
+        tradeability_score=67.8,
+        expected_edge=2.34,
+        expected_total_fee_pct=0.28,
+        execution_slippage_buffer_pct=0.41,
+        min_profit_buffer_pct=0.55,
     )
     candidate.entry_distance_from_breakout_pct = round((candidate.last_price - candidate.breakout_level) / candidate.breakout_level * 100, 4)
     candidate.entry_distance_from_vwap_pct = candidate.distance_from_vwap_15m_pct
@@ -1064,6 +1103,11 @@ def test_build_standardized_alert_exposes_candidate_three_layer_fields():
     assert alert['liquidity_grade'] == 'A'
     assert alert['setup_ready'] is True
     assert alert['trigger_fired'] is True
+    assert alert['tradeability_score'] == 67.8
+    assert alert['expected_edge'] == 2.34
+    assert alert['expected_total_fee_pct'] == 0.28
+    assert alert['execution_slippage_buffer_pct'] == 0.41
+    assert alert['min_profit_buffer_pct'] == 0.55
 
 
 def test_run_loop_records_rejection_event_when_risk_guard_blocks_live_trade(monkeypatch, tmp_path):
@@ -1506,41 +1550,45 @@ def test_run_auto_loop_user_data_stream_monitor_returns_empty_payload_without_ex
     assert result == {'monitor': None, 'alert': None}
 
 
-def test_run_auto_loop_book_ticker_websocket_monitor_uses_supervisor_and_health(monkeypatch, tmp_path):
+def test_run_auto_loop_book_ticker_websocket_monitor_starts_background_supervisor_and_reads_health(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     args = argparse.Namespace(auto_loop=True)
     ws_module = object()
-    supervisor_calls = []
+    ensure_calls = []
 
     monkeypatch.setattr(mod, 'websocket', ws_module)
     monkeypatch.setattr(mod, 'resolve_auto_loop_book_ticker_symbols', lambda client, args: ['BTCUSDT', 'ETHUSDT'])
 
-    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
-        supervisor_calls.append({
-            'store': store_arg,
-            'initial_symbols': list(initial_symbols),
+    def fake_ensure(*, store, symbol_provider, ws_module):
+        ensure_calls.append({
+            'store': store,
             'ws_module': ws_module,
             'provider_symbols': list(symbol_provider()),
         })
-        store_arg.save_json('book_ticker_ws_status', {'status': 'healthy', 'messages_processed': 7})
-        return {'cycles_completed': 1, 'subscription_version': 2, 'symbols': ['BTCUSDT', 'ETHUSDT']}
+        store.save_json('book_ticker_ws_status', {'status': 'healthy', 'messages_processed': 7})
+        return {
+            'mode': 'background_thread',
+            'thread_name': 'book-ticker-ws-supervisor',
+            'symbols': ['BTCUSDT', 'ETHUSDT'],
+            'running': True,
+        }
 
-    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+    monkeypatch.setattr(mod, 'ensure_auto_loop_book_ticker_websocket_supervisor_running', fake_ensure)
 
     result = mod.run_auto_loop_book_ticker_websocket_monitor(client=object(), store=store, args=args)
 
-    assert supervisor_calls == [{
+    assert ensure_calls == [{
         'store': store,
-        'initial_symbols': ['BTCUSDT', 'ETHUSDT'],
         'ws_module': ws_module,
         'provider_symbols': ['BTCUSDT', 'ETHUSDT'],
     }]
     assert result == {
         'status': 'available',
         'summary': {
-            'cycles_completed': 1,
-            'subscription_version': 2,
+            'mode': 'background_thread',
+            'thread_name': 'book-ticker-ws-supervisor',
             'symbols': ['BTCUSDT', 'ETHUSDT'],
+            'running': True,
         },
         'health': {'status': 'healthy', 'messages_processed': 7},
     }
@@ -2194,7 +2242,7 @@ def test_build_auto_loop_book_ticker_websocket_monitor_config_is_explicit_marker
         unavailable_event_emitter=expected_store_seams['unavailable_event_emitter'],
         unavailable_summary_builder=expected_default_seams['unavailable_summary_builder'],
         unavailable_reason='websocket_client_missing',
-        max_supervisor_cycles=1,
+        max_supervisor_cycles=0,
     )
 
 
@@ -2255,6 +2303,80 @@ def test_run_auto_loop_book_ticker_websocket_monitor_uses_explicit_config_withou
     }
 
 
+def test_build_auto_loop_book_ticker_supervisor_summary_scales_message_budget_to_symbol_count(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    ws_module = object()
+    supervisor_calls = []
+
+    def fake_provider():
+        return ['BTCUSDT', 'ETHUSDT', 'DOGEUSDT']
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'store': store_arg,
+            'initial_symbols': list(initial_symbols),
+            'provider_symbols': list(symbol_provider()),
+            'ws_module': ws_module,
+            'max_supervisor_cycles': kwargs.get('max_supervisor_cycles'),
+            'max_messages_per_cycle': kwargs.get('max_messages_per_cycle'),
+        })
+        return {'cycles_completed': 1, 'messages_processed_total': kwargs.get('max_messages_per_cycle')}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    result = mod.build_auto_loop_book_ticker_supervisor_summary(
+        store=store,
+        symbol_provider=fake_provider,
+        ws_module=ws_module,
+        max_supervisor_cycles=7,
+    )
+
+    assert supervisor_calls == [{
+        'store': store,
+        'initial_symbols': ['BTCUSDT', 'ETHUSDT', 'DOGEUSDT'],
+        'provider_symbols': ['BTCUSDT', 'ETHUSDT', 'DOGEUSDT'],
+        'ws_module': ws_module,
+        'max_supervisor_cycles': 7,
+        'max_messages_per_cycle': 100,
+    }]
+    assert result == {'cycles_completed': 1, 'messages_processed_total': 100}
+
+
+
+def test_build_auto_loop_book_ticker_supervisor_summary_raises_message_budget_for_large_symbol_set(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    ws_module = object()
+    supervisor_calls = []
+    symbols = [f'SYM{idx}USDT' for idx in range(112)]
+
+    def fake_provider():
+        return list(symbols)
+
+    def fake_supervisor(store_arg, initial_symbols, symbol_provider, ws_module=None, **kwargs):
+        supervisor_calls.append({
+            'initial_count': len(initial_symbols),
+            'provider_count': len(symbol_provider()),
+            'max_messages_per_cycle': kwargs.get('max_messages_per_cycle'),
+        })
+        return {'cycles_completed': 1}
+
+    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_supervisor)
+
+    mod.build_auto_loop_book_ticker_supervisor_summary(
+        store=store,
+        symbol_provider=fake_provider,
+        ws_module=ws_module,
+        max_supervisor_cycles=1,
+    )
+
+    assert supervisor_calls == [{
+        'initial_count': 112,
+        'provider_count': 112,
+        'max_messages_per_cycle': 672,
+    }]
+
+
+
 def test_build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_probe_and_unavailable_emitter(monkeypatch, tmp_path):
     args = argparse.Namespace(auto_loop=True)
     store = mod.RuntimeStateStore(str(tmp_path))
@@ -2280,7 +2402,7 @@ def test_build_auto_loop_book_ticker_websocket_monitor_config_wires_explicit_pro
         unavailable_event_emitter=expected_emitter,
         unavailable_summary_builder=expected_summary_builder,
         unavailable_reason='websocket_client_missing',
-        max_supervisor_cycles=1,
+        max_supervisor_cycles=0,
     )
 
 
@@ -3839,7 +3961,25 @@ def test_sync_tracked_positions_with_exchange_clears_recovery_flags_when_positio
             'protection_status': 'protected',
             'recovery_incomplete': True,
             'protected_recovery_pending': True,
-            'trade_management_plan': {'quantity': 5.0, 'tp1': 0.12},
+            'opened_at': '2026-04-29T00:00:00Z',
+            'selected_score': 82.6,
+            'selected_state': 'launch',
+            'selected_alert_tier': 'critical',
+            'candidate_stage': 'launch',
+            'trigger_class': 'breakout_retest',
+            'market_regime_label': 'expansion',
+            'market_regime_multiplier': 1.25,
+            'setup_ready': True,
+            'trigger_fired': True,
+            'trade_management_plan': {
+                'position_side': 'LONG',
+                'side': 'BUY',
+                'quantity': 5.0,
+                'stop_price': 0.12,
+                'initial_stop_price': 0.12,
+                'initial_risk_per_unit': 0.01,
+                'tp1': 0.12,
+            },
         },
     })
 
@@ -3851,6 +3991,52 @@ def test_sync_tracked_positions_with_exchange_clears_recovery_flags_when_positio
     assert positions['DOGEUSDT:LONG']['protected_recovery_pending'] is False
     assert positions['DOGEUSDT:LONG']['trade_management_plan'] == {}
     assert positions['DOGEUSDT:LONG']['exchange_reconcile_reason'] == 'exchange_position_missing'
+    assert positions['DOGEUSDT:LONG']['opened_at'] == '2026-04-29T00:00:00Z'
+    assert positions['DOGEUSDT:LONG']['selected_score'] == 82.6
+    assert positions['DOGEUSDT:LONG']['selected_state'] == 'launch'
+
+    rows = [mod.json.loads(line) for line in store._events_path().read_text(encoding='utf-8').splitlines() if line.strip()]
+    assert rows[-1]['event_type'] == 'trade_invalidated'
+    assert rows[-1]['symbol'] == 'DOGEUSDT'
+    assert rows[-1]['position_side'] == 'LONG'
+    assert rows[-1]['exit_reason'] == 'exchange_position_missing'
+    assert rows[-1]['opened_at'] == '2026-04-29T00:00:00Z'
+    assert rows[-1]['score'] == 82.6
+    assert rows[-1]['state'] == 'launch'
+    assert rows[-1]['alert_tier'] == 'critical'
+
+
+def test_sync_tracked_positions_with_exchange_does_not_repeat_reconcile_close_events_for_already_closed_position(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 0.0,
+            'filled_quantity': 0.005,
+            'remaining_quantity': 0.0,
+            'exchange_position_amt': 0.0,
+            'protection_status': 'flat',
+            'exchange_reconcile_reason': 'exchange_position_missing',
+            'closed_at': '2026-05-16T10:01:20.513347Z',
+            'exit_reason': 'exchange_position_missing',
+            'opened_at': '2026-05-16T09:49:37.968235Z',
+            'selected_score': 43.2272,
+            'selected_state': 'launch',
+            'selected_alert_tier': 'blocked',
+        },
+    })
+
+    first = mod.sync_tracked_positions_with_exchange(store, exchange_positions=[])
+    second = mod.sync_tracked_positions_with_exchange(store, exchange_positions=[])
+    events_path = store._events_path()
+    rows = [mod.json.loads(line) for line in events_path.read_text(encoding='utf-8').splitlines() if line.strip()] if events_path.exists() else []
+
+    assert first['closed_symbols'] == []
+    assert second['closed_symbols'] == []
+    assert rows == []
 
 
 def test_sync_tracked_positions_with_exchange_clears_orphan_close_fields_when_position_closes(tmp_path):

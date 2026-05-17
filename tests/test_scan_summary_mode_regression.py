@@ -385,3 +385,68 @@ def test_build_cn_scan_summary_includes_execution_slippage_tradeability_details(
     assert '可交易性拦截:' in rendered
     assert 'DOGEUSDT | execution_slippage | 分数 41.2 | slippage_r=0.33, spread_bps=9.2, depth_fill_ratio=0.38' in rendered
     assert 'PEPEUSDT | execution_slippage | 分数 36.7 | slippage_r=0.29, spread_bps=11.5' in rendered
+
+
+def test_build_cn_scan_summary_includes_scan_summary_counters_line():
+    result = {
+        'ok': True,
+        'cycles': [
+            {
+                'scan_only': False,
+                'scan': {
+                    'market_regime': {'label': 'risk-on', 'score_multiplier': 1.0, 'reasons': []},
+                    'candidate_count': 2,
+                    'rejected_stats': {'total': 5, 'by_reject_label': {'tradeability': 3}},
+                    'candidate_alerts': [
+                        {
+                            'symbol': 'WIFUSDT',
+                            'alert_tier': 'trade',
+                            'state': 'armed',
+                            'candidate_stage': 'trade_candidate',
+                            'score': 78.5,
+                            'price_change_pct_24h': 15.7,
+                            'recent_5m_change_pct': 2.4,
+                            'position_size_pct': 20.0,
+                            'execution_liquidity_grade': 'A',
+                        },
+                        {
+                            'symbol': 'DOGEUSDT',
+                            'alert_tier': 'watch',
+                            'state': 'watch',
+                            'candidate_stage': 'watch_candidate',
+                            'score': 67.1,
+                            'price_change_pct_24h': 9.2,
+                            'recent_5m_change_pct': 1.5,
+                            'position_size_pct': 12.0,
+                            'execution_liquidity_grade': 'B',
+                        },
+                    ],
+                    'summary_counters': {
+                        'raw_scan_symbol_count': 42,
+                        'evaluated_symbol_count': 19,
+                        'evaluated_side_count': 31,
+                        'early_filter_passed_count': 12,
+                        'setup_ready_count': 6,
+                        'trigger_fired_count': 3,
+                        'candidate_pool_count': 2,
+                        'hard_rejected_count': 5,
+                    },
+                },
+            }
+        ],
+    }
+
+    summary = mod.build_cn_scan_summary(result)
+    rendered = mod.render_cn_scan_summary(result)
+
+    assert summary['扫描概览']['计数器'] == {
+        'raw_scan_symbol_count': 42,
+        'evaluated_symbol_count': 19,
+        'evaluated_side_count': 31,
+        'early_filter_passed_count': 12,
+        'setup_ready_count': 6,
+        'trigger_fired_count': 3,
+        'candidate_pool_count': 2,
+        'hard_rejected_count': 5,
+    }
+    assert '扫描计数: 原始 42 | 评估标的 19 | 评估方向 31 | 初筛通过 12 | setup_ready 6 | trigger_fired 3 | 候选池 2 | 硬拦截 5' in rendered

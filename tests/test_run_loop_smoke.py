@@ -868,7 +868,7 @@ def test_run_loop_auto_loop_starts_book_ticker_supervisor_before_scan(monkeypatc
     monkeypatch.setattr(mod, 'start_trade_monitor_thread', lambda *args, **kwargs: SimpleNamespace(name='trade-monitor-DOGEUSDT'))
     monkeypatch.setattr(mod, 'websocket', SimpleNamespace(create_connection=lambda *args, **kwargs: None), raising=False)
 
-    def fake_run_book_ticker_websocket_supervisor(store, initial_symbols, symbol_provider, ws_module, **kwargs):
+    def fake_ensure_book_ticker_supervisor(*, store, symbol_provider, ws_module):
         call_order.append('book_ticker_supervisor')
         store.save_json('book_ticker_ws_status', {
             'status': 'healthy',
@@ -883,12 +883,10 @@ def test_run_loop_auto_loop_starts_book_ticker_supervisor_before_scan(monkeypatc
         })
         assert list(symbol_provider()) == ['BTCUSDT', 'ETHUSDT']
         return {
-            'cycles_completed': 1,
-            'reconnect_count': 0,
-            'messages_processed_total': 8,
-            'samples_written_total': 8,
+            'mode': 'background_thread',
+            'running': True,
             'symbols': ['BTCUSDT', 'ETHUSDT'],
-            'subscription_version': 1,
+            'thread_name': 'book-ticker-ws-supervisor',
         }
 
     def fake_run_scan_once(client, args):
@@ -897,7 +895,7 @@ def test_run_loop_auto_loop_starts_book_ticker_supervisor_before_scan(monkeypatc
         assert health['symbols'] == ['BTCUSDT', 'ETHUSDT']
         return ({'candidates': ['DOGEUSDT']}, candidate, {'DOGEUSDT': meta})
 
-    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_run_book_ticker_websocket_supervisor)
+    monkeypatch.setattr(mod, 'ensure_auto_loop_book_ticker_websocket_supervisor_running', fake_ensure_book_ticker_supervisor)
     monkeypatch.setattr(mod, 'run_scan_once', fake_run_scan_once)
     monkeypatch.setattr(mod, 'resolve_auto_loop_book_ticker_symbols', lambda client, args: ['BTCUSDT', 'ETHUSDT'], raising=False)
 
@@ -921,13 +919,11 @@ def test_run_loop_auto_loop_persists_book_ticker_supervisor_health_without_live_
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
     monkeypatch.setattr(mod, 'websocket', SimpleNamespace(create_connection=lambda *args, **kwargs: None), raising=False)
 
-    def fake_run_book_ticker_websocket_supervisor(store, initial_symbols, symbol_provider, ws_module, **kwargs):
+    def fake_ensure_book_ticker_supervisor(*, store, symbol_provider, ws_module):
         book_ticker_calls.append({
             'store': store,
-            'initial_symbols': list(initial_symbols),
             'provided_symbols': list(symbol_provider()),
             'ws_module': ws_module,
-            'kwargs': kwargs,
         })
         store.save_json('book_ticker_ws_status', {
             'status': 'healthy',
@@ -941,15 +937,13 @@ def test_run_loop_auto_loop_persists_book_ticker_supervisor_health_without_live_
             'last_error': '',
         })
         return {
-            'cycles_completed': 1,
-            'reconnect_count': 0,
-            'messages_processed_total': 5,
-            'samples_written_total': 5,
+            'mode': 'background_thread',
+            'running': True,
             'symbols': ['DOGEUSDT'],
-            'subscription_version': 1,
+            'thread_name': 'book-ticker-ws-supervisor',
         }
 
-    monkeypatch.setattr(mod, 'run_book_ticker_websocket_supervisor', fake_run_book_ticker_websocket_supervisor)
+    monkeypatch.setattr(mod, 'ensure_auto_loop_book_ticker_websocket_supervisor_running', fake_ensure_book_ticker_supervisor)
     monkeypatch.setattr(mod, 'resolve_auto_loop_book_ticker_symbols', lambda client, args: ['DOGEUSDT'], raising=False)
 
     result = mod.run_loop(DummyClient(), make_args(auto_loop=True, live=False, runtime_state_dir=str(tmp_path)))
@@ -959,7 +953,6 @@ def test_run_loop_auto_loop_persists_book_ticker_supervisor_health_without_live_
     assert cycle['book_ticker_websocket']['health']['status'] == 'healthy'
     assert cycle['book_ticker_websocket']['health']['active_streams'] == ['dogeusdt@bookTicker']
     assert book_ticker_calls[0]['store'] is store
-    assert book_ticker_calls[0]['initial_symbols'] == ['DOGEUSDT']
     assert book_ticker_calls[0]['provided_symbols'] == ['DOGEUSDT']
 
 
@@ -1913,6 +1906,93 @@ def test_record_user_data_stream_health_event_persists_refresh_and_disconnect_st
     assert uds_state['refresh_failure_count'] == 1
     assert uds_state['started_at'] == '2026-04-20T12:00:00Z'
     assert uds_state['updated_at'] == '2026-04-20T12:40:00Z'
+
+
+def test_apply_user_data_stream_order_update_emits_unified_exit_event_for_reduce_only_close(tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'status': 'monitoring',
+            'monitor_mode': 'trade_management',
+            'quantity': 12.7,
+            'filled_quantity': 12.7,
+            'remaining_quantity': 12.7,
+            'entry_price': 0.1365,
+            'current_stop_price': 0.129,
+            'opened_at': '2026-04-29T00:00:00Z',
+            'selected_score': 82.6,
+            'selected_state': 'launch',
+            'selected_alert_tier': 'critical',
+            'candidate_stage': 'launch',
+            'trigger_class': 'breakout_retest',
+            'market_regime_label': 'expansion',
+            'market_regime_multiplier': 1.25,
+            'setup_ready': True,
+            'trigger_fired': True,
+            'trade_management_plan': {
+                'position_side': 'LONG',
+                'side': 'BUY',
+                'quantity': 12.7,
+                'stop_price': 0.129,
+                'initial_stop_price': 0.129,
+                'initial_risk_per_unit': 0.0075,
+            },
+        },
+    })
+
+    row = mod.apply_user_data_stream_order_update(store, {
+        'e': 'ORDER_TRADE_UPDATE',
+        'E': 1710000002222,
+        'o': {
+            's': 'DOGEUSDT',
+            'S': 'SELL',
+            'ps': 'LONG',
+            'o': 'MARKET',
+            'x': 'TRADE',
+            'X': 'FILLED',
+            'i': 45678,
+            'c': 'close-order-1',
+            'ap': '0.1412',
+            'L': '0.1412',
+            'z': '12.7',
+            'l': '12.7',
+            'q': '12.7',
+            'zq': '1.79324',
+            'n': '0.0002',
+            'N': 'USDT',
+            'R': True,
+            'rp': '0.05969',
+            'T': 1710000002211,
+        },
+    })
+
+    assert row['event_type'] == 'trade_invalidated'
+    assert row['symbol'] == 'DOGEUSDT'
+    assert row['position_side'] == 'LONG'
+    assert row['exit_reason'] == 'order_trade_update_reduce_only_filled'
+    assert row['exit_price'] == 0.1412
+    assert row['opened_at'] == '2026-04-29T00:00:00Z'
+    assert row['score'] == 82.6
+    assert row['state'] == 'launch'
+    assert row['alert_tier'] == 'critical'
+
+    tracked = store.load_json('positions', {})['DOGEUSDT:LONG']
+    assert tracked['status'] == 'closed'
+    assert tracked['protection_status'] == 'flat'
+    assert tracked['remaining_quantity'] == 0.0
+    assert tracked['exit_reason'] == 'order_trade_update_reduce_only_filled'
+    assert tracked['opened_at'] == '2026-04-29T00:00:00Z'
+    assert tracked['selected_score'] == 82.6
+    assert tracked['selected_state'] == 'launch'
+
+    rows = [mod.json.loads(line) for line in store._events_path().read_text(encoding='utf-8').splitlines() if line.strip()]
+    assert rows[-1]['event_type'] == 'trade_invalidated'
+    assert rows[-1]['position_side'] == 'LONG'
+    assert rows[-1]['opened_at'] == '2026-04-29T00:00:00Z'
 
 
 def test_run_loop_auto_loop_persists_user_data_stream_health_state(monkeypatch, tmp_path):

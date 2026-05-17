@@ -112,6 +112,22 @@ def populate_tradeability_blocks(summary: Dict[str, Any], scan: Dict[str, Any]) 
         rows.append(_build_tradeability_block_row(item))
 
 
+def populate_summary_counters(summary: Dict[str, Any], scan: Dict[str, Any]) -> None:
+    counters = scan.get('summary_counters') or scan.get('funnel') or {}
+    if not isinstance(counters, dict):
+        return
+    summary['扫描概览']['计数器'] = {
+        'raw_scan_symbol_count': int(counters.get('raw_scan_symbol_count', 0) or 0),
+        'evaluated_symbol_count': int(counters.get('evaluated_symbol_count', 0) or 0),
+        'evaluated_side_count': int(counters.get('evaluated_side_count', 0) or 0),
+        'early_filter_passed_count': int(counters.get('early_filter_passed_count', 0) or 0),
+        'setup_ready_count': int(counters.get('setup_ready_count', 0) or 0),
+        'trigger_fired_count': int(counters.get('trigger_fired_count', 0) or 0),
+        'candidate_pool_count': int(counters.get('candidate_pool_count', 0) or 0),
+        'hard_rejected_count': int(counters.get('hard_rejected_count', 0) or 0),
+    }
+
+
 def populate_candidate_sections(summary: Dict[str, Any], candidates: Sequence[Dict[str, Any]]) -> None:
     stage_counts = summary['扫描概览']['阶段分布']
     grouped_rows = {
@@ -162,6 +178,7 @@ def build_cn_scan_summary(result: Dict[str, Any], mask_sensitive_token) -> Dict[
                 {'原因': key, '数量': value}
                 for key, value in top_dict_items(rejected_stats.get('by_reject_label', {}), limit=4)
             ],
+            '计数器': {},
             '可交易性拦截列表': [],
             '阶段分布': {
                 'setup_candidate': 0,
@@ -182,6 +199,7 @@ def build_cn_scan_summary(result: Dict[str, Any], mask_sensitive_token) -> Dict[
         'trade候选列表': [],
         '其他候选列表': [],
     }
+    populate_summary_counters(summary, scan)
     populate_tradeability_blocks(summary, scan)
     populate_candidate_sections(summary, candidates)
     return summary
@@ -283,6 +301,19 @@ def render_cn_scan_summary(summary: Dict[str, Any], format_num, format_pct) -> s
     if reject_items:
         reject_text = '，'.join(f"{item['原因']} {item['数量']}" for item in reject_items)
         lines.append(f"主要拦截: {reject_text}")
+    counters = overview.get('计数器', {}) or {}
+    if counters:
+        lines.append(
+            "扫描计数: "
+            f"原始 {int(counters.get('raw_scan_symbol_count', 0) or 0)} | "
+            f"评估标的 {int(counters.get('evaluated_symbol_count', 0) or 0)} | "
+            f"评估方向 {int(counters.get('evaluated_side_count', 0) or 0)} | "
+            f"初筛通过 {int(counters.get('early_filter_passed_count', 0) or 0)} | "
+            f"setup_ready {int(counters.get('setup_ready_count', 0) or 0)} | "
+            f"trigger_fired {int(counters.get('trigger_fired_count', 0) or 0)} | "
+            f"候选池 {int(counters.get('candidate_pool_count', 0) or 0)} | "
+            f"硬拦截 {int(counters.get('hard_rejected_count', 0) or 0)}"
+        )
     stage_distribution = overview.get('阶段分布', {}) or {}
     if stage_distribution:
         lines.append(

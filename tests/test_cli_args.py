@@ -150,6 +150,21 @@ def test_emit_notification_captures_weixin_delivery_errors(monkeypatch):
     assert result['event_type'] == 'entry_filled'
 
 
+def test_build_notification_message_formats_entry_filled_in_chinese():
+    mod = load_module()
+
+    message = mod.build_notification_message('entry_filled', {
+        'symbol': 'ZECUSDT',
+        'side': 'LONG',
+        'entry_price': 41.23,
+        'stop_price': 39.8,
+        'quantity': 2.5,
+        'profile': '10u-aggressive',
+    })
+
+    assert message == '开单成交 ZECUSDT 方向=做多 成交价=41.23 止损价=39.8 数量=2.5 策略=10u-aggressive'
+
+
 def test_send_weixin_notification_uses_gateway_direct_helper(monkeypatch):
     mod = load_module()
     calls = []
@@ -277,6 +292,82 @@ def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     assert args.trigger_min_confirmations == 1
     assert args.max_distance_from_ema_pct == 9.0
     assert args.max_distance_from_vwap_pct == 8.0
+
+
+def test_aggressive_fee_aware_scalp_long_short_profile_uses_effective_size_and_wider_risk_controls():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'aggressive-fee-aware-scalp-long-short']))
+    assert args.risk_usdt == 2.0
+    assert args.max_notional_usdt == 80.0
+    assert args.leverage == 5
+    assert args.max_open_positions == 1
+    assert args.max_long_positions == 1
+    assert args.max_short_positions == 1
+    assert args.poll_interval_sec == 30
+    assert args.monitor_poll_interval_sec == 3
+    assert args.stop_buffer_pct == 0.025
+    assert args.breakeven_r == 0.55
+    assert args.tp1_r == 1.0
+    assert args.tp1_close_pct == 0.55
+    assert args.tp2_r == 1.8
+    assert args.tp2_close_pct == 0.35
+    assert args.trailing_buffer_pct == 0.01
+    assert args.trigger_min_confirmations == 1
+    assert args.min_5m_change_pct == 0.45
+    assert args.min_volume_multiple == 1.1
+    assert args.watch_breakout_tolerance_pct == 0.7
+    assert args.setup_breakout_tolerance_pct == 0.35
+    assert args.max_rsi_5m == 86.0
+    assert args.max_distance_from_ema_pct == 5.0
+    assert args.max_distance_from_vwap_pct == 4.5
+    assert args.extended_chase_threshold_pct == 10.0
+    assert args.execution_slippage_hard_veto_r == 0.25
+    assert args.execution_slippage_risk_threshold_r == 0.15
+    assert args.daily_max_loss_usdt == 6.0
+    assert args.max_consecutive_losses == 2
+    assert args.symbol_cooldown_minutes == 30
+    assert args.opposite_side_flip_cooldown_minutes == 90
+    assert args.gross_heat_cap_r == 1.2
+    assert args.same_theme_heat_cap_r == 0.8
+    assert args.same_correlation_heat_cap_r == 0.8
+    assert args.sim_probe_size_ratio == 0.3
+    assert args.allowed_trade_sides == 'long,short'
+
+
+def test_aggressive_fee_aware_scalp_directional_profiles_limit_evaluation_side():
+    mod = load_module()
+    long_args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'aggressive-fee-aware-scalp-long-only']))
+    short_args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'aggressive-fee-aware-scalp-short-only']))
+    assert long_args.allowed_trade_sides == 'long'
+    assert short_args.allowed_trade_sides == 'short'
+    assert long_args.max_long_positions == 1
+    assert long_args.max_short_positions == 1
+    assert short_args.max_long_positions == 1
+    assert short_args.max_short_positions == 1
+
+
+def test_v2_profile_enables_structural_filters_and_disables_live_probe_defaults():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-aggressive-v2']))
+
+    assert args.profile == '10u-aggressive-v2'
+    assert args.sim_probe_entry_enabled is False
+    assert args.enable_symbol_quality_tier is True
+    assert args.enable_market_regime_gate is True
+    assert args.enable_direction_lock is True
+    assert args.enable_fee_aware_edge_filter is True
+    assert args.atr_stop_multiplier > 0
+    assert args.allowed_trade_sides == 'long,short'
+
+
+def test_v2_profile_keeps_explicit_probe_flag_override():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args([
+        '--profile', '10u-aggressive-v2',
+        '--sim-probe-entry-enabled',
+    ]))
+
+    assert args.sim_probe_entry_enabled is True
 
 
 def test_binance_sim_active_profile_uses_exploratory_simulation_thresholds():

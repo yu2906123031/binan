@@ -3,6 +3,15 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def finalize_candidate_construction(
     *,
     Candidate,
@@ -68,7 +77,21 @@ def finalize_candidate_construction(
     trigger_confirmation: Dict[str, Any],
     legacy_kwargs: Dict[str, Any],
     waiting_breakout: bool,
+    expected_edge: Optional[float] = None,
+    expected_total_fee_pct: Optional[float] = None,
+    execution_slippage_buffer_pct: Optional[float] = None,
+    min_profit_buffer_pct: Optional[float] = None,
 ):
+    if expected_total_fee_pct is None:
+        expected_total_fee_pct = max(_safe_float(legacy_kwargs.get('expected_total_fee_pct'), default=0.16), 0.0)
+    if execution_slippage_buffer_pct is None:
+        execution_slippage_buffer_pct = max(_safe_float(legacy_kwargs.get('execution_slippage_buffer_pct'), default=max(expected_slippage_pct, 0.05)), 0.0)
+    if min_profit_buffer_pct is None:
+        min_profit_buffer_pct = max(_safe_float(legacy_kwargs.get('min_profit_buffer_pct'), default=0.12), 0.0)
+    expected_edge_floor = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
+    if expected_edge is None:
+        expected_edge = max(_safe_float(legacy_kwargs.get('expected_edge'), default=expected_edge_floor + 0.05), expected_edge_floor + 0.05)
+
     candidate = Candidate(
         symbol=symbol,
         last_price=last_price,
@@ -140,6 +163,10 @@ def finalize_candidate_construction(
         setup_ready=setup_ready,
         trigger_fired=trigger_fired,
         expected_slippage_pct=expected_slippage_pct,
+        expected_edge=expected_edge,
+        expected_total_fee_pct=expected_total_fee_pct,
+        execution_slippage_buffer_pct=execution_slippage_buffer_pct,
+        min_profit_buffer_pct=min_profit_buffer_pct,
         book_depth_fill_ratio=book_depth_fill_ratio,
         liquidity_grade=liquidity_grade,
         loser_rank=loser_rank,
@@ -200,6 +227,7 @@ def build_candidate(
     smart_money_flow_score: float = 0.0,
     microstructure_inputs: Optional[Dict[str, Any]] = None,
     max_notional_usdt: float = 0.0,
+    min_notional_usdt: float = 0.0,
     side: str = 'long',
     *,
     Candidate,
@@ -334,6 +362,9 @@ def build_candidate(
         early_reject('invalid_risk_per_unit')
         return None
     quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
+    if min_notional_usdt > 0:
+        min_qty_by_notional = round_step(min_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
+        quantity = max(quantity, min_qty_by_notional)
     if max_notional_usdt > 0:
         max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
         quantity = min(quantity, max_qty_by_notional)
@@ -350,7 +381,8 @@ def build_candidate(
     vwap_15m = compute_vwap(klines_15m[-20:])
     distance_from_vwap_15m_pct_raw = ((last_price / vwap_15m) - 1.0) * 100 if vwap_15m else 0.0
     distance_from_vwap_15m_pct = distance_from_vwap_15m_pct_raw if trade_side == TRADE_SIDE_LONG else -distance_from_vwap_15m_pct_raw
-    atr_stop_distance = compute_atr(klines_5m, period=14) * 1.5
+    atr_stop_multiplier = max(_to_float(legacy_kwargs.get('atr_stop_multiplier'), default=1.5), 0.0)
+    atr_stop_distance = compute_atr(klines_5m, period=14) * atr_stop_multiplier
     oi_change_samples_5m = []
     if len(closes_5m) >= 22:
         for idx in range(1, min(len(closes_5m), 22)):
@@ -380,6 +412,9 @@ def build_candidate(
                 early_reject('invalid_atr_risk_per_unit')
                 return None
             quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
+            if min_notional_usdt > 0:
+                min_qty_by_notional = round_step(min_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
+                quantity = max(quantity, min_qty_by_notional)
             if max_notional_usdt > 0:
                 max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
                 quantity = min(quantity, max_qty_by_notional)
@@ -686,6 +721,11 @@ def build_candidate(
             trigger_confirmation['setup_ready'] = False
             trigger_confirmation['flags']['watch_only_breakout_distance'] = True
     expected_slippage_pct = round(max(entry_distance_from_breakout_pct, 0.0) * 0.35, 4)
+    expected_total_fee_pct = round(max(_to_float(legacy_kwargs.get('expected_total_fee_pct'), default=0.16), 0.0), 4)
+    execution_slippage_buffer_pct = round(max(_to_float(legacy_kwargs.get('execution_slippage_buffer_pct'), default=max(expected_slippage_pct, 0.05)), 0.0), 4)
+    min_profit_buffer_pct = round(max(_to_float(legacy_kwargs.get('min_profit_buffer_pct'), default=0.12), 0.0), 4)
+    expected_edge_floor = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
+    expected_edge = round(max(_to_float(legacy_kwargs.get('expected_edge'), default=max(stop_distance_pct * 0.2, expected_edge_floor + 0.05)), expected_edge_floor + 0.05), 4)
     book_depth_fill_ratio = round(clamp(1.0 - (expected_slippage_pct / 2.0), 0.0, 1.0), 4)
     if book_depth_fill_ratio >= 0.85 and expected_slippage_pct <= 0.2:
         liquidity_grade = 'A'
@@ -752,6 +792,10 @@ def build_candidate(
         setup_ready=setup_ready,
         trigger_fired=trigger_fired,
         expected_slippage_pct=expected_slippage_pct,
+        expected_edge=expected_edge,
+        expected_total_fee_pct=expected_total_fee_pct,
+        execution_slippage_buffer_pct=execution_slippage_buffer_pct,
+        min_profit_buffer_pct=min_profit_buffer_pct,
         book_depth_fill_ratio=book_depth_fill_ratio,
         liquidity_grade=liquidity_grade,
         funding_rate_threshold=funding_rate_threshold,

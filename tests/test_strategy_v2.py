@@ -575,6 +575,56 @@ def test_refresh_book_ticker_websocket_subscription_reopens_when_symbols_change(
     assert events[-1]['event_type'] == 'book_ticker_ws_subscription_refreshed'
 
 
+
+def test_refresh_book_ticker_websocket_subscription_preserves_healthy_counters_on_refresh(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('book_ticker_ws_status', {
+        'status': 'healthy',
+        'symbols': ['BTCUSDT'],
+        'symbol_count': 1,
+        'reconnect_count': 4,
+        'subscription_version': 9,
+        'messages_processed': 123,
+        'samples_written': 120,
+        'active_streams': ['btcusdt@bookTicker'],
+        'last_error': '',
+    })
+
+    class StubSocket:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    state = {
+        'symbols': ['BTCUSDT'],
+        'ws': StubSocket('original'),
+        'reconnect_count': 4,
+        'subscription_version': 9,
+    }
+
+    mod.refresh_book_ticker_websocket_subscription(
+        store,
+        state,
+        requested_symbols=['BTCUSDT', 'ETHUSDT'],
+        ws_module=object(),
+        open_websocket_fn=lambda *args, **kwargs: StubSocket('refreshed'),
+        base_ws_url='wss://fstream.binance.com/stream',
+        connect_timeout_seconds=5.0,
+    )
+
+    health = store.load_json('book_ticker_ws_status', {})
+    assert health['status'] == 'healthy'
+    assert health['messages_processed'] == 123
+    assert health['samples_written'] == 120
+    assert health['symbols'] == ['BTCUSDT', 'ETHUSDT']
+    assert health['reconnect_count'] == 5
+    assert health['subscription_version'] == 10
+    assert health['active_streams'] == ['btcusdt@bookTicker', 'ethusdt@bookTicker']
+
+
 def test_book_ticker_websocket_supervisor_reconnects_and_refreshes_symbols(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
 
@@ -958,6 +1008,114 @@ def test_run_scan_once_passes_real_orderbook_microstructure_into_build_candidate
     assert captured['build_kwargs']['book_depth_fill_ratio'] == 1.0
     assert 'order_book' in captured['derive_kwargs']
     assert 'book_ticker_samples' in captured['derive_kwargs']
+
+
+def test_run_scan_once_skips_non_triggered_setup_candidates_for_execution(monkeypatch, tmp_path):
+    args = argparse.Namespace(
+        symbol='',
+        square_symbols='',
+        square_symbols_file='',
+        use_square_page=False,
+        top_gainers=5,
+        max_candidates=5,
+        lookback_bars=12,
+        swing_bars=6,
+        risk_usdt=10.0,
+        max_notional_usdt=0.0,
+        min_notional_usdt=0.0,
+        min_5m_change_pct=0.0,
+        min_quote_volume=0.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=100.0,
+        min_volume_multiple=0.0,
+        max_distance_from_ema_pct=100.0,
+        max_distance_from_vwap_pct=100.0,
+        leverage=5,
+        max_funding_rate=1.0,
+        max_funding_rate_avg=1.0,
+        okx_sentiment_inline='',
+        okx_sentiment_file='',
+        okx_sentiment_command='',
+        okx_auto=False,
+        okx_mcp_command='',
+        okx_sentiment_timeout=5,
+        external_signal_json='',
+        smart_money_inline='',
+        smart_money_file='',
+        runtime_state_dir=str(tmp_path),
+        allowed_trade_sides='long',
+        use_external_setup_relaxation=False,
+        watch_breakout_tolerance_pct=0.0,
+        setup_breakout_tolerance_pct=0.0,
+        oi_hard_reversal_threshold_pct=0.8,
+        extended_chase_threshold_pct=15.0,
+        execution_slippage_hard_veto_r=0.25,
+        execution_slippage_risk_threshold_r=0.15,
+        trigger_min_confirmations=2,
+        base_acceleration_ratio=1.25,
+    )
+    meta = make_meta(symbol='TESTUSDT')
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=14.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2,
+        acceleration_ratio_5m_vs_15m=1.1,
+        breakout_level=99.0,
+        recent_swing_low=97.0,
+        stop_price=98.0,
+        quantity=10.0,
+        risk_per_unit=2.0,
+        recommended_leverage=3,
+        rsi_5m=68.0,
+        volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8,
+        distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned',
+        score=72.0,
+        reasons=['seed'],
+        state='launch',
+        state_reasons=['launch_setup'],
+        alert_tier='high',
+        position_size_pct=1.5,
+        liquidity_grade='A',
+        expected_slippage_pct=0.08,
+        book_depth_fill_ratio=1.0,
+        spread_bps=9.995,
+        orderbook_slope=1.4182,
+        cancel_rate=0.5,
+        setup_ready=True,
+        trigger_fired=False,
+        candidate_stage='setup_candidate',
+        trade_missing=['candidate_trigger_not_fired'],
+    )
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'TESTUSDT': meta})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['TESTUSDT'], {'TESTUSDT': 1}, {'TESTUSDT': 1}))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda _client, symbol, interval, limit: [make_kline(100, 101, 99, 100, volume=1000, quote_volume=100000)] * max(limit, 30))
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, _symbol, limit=3: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'fetch_order_book', lambda _client, _symbol, limit=20: {'bids': [['100.0', '10']], 'asks': [['100.1', '8']]}, raising=False)
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, _symbol, sample_count=6, interval_ms=150, store=None, cache_max_age_seconds=3.0: [], raising=False)
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {'spread_bps': 9.995, 'orderbook_slope': 1.4182, 'cancel_rate': 0.5, 'book_depth_fill_ratio': 1.0})
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+    monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: candidate)
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert payload['candidate_count'] == 1
+    assert payload['selected'] is None
+    assert best is None
+    assert payload['candidate_alerts'][0]['symbol'] == 'TESTUSDT'
+    assert payload['candidate_alerts'][0]['trigger_fired'] is False
 
 
 def test_execution_liquidity_grade_v2_penalizes_wide_spread_thin_slope_and_high_cancel_rate():
@@ -2432,27 +2590,121 @@ def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_pa
 
     payload, best, _meta = mod.run_scan_once(client=object(), args=args)
 
-    assert best is watch_candidate
+    assert best is None
+    assert payload['selected'] is None
     assert payload['funnel']['raw_scan_symbol_count'] == 1
     assert payload['funnel']['evaluated_symbol_count'] == 1
     assert payload['funnel']['evaluated_side_count'] == 2
     assert payload['funnel']['candidate_pool_count'] == 1
     assert payload['funnel']['setup_ready_count'] == 2
+
+
+def test_run_scan_once_respects_allowed_trade_sides(monkeypatch):
+    args = argparse.Namespace(
+        symbol='',
+        square_symbols='',
+        use_square_page=False,
+        top_gainers=1,
+        top_losers=1,
+        max_candidates=4,
+        lookback_bars=12,
+        swing_bars=6,
+        risk_usdt=2.0,
+        max_notional_usdt=80.0,
+        min_5m_change_pct=0.45,
+        min_quote_volume=1000.0,
+        stop_buffer_pct=0.025,
+        max_rsi_5m=86.0,
+        min_volume_multiple=1.1,
+        max_distance_from_ema_pct=5.0,
+        max_distance_from_vwap_pct=4.5,
+        leverage=5,
+        max_funding_rate=0.01,
+        max_funding_rate_avg=0.01,
+        okx_sentiment_file='',
+        okx_sentiment_inline='',
+        okx_sentiment_command='',
+        okx_mcp_command='',
+        okx_sentiment_timeout=15,
+        okx_auto=False,
+        smart_money_inline='',
+        smart_money_file='',
+        use_external_setup_relaxation=False,
+        watch_breakout_tolerance_pct=0.7,
+        setup_breakout_tolerance_pct=0.35,
+        oi_hard_reversal_threshold_pct=0.8,
+        extended_chase_threshold_pct=10.0,
+        execution_slippage_hard_veto_r=0.25,
+        execution_slippage_risk_threshold_r=0.15,
+        trigger_min_confirmations=1,
+        base_acceleration_ratio=1.25,
+        allowed_trade_sides='short',
+    )
+    meta = make_meta()
+    seen_sides = []
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'TESTUSDT': meta})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['TESTUSDT'], {'TESTUSDT': 1}, {'TESTUSDT': 1}))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda _client, symbol, interval, limit: [make_kline(100, 101, 99, 100, volume=1000, quote_volume=100000)] * max(limit, 30))
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, _symbol, limit=3: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {})
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+
+    def fake_build_candidate(**kwargs):
+        seen_sides.append(kwargs['side'])
+        return mod.Candidate(
+            symbol='TESTUSDT',
+            last_price=100.0,
+            price_change_pct_24h=13.0,
+            quote_volume_24h=1_000_000.0,
+            hot_rank=1,
+            gainer_rank=1,
+            loser_rank=1,
+            funding_rate=0.0,
+            funding_rate_avg=0.0,
+            recent_5m_change_pct=1.3,
+            acceleration_ratio_5m_vs_15m=1.2,
+            breakout_level=99.0,
+            recent_swing_low=97.0,
+            stop_price=96.0,
+            quantity=10.0,
+            risk_per_unit=4.0,
+            recommended_leverage=3,
+            rsi_5m=64.0,
+            volume_multiple=1.5,
+            distance_from_ema20_5m_pct=0.6,
+            distance_from_vwap_15m_pct=0.5,
+            higher_tf_summary='aligned',
+            score=74.0,
+            reasons=['seed_rejected'],
+            state='launch',
+            state_reasons=['trigger_ready'],
+            alert_tier='high',
+            liquidity_grade='A',
+            setup_ready=True,
+            trigger_fired=True,
+            candidate_stage='trade_candidate',
+            side=kwargs['side'],
+            position_side=mod.trade_side_to_position_side(kwargs['side']),
+            trigger_confirmation_count=1,
+            trigger_min_confirmations=1,
+        )
+
+    monkeypatch.setattr(mod, 'build_candidate', fake_build_candidate)
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert seen_sides == [mod.TRADE_SIDE_SHORT]
+    assert payload['funnel']['evaluated_side_count'] == 1
+    assert best is not None
+    assert best.side == mod.TRADE_SIDE_SHORT
     assert payload['funnel']['trigger_fired_count'] == 1
-    assert payload['funnel']['hard_rejected_count'] == 1
-    assert payload['funnel']['stage_counts']['setup_candidate'] == 1
+    assert payload['funnel']['hard_rejected_count'] == 0
     assert payload['funnel']['stage_counts']['trade_candidate'] == 1
-    assert payload['funnel']['top_trigger_missing']['confirmation_count_below_minimum'] == 1
-    assert payload['funnel']['top_trade_missing']['candidate_trigger_not_fired'] == 1
-    assert payload['rejected_stats']['total'] == 1
-    assert payload['rejected_stats']['by_reason']['execution_slippage_veto'] == 1
-    assert payload['rejected_stats']['by_reject_label']['execution_slippage'] == 1
-    assert payload['rejected_stats']['by_execution_liquidity_grade']['D'] == 1
-    triggered = payload['rejected_stats']['triggered_but_risk_rejected']
-    assert len(triggered) == 1
-    assert triggered[0]['symbol'] == 'TESTUSDT'
-    assert triggered[0]['trigger_fired'] is True
-    assert triggered[0]['reject_reason'] == 'execution_slippage_veto'
 
 
 def test_apply_hard_veto_filters_rejects_extreme_execution_quality_before_live_trade():
@@ -4049,6 +4301,53 @@ def test_resolve_auto_loop_book_ticker_symbols_filters_to_strategy_safe_ascii_sy
     symbols = mod.resolve_auto_loop_book_ticker_symbols(client=object(), args=args)
 
     assert symbols == ['OPUSDT', '2ZUSDT', 'DOGEUSDT']
+
+
+def test_resolve_auto_loop_book_ticker_symbols_includes_manual_square_and_external_signal_symbols(monkeypatch, tmp_path):
+    args = mod.parse_args([])
+    args.top_gainers = 1
+    args.top_losers = 1
+    args.square_symbols = 'DOGS,sui'
+    args.external_signal_json = str(tmp_path / 'external_signal.json')
+    args.symbol = ''
+
+    external_signal_path = tmp_path / 'external_signal.json'
+    external_signal_path.write_text(
+        json.dumps({
+            'symbols': ['zec'],
+            'signal_map': {
+                'xlm': {'external_signal_score': 91.0},
+                'gpsusdt': {'external_signal_score': 88.0},
+            },
+        }),
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(
+        mod,
+        'fetch_exchange_meta',
+        lambda _client: {
+            'DOGSUSDT': mod.SymbolMeta(symbol='DOGSUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'SUIUSDT': mod.SymbolMeta(symbol='SUIUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'ZECUSDT': mod.SymbolMeta(symbol='ZECUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'XLMUSDT': mod.SymbolMeta(symbol='XLMUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'GPSUSDT': mod.SymbolMeta(symbol='GPSUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'BTCUSDT': mod.SymbolMeta(symbol='BTCUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        'fetch_tickers',
+        lambda _client: [
+            {'symbol': 'BTCUSDT', 'priceChangePercent': '9.0'},
+            {'symbol': 'DOGSUSDT', 'priceChangePercent': '1.0'},
+            {'symbol': 'GPSUSDT', 'priceChangePercent': '-2.0'},
+        ],
+    )
+
+    symbols = mod.resolve_auto_loop_book_ticker_symbols(client=object(), args=args)
+
+    assert symbols == ['DOGSUSDT', 'SUIUSDT', 'ZECUSDT', 'XLMUSDT', 'GPSUSDT', 'BTCUSDT']
 
 
 def test_normalize_external_signal_map_preserves_portfolio_bucket_aliases():
