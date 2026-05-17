@@ -303,3 +303,86 @@ def test_build_symbol_replay_payload_preserves_close_event_details_for_recent_tr
     assert session['closed_quantity'] == 800.0
     assert session['realized_pnl'] == 12.75
     assert session['closed_at'] == '2026-05-02T02:06:01+00:00'
+
+
+def test_build_symbol_replay_payload_adds_trade_learning_and_ranking_insights():
+    rows = [
+        {
+            'event_type': 'candidate_selected',
+            'recorded_at': '2026-05-03T01:00:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'win-1',
+            'score': 92.0,
+            'state': 'launch',
+            'alert_tier': 'critical',
+            'liquidity_grade': 'A+',
+            'rank_score': 94.0,
+        },
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-03T01:00:05+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'win-1',
+            'entry_price': 0.15,
+            'quantity': 1000.0,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-05-03T01:12:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'win-1',
+            'exit_reason': 'tp1',
+            'realized_pnl': 8.0,
+        },
+        {
+            'event_type': 'candidate_selected',
+            'recorded_at': '2026-05-03T02:00:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'loss-1',
+            'score': 76.0,
+            'state': 'watch',
+            'alert_tier': 'high',
+            'liquidity_grade': 'C',
+            'rank_score': 70.0,
+        },
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-05-03T02:00:05+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'loss-1',
+            'entry_price': 0.152,
+            'quantity': 1200.0,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-05-03T02:08:00+00:00',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'position_instance_id': 'loss-1',
+            'exit_reason': 'stop_loss',
+            'realized_pnl': -18.0,
+        },
+    ]
+
+    payload = mod.build_symbol_replay_payload(rows, symbol='DOGEUSDT', side='LONG')
+
+    assert payload['trade_learning']['closed_trade_count'] == 2
+    assert payload['trade_learning']['win_rate'] == 0.5
+    assert payload['trade_learning']['average_realized_pnl'] == -5.0
+    assert payload['adaptive_parameters']['dynamic_risk_multiplier'] == 0.75
+    assert payload['adaptive_parameters']['reason'] == 'negative_recent_expectancy'
+    assert payload['ranking_insights']['by_alert_tier'][0]['bucket'] == 'critical'
+    assert payload['ranking_insights']['by_alert_tier'][0]['win_rate'] == 1.0
+    assert payload['ranking_insights']['by_liquidity_grade'][-1]['bucket'] == 'C'
+    assert payload['ranking_insights']['by_liquidity_grade'][-1]['average_realized_pnl'] == -18.0

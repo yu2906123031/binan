@@ -3991,6 +3991,46 @@ def test_evaluate_risk_guards_blocks_live_entry_for_execution_quality_candidate(
     ]
 
 
+def test_evaluate_risk_guards_allows_b_tier_execution_with_soft_slippage_penalty():
+    candidate = mod.Candidate(
+        symbol='TIERBUSDT', last_price=100.0, price_change_pct_24h=8.0, quote_volume_24h=1_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2, acceleration_ratio_5m_vs_15m=1.1, breakout_level=99.0,
+        recent_swing_low=97.0, stop_price=98.0, quantity=10.0, risk_per_unit=2.0,
+        recommended_leverage=3, rsi_5m=69.0, volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8, distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned', score=72.0, reasons=['seed'], state='launch', alert_tier='high',
+        liquidity_grade='B', expected_slippage_pct=0.36, book_depth_fill_ratio=0.62,
+        spread_bps=8.0, orderbook_slope=0.7, setup_ready=True, trigger_fired=True,
+        cvd_delta=120.0, oi_change_pct_5m=0.2,
+    )
+
+    payload = mod.evaluate_risk_guards(symbol='TIERBUSDT', risk_state=mod.default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert 'candidate_execution_slippage_risk' not in payload['reasons']
+    assert 'candidate_execution_liquidity_poor' not in payload['reasons']
+
+
+def test_evaluate_risk_guards_blocks_fake_breakout_when_price_loses_breakout_or_flow_fails():
+    candidate = mod.Candidate(
+        symbol='FAKEUSDT', last_price=99.95, price_change_pct_24h=8.0, quote_volume_24h=1_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=1.2, acceleration_ratio_5m_vs_15m=1.1, breakout_level=100.0,
+        recent_swing_low=97.0, stop_price=98.0, quantity=10.0, risk_per_unit=2.0,
+        recommended_leverage=3, rsi_5m=69.0, volume_multiple=1.6,
+        distance_from_ema20_5m_pct=0.8, distance_from_vwap_15m_pct=0.7,
+        higher_tf_summary='aligned', score=72.0, reasons=['seed'], state='launch', alert_tier='high',
+        liquidity_grade='A', expected_slippage_pct=0.02, book_depth_fill_ratio=0.9,
+        setup_ready=True, trigger_fired=True, cvd_delta=-50.0, oi_change_pct_5m=-0.1,
+    )
+
+    payload = mod.evaluate_risk_guards(symbol='FAKEUSDT', risk_state=mod.default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is False
+    assert 'candidate_fake_breakout_risk' in payload['reasons']
+
+
 def test_run_loop_records_execution_quality_rejection_event_when_risk_guard_blocks_live_trade(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     args = argparse.Namespace(

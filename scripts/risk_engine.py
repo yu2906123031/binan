@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from typing import Any, Dict, Optional, Sequence
 
 
@@ -103,6 +104,15 @@ def evaluate_risk_guards(
     ) if candidate is not None else 'LONG'
     if normalized.get('halted'):
         reasons.append('strategy_halted')
+    allowed_session_utc_hours = kwargs.get('allowed_session_utc_hours')
+    if allowed_session_utc_hours:
+        try:
+            allowed_hours = {int(hour) % 24 for hour in allowed_session_utc_hours}
+        except (TypeError, ValueError):
+            allowed_hours = set()
+        current_utc_hour = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).hour
+        if allowed_hours and current_utc_hour not in allowed_hours:
+            reasons.append('session_filter_blocked')
     pnl = abs(_to_float(normalized.get('daily_realized_pnl_usdt')))
     if daily_max_loss_usdt > 0 and pnl >= daily_max_loss_usdt:
         reasons.append('daily_max_loss_reached')
@@ -150,6 +160,12 @@ def evaluate_risk_guards(
         elif not effective_trigger_fired:
             if not effective_probe_entry:
                 reasons.append('candidate_trigger_not_fired')
+        trigger_min_confirmations = max(int(_to_float(getattr(candidate, 'trigger_min_confirmations', 0))), 0)
+        trigger_confirmation_count = max(int(_to_float(getattr(candidate, 'trigger_confirmation_count', 0))), 0)
+        trigger_confirmation_flags = getattr(candidate, 'trigger_confirmation_flags', None)
+        trigger_confirmation_gate_active = trigger_confirmation_count > 0 or bool(trigger_confirmation_flags)
+        if trigger_confirmation_gate_active and effective_trigger_fired and not effective_probe_entry and trigger_min_confirmations > 0 and trigger_confirmation_count < trigger_min_confirmations:
+            reasons.append('candidate_trigger_confirmations_insufficient')
         execution_slippage_r = compute_expected_slippage_r(candidate)
         spread_bps = _to_float(getattr(candidate, 'spread_bps', 0.0))
         orderbook_slope = _to_float(getattr(candidate, 'orderbook_slope', 0.0))
@@ -169,7 +185,8 @@ def evaluate_risk_guards(
         if _to_float(getattr(candidate, 'oi_change_pct_5m', 0.0)) <= -oi_hard_reversal_threshold:
             reasons.append('candidate_oi_reversal')
         risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
-        if execution_slippage_r > risk_slippage_r:
+        hard_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_hard_veto_r', 0.25), default=0.25), risk_slippage_r)
+        if execution_slippage_r > hard_slippage_r:
             reasons.append('candidate_execution_slippage_risk')
         has_explicit_edge_cost_contract = any(
             hasattr(candidate, field_name)
@@ -193,14 +210,32 @@ def evaluate_risk_guards(
         if has_explicit_edge_cost_contract and total_cost_floor_pct > 0 and expected_edge <= total_cost_floor_pct:
             reasons.append('candidate_edge_after_costs_insufficient')
         liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
+        explicit_liquidity_grade = str(getattr(candidate, 'liquidity_grade', '') or '').strip().upper()
         if execution_liquidity_grade == 'D':
             reasons.append('candidate_execution_liquidity_poor')
-        elif execution_liquidity_grade == 'C' and (
+        elif execution_liquidity_grade == 'B' and explicit_liquidity_grade != 'B' and (spread_bps >= 15.0 or cancel_rate >= 0.35):
+            reasons.append('candidate_execution_liquidity_poor')
+        elif execution_liquidity_grade == 'C' and explicit_liquidity_grade != 'B' and (
             _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5 or liquidity_penalty_present
         ):
             reasons.append('candidate_execution_liquidity_poor')
-        elif execution_liquidity_grade == 'B' and liquidity_penalty_present:
-            reasons.append('candidate_execution_liquidity_poor')
+        breakout_level = _to_float(getattr(candidate, 'breakout_level', 0.0))
+        last_price = _to_float(getattr(candidate, 'last_price', 0.0))
+        trigger_fired = bool(getattr(candidate, 'trigger_fired', False))
+        volume_multiple = _to_float(getattr(candidate, 'volume_multiple', 0.0))
+        cvd_delta = _to_float(getattr(candidate, 'cvd_delta', 0.0))
+        oi_change_5m = _to_float(getattr(candidate, 'oi_change_pct_5m', 0.0))
+        fake_breakout_buffer_pct = max(_to_float(kwargs.get('fake_breakout_buffer_pct', 0.001)), 0.0)
+        if trigger_fired and breakout_level > 0 and last_price > 0:
+            has_flow_context = cvd_delta != 0 or oi_change_5m != 0
+            if candidate_side == 'LONG':
+                reclaimed = last_price >= breakout_level * (1.0 + fake_breakout_buffer_pct)
+                flow_confirmed = (cvd_delta > 0 and oi_change_5m >= 0 and volume_multiple >= 1.0) if has_flow_context else True
+            else:
+                reclaimed = last_price <= breakout_level * (1.0 - fake_breakout_buffer_pct)
+                flow_confirmed = (cvd_delta < 0 and oi_change_5m >= 0 and volume_multiple >= 1.0) if has_flow_context else True
+            if not reclaimed or not flow_confirmed:
+                reasons.append('candidate_fake_breakout_risk')
         position_size_pct = max(_to_float(getattr(candidate, 'position_size_pct', 0.0)), 0.0)
         portfolio_narrative_bucket = str(kwargs.get('portfolio_narrative_bucket') or getattr(candidate, 'portfolio_narrative_bucket', '') or '').strip()
         portfolio_correlation_group = str(kwargs.get('portfolio_correlation_group') or getattr(candidate, 'portfolio_correlation_group', '') or '').strip()
@@ -213,6 +248,11 @@ def evaluate_risk_guards(
         gross_heat_cap_r = max(_to_float(kwargs.get('gross_heat_cap_r', 0.0)), 0.0)
         same_theme_heat_cap_r = max(_to_float(kwargs.get('same_theme_heat_cap_r', 0.0)), 0.0)
         same_correlation_heat_cap_r = max(_to_float(kwargs.get('same_correlation_heat_cap_r', 0.0)), 0.0)
+        dynamic_risk_multiplier = max(_to_float(kwargs.get('dynamic_risk_multiplier', getattr(candidate, 'dynamic_risk_multiplier', normalized.get('dynamic_risk_multiplier', 1.0))), default=1.0), 0.0)
+        if dynamic_risk_multiplier > 0:
+            gross_heat_cap_r *= dynamic_risk_multiplier
+            same_theme_heat_cap_r *= dynamic_risk_multiplier
+            same_correlation_heat_cap_r *= dynamic_risk_multiplier
         if gross_heat_cap_r > 0 and (current_open_heat_r + current_pending_heat_r + candidate_heat_r) >= gross_heat_cap_r:
             reasons.append('candidate_portfolio_heat_overexposure')
         if portfolio_narrative_bucket and max_theme > 0 and position_size_pct > 0:

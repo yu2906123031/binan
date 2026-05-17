@@ -650,6 +650,7 @@ def monitor_live_trade(
     initial_positions_state: Optional[Dict[str, Any]] = None,
     trade_management_plan_type,
     trade_management_state_type,
+    build_trade_management_state_from_position: Optional[Callable[[Dict[str, Any]], Any]] = None,
     position_side_long: str,
     position_side_short: str,
     binance_api_error,
@@ -679,6 +680,7 @@ def monitor_live_trade(
     utc_now: Callable[[], datetime.datetime],
     isoformat_utc: Callable[[datetime.datetime], str],
     time_module,
+    record_runtime_heartbeat: Optional[Callable[..., Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     entry_price = _to_float(trade.get('entry_price'))
     stop_order = trade.get('stop_order') if isinstance(trade.get('stop_order'), dict) else None
@@ -697,23 +699,42 @@ def monitor_live_trade(
     if tracked_stop_price > 0:
         plan_payload['stop_price'] = tracked_stop_price
     plan = trade_management_plan_type(**plan_payload)
-    state = trade_management_state_type(
-        symbol=symbol,
-        side=position_side_to_trade_side(trade_side),
-        position_side=trade_side,
-        position_key=position_key,
-        initial_quantity=_to_float(tracked.get('quantity') or plan.quantity or trade.get('quantity')),
-        remaining_quantity=_to_float(tracked.get('remaining_quantity') or tracked.get('quantity') or plan.quantity),
-        current_stop_price=_to_float(tracked.get('current_stop_price') or tracked.get('stop_price') or plan.stop_price, default=plan.stop_price),
-        moved_to_breakeven=bool(tracked.get('moved_to_breakeven', False)),
-        tp1_hit=bool(tracked.get('tp1_hit', False)),
-        tp2_hit=bool(tracked.get('tp2_hit', False)),
-        highest_price_seen=_to_float(tracked.get('highest_price_seen') or entry_price, default=entry_price),
-        lowest_price_seen=_to_float(tracked.get('lowest_price_seen') or entry_price, default=entry_price),
-        opened_at=str(tracked.get('opened_at') or isoformat_utc(utc_now())),
-        first_1r_at=str(tracked.get('first_1r_at') or '') or None,
-        realized_r=_to_float(tracked.get('realized_r'), default=0.0),
-    )
+    if build_trade_management_state_from_position is not None:
+        tracked_for_state = dict(tracked)
+        tracked_for_state.setdefault('symbol', symbol)
+        tracked_for_state.setdefault('side', trade_side)
+        tracked_for_state.setdefault('position_side', trade_side)
+        tracked_for_state.setdefault('position_key', position_key)
+        tracked_for_state.setdefault('entry_price', entry_price)
+        tracked_for_state.setdefault('quantity', plan.quantity or trade.get('quantity'))
+        tracked_for_state.setdefault('remaining_quantity', tracked_for_state.get('quantity'))
+        tracked_for_state.setdefault('current_stop_price', tracked_for_state.get('stop_price') or plan.stop_price)
+        tracked_for_state.setdefault('trade_management_plan', plan_payload)
+        state = build_trade_management_state_from_position(tracked_for_state)
+        if state.highest_price_seen is None:
+            state.highest_price_seen = entry_price
+        if state.lowest_price_seen is None:
+            state.lowest_price_seen = entry_price
+        if not state.opened_at:
+            state.opened_at = isoformat_utc(utc_now())
+    else:
+        state = trade_management_state_type(
+            symbol=symbol,
+            side=position_side_to_trade_side(trade_side),
+            position_side=trade_side,
+            position_key=position_key,
+            initial_quantity=_to_float(tracked.get('quantity') or plan.quantity or trade.get('quantity')),
+            remaining_quantity=_to_float(tracked.get('remaining_quantity') or tracked.get('quantity') or plan.quantity),
+            current_stop_price=_to_float(tracked.get('current_stop_price') or tracked.get('stop_price') or plan.stop_price, default=plan.stop_price),
+            moved_to_breakeven=bool(tracked.get('moved_to_breakeven', False)),
+            tp1_hit=bool(tracked.get('tp1_hit', False)),
+            tp2_hit=bool(tracked.get('tp2_hit', False)),
+            highest_price_seen=_to_float(tracked.get('highest_price_seen') or entry_price, default=entry_price),
+            lowest_price_seen=_to_float(tracked.get('lowest_price_seen') or entry_price, default=entry_price),
+            opened_at=str(tracked.get('opened_at') or isoformat_utc(utc_now())),
+            first_1r_at=str(tracked.get('first_1r_at') or '') or None,
+            realized_r=_to_float(tracked.get('realized_r'), default=0.0),
+        )
     selection_context = dict(tracked)
 
     def persist_position(
@@ -789,11 +810,12 @@ def monitor_live_trade(
         return row
 
     persist_position(status='monitoring', protection_status=protection_check.get('status') if isinstance(protection_check, dict) else None, active_stop_order=stop_order)
+    event_leverage = int(getattr(args, 'leverage', trade.get('leverage', 0)) or trade.get('leverage', 0) or 0)
     record_event('entry_filled', {
         'entry_price': round(entry_price, 10),
         'stop_price': round(plan.stop_price, 10),
         'quantity': round(state.initial_quantity, 10),
-        'leverage': requested_leverage,
+        'leverage': event_leverage,
     })
     record_event('protection_confirmed', {
         'protection_status': protection_check.get('status') if isinstance(protection_check, dict) else None,
@@ -807,7 +829,21 @@ def monitor_live_trade(
         max_cycles = max(max_cycles, 50)
     trailing_buffer_pct = float(getattr(args, 'trailing_buffer_pct', 0.02) or 0.02)
     book_ticker_cache_max_age_seconds = max(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2), 3.0)
-    for _ in range(max_cycles):
+    for cycle_index in range(max_cycles):
+        if record_runtime_heartbeat is not None:
+            record_runtime_heartbeat(
+                store,
+                component='execution_monitor',
+                status='running',
+                blocked_reason='',
+                extra={
+                    'symbol': symbol,
+                    'position_side': state.position_side,
+                    'cycle_index': cycle_index,
+                    'max_cycles': max_cycles,
+                    'remaining_quantity': state.remaining_quantity,
+                },
+            )
         if state.remaining_quantity <= 0:
             break
         klines = fetch_klines(client, symbol, '5m', 21)
@@ -989,6 +1025,20 @@ def monitor_live_trade(
         if protection_status == 'flat':
             break
         time_module.sleep(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2))
+
+    if record_runtime_heartbeat is not None:
+        record_runtime_heartbeat(
+            store,
+            component='execution_monitor',
+            status='healthy' if protection_status != 'flat' else 'flat',
+            blocked_reason='',
+            extra={
+                'symbol': symbol,
+                'position_side': state.position_side,
+                'remaining_quantity': state.remaining_quantity,
+                'protection_status': protection_status,
+            },
+        )
 
     final_status = 'closed' if state.remaining_quantity <= 0 or protection_status == 'flat' else 'monitoring'
     final_exit_reason = tracked.get('exit_reason')

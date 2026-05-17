@@ -3522,6 +3522,75 @@ def test_evaluate_management_actions_triggers_micro_scalp_time_stop_after_min_pr
     assert actions[1]['exit_reason'] == 'micro_scalp_time_stop'
 
 
+def test_build_trade_management_state_from_position_restores_tp_runner_checkpoint():
+    position = {
+        'symbol': 'TESTUSDT',
+        'position_side': 'LONG',
+        'entry_price': 100.0,
+        'quantity': 1.2,
+        'remaining_quantity': 0.42,
+        'current_stop_price': 100.2,
+        'moved_to_breakeven': True,
+        'tp1_hit': True,
+        'tp2_hit': True,
+        'highest_price_seen': 113.4,
+        'lowest_price_seen': 98.7,
+        'opened_at': '2026-05-15T12:00:00Z',
+        'first_1r_at': '2026-05-15T12:03:00Z',
+        'realized_r': 1.18,
+    }
+
+    state = mod.build_trade_management_state_from_position(position)
+
+    assert state.symbol == 'TESTUSDT'
+    assert state.position_key == 'TESTUSDT:LONG'
+    assert state.side == 'long'
+    assert state.position_side == 'LONG'
+    assert state.initial_quantity == 1.2
+    assert state.remaining_quantity == 0.42
+    assert state.current_stop_price == 100.2
+    assert state.moved_to_breakeven is True
+    assert state.tp1_hit is True
+    assert state.tp2_hit is True
+    assert state.highest_price_seen == 113.4
+    assert state.lowest_price_seen == 98.7
+    assert state.opened_at == '2026-05-15T12:00:00Z'
+    assert state.first_1r_at == '2026-05-15T12:03:00Z'
+    assert state.realized_r == 1.18
+
+
+def test_build_trade_management_state_from_position_infers_runner_checkpoint_from_remaining_quantity():
+    position = {
+        'symbol': 'TESTUSDT',
+        'position_side': 'LONG',
+        'entry_price': 100.0,
+        'quantity': 1.0,
+        'remaining_quantity': 0.25,
+        'current_stop_price': 101.0,
+        'trade_management_plan': {
+            'entry_price': 100.0,
+            'stop_price': 95.0,
+            'quantity': 1.0,
+            'initial_risk_per_unit': 5.0,
+            'breakeven_trigger_price': 105.0,
+            'tp1_trigger_price': 107.5,
+            'tp1_close_qty': 0.3,
+            'tp2_trigger_price': 110.0,
+            'tp2_close_qty': 0.45,
+            'runner_qty': 0.25,
+            'side': 'long',
+            'position_side': 'LONG',
+        },
+    }
+
+    state = mod.build_trade_management_state_from_position(position)
+
+    assert state.remaining_quantity == 0.25
+    assert state.moved_to_breakeven is True
+    assert state.tp1_hit is True
+    assert state.tp2_hit is True
+
+
 def test_build_trade_management_plan_from_position_inherits_micro_scalp_time_stop_args():
     position = {
         'symbol': 'TESTUSDT',
@@ -5668,6 +5737,7 @@ def test_runtime_store_append_event_fsyncs_and_terminates_each_jsonl_row(tmp_pat
     store = mod.RuntimeStateStore(str(tmp_path))
     flush_calls = []
     fsync_calls = []
+    event_fds = []
     original_open = mod.Path.open
 
     class RecordingHandle:
@@ -5682,7 +5752,9 @@ def test_runtime_store_append_event_fsyncs_and_terminates_each_jsonl_row(tmp_pat
             return self._fh.flush()
 
         def fileno(self):
-            return self._fh.fileno()
+            fd = self._fh.fileno()
+            event_fds.append(fd)
+            return fd
 
         def __enter__(self):
             self._fh.__enter__()
@@ -5704,7 +5776,7 @@ def test_runtime_store_append_event_fsyncs_and_terminates_each_jsonl_row(tmp_pat
 
     assert row['event_type'] == 'entry_filled'
     assert len(flush_calls) == 1
-    assert len(fsync_calls) == 1
+    assert any(fd in event_fds for fd in fsync_calls)
     raw_text = (tmp_path / 'events.jsonl').read_text(encoding='utf-8')
     assert raw_text.endswith('\n')
     parsed = [mod.json.loads(line) for line in raw_text.splitlines() if line.strip()]

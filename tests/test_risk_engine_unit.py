@@ -298,7 +298,64 @@ def test_evaluate_portfolio_risk_guards_prefers_candidate_position_side_for_shor
 
 
 
+def test_evaluate_risk_guards_blocks_trigger_until_min_confirmations_are_met():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=True,
+        trigger_confirmation_count=1,
+        trigger_min_confirmations=2,
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is False
+    assert 'candidate_trigger_confirmations_insufficient' in payload['reasons']
+
+
+
+def test_evaluate_risk_guards_blocks_entries_outside_allowed_utc_hours():
+    candidate = make_candidate(expected_edge=1.0, expected_total_fee_pct=0.02, execution_slippage_buffer_pct=0.02, min_profit_buffer_pct=0.02)
+
+    payload = evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        risk_state=default_risk_state(),
+        candidate=candidate,
+        now_ts=1_710_000_000,  # 2024-03-09 16:00:00 UTC
+        allowed_session_utc_hours=[1, 2, 3],
+    )
+
+    assert payload['allowed'] is False
+    assert 'session_filter_blocked' in payload['reasons']
+
+
+
+def test_evaluate_risk_guards_scales_heat_caps_with_dynamic_risk_multiplier():
+    candidate = make_candidate(
+        position_size_pct=1.0,
+        quantity=10.0,
+        risk_per_unit=1.0,
+        expected_edge=1.0,
+        expected_total_fee_pct=0.02,
+        execution_slippage_buffer_pct=0.02,
+        min_profit_buffer_pct=0.02,
+        dynamic_risk_multiplier=0.5,
+    )
+
+    payload = evaluate_risk_guards(
+        symbol='DOGEUSDT',
+        risk_state={'portfolio_heat_open_r': 1.2},
+        candidate=candidate,
+        base_risk_usdt=10.0,
+        gross_heat_cap_r=3.0,
+    )
+
+    assert payload['allowed'] is False
+    assert 'candidate_portfolio_heat_overexposure' in payload['reasons']
+
+
+
 def test_evaluate_risk_guards_blocks_daily_symbol_trade_limit():
+
     candidate = make_candidate(
         expected_edge=1.0,
         expected_total_fee_pct=0.02,

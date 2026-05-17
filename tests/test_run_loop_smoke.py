@@ -143,6 +143,109 @@ def test_run_loop_scan_only_returns_before_live_execution(monkeypatch):
     assert 'live_execution' not in cycle
 
 
+def test_run_loop_persists_wait_trigger_state_for_setup_ready_candidate(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    candidate = SimpleNamespace(
+        symbol='DOGEUSDT',
+        side='LONG',
+        position_side='LONG',
+        setup_ready=True,
+        trigger_fired=False,
+        candidate_stage='setup',
+        score=88.0,
+        state='setup',
+        alert_tier='critical',
+        must_pass_flags={},
+        quality_score=0.0,
+        execution_priority_score=0.0,
+        entry_distance_from_breakout_pct=0.0,
+        entry_distance_from_vwap_pct=0.0,
+        candle_extension_pct=0.0,
+        recent_3bar_runup_pct=0.0,
+        overextension_flag=False,
+        entry_pattern='',
+        trend_regime='',
+        liquidity_grade='A',
+        setup_missing=[],
+        trigger_missing=['waiting_breakout'],
+        trade_missing=[],
+        trigger_confirmation_flags={},
+        trigger_confirmation_count=0,
+        trigger_min_confirmations=2,
+        portfolio_narrative_bucket='',
+        portfolio_correlation_group='',
+        expected_slippage_pct=0.0,
+        book_depth_fill_ratio=1.0,
+        cvd_delta=0.0,
+        cvd_zscore=0.0,
+        oi_change_pct_5m=0.0,
+        oi_change_pct_15m=0.0,
+        spread_bps=1.0,
+        orderbook_slope=0.0,
+        cancel_rate=0.0,
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': []})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'candidate_count': 1, 'candidates': ['DOGEUSDT']}, candidate, {'DOGEUSDT': {'symbol': 'DOGEUSDT'}}))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    result = mod.run_loop(DummyClient(), make_args(scan_only=True, auto_loop=True, profile='state-machine-test'))
+
+    assert result['ok'] is True
+    loop_state = store.json_state['auto_loop_state']
+    assert loop_state['state'] == 'WAIT_TRIGGER'
+    assert loop_state['profile'] == 'state-machine-test'
+    assert loop_state['active_candidate']['symbol'] == 'DOGEUSDT'
+    assert loop_state['active_candidate']['side'] == 'LONG'
+    assert loop_state['active_candidate']['setup_ready'] is True
+    assert loop_state['active_candidate']['trigger_fired'] is False
+    assert loop_state['active_candidate']['candidate_stage'] == 'setup'
+    assert loop_state['active_candidate']['trigger_missing'] == ['waiting_breakout']
+
+
+
+def test_run_loop_auto_loop_resumes_managing_open_position_before_scan(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    store.json_state['positions'] = {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'status': 'monitoring',
+            'remaining_quantity': 12.5,
+            'protection_status': 'protected',
+        }
+    }
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda client, store, halt_on_orphan_position=False, repair_missing_protection_enabled=True: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []})
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor_core', lambda **kwargs: {'summary': {'status': 'healthy'}, 'health': {'status': 'healthy'}})
+    monkeypatch.setattr(mod, 'run_auto_loop_user_data_stream_monitor', lambda **kwargs: {'monitor': {'status': 'healthy'}})
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError('resident auto-loop should resume position management before scanning')
+
+    monkeypatch.setattr(mod, 'run_scan_once', unexpected_scan)
+
+    result = mod.run_loop(DummyClient(), make_args(live=True, auto_loop=True, profile='state-machine-test'))
+
+    assert result['ok'] is True
+    cycle = result['cycles'][0]
+    assert cycle['resident_resume']['state'] == 'MANAGING'
+    assert cycle['resident_resume']['position_key'] == 'DOGEUSDT:LONG'
+    loop_state = store.json_state['auto_loop_state']
+    assert loop_state['state'] == 'MANAGING'
+    assert loop_state['reason'] == 'resume_open_position'
+    assert loop_state['position_key'] == 'DOGEUSDT:LONG'
+
+
 def test_run_loop_scan_only_persists_candidate_selected_event(monkeypatch, tmp_path):
     mod = load_module()
     store = mod.RuntimeStateStore(str(tmp_path))
@@ -2479,6 +2582,82 @@ def test_monitor_live_trade_records_lifecycle_events_and_updates_position_state(
     notified_types = [item[0] for item in notifications]
     assert notified_types == event_types[:-1]
 
+    heartbeat = store.load_json('runtime_heartbeat', {})
+    monitor_heartbeat = heartbeat['components']['execution_monitor']
+    assert monitor_heartbeat['status'] == 'flat'
+    assert monitor_heartbeat['symbol'] == 'DOGEUSDT'
+    assert monitor_heartbeat['remaining_quantity'] == 0.0
+
+
+def test_monitor_live_trade_restores_checkpoint_state_before_evaluating_actions(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = make_args(
+        live=True,
+        auto_loop=False,
+        profile='test-profile',
+        trailing_buffer_pct=0.02,
+        monitor_poll_interval_sec=0,
+        max_monitor_cycles=1,
+        disable_notify=True,
+    )
+    meta = SimpleNamespace(step_size=0.01, quantity_precision=2, tick_size=0.01, price_precision=2)
+    plan = mod.build_trade_management_plan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=10.0,
+        tp1_r=1.0,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+    )
+    trade = {
+        'symbol': 'DOGEUSDT',
+        'entry_price': 100.0,
+        'side': 'LONG',
+        'stop_order': {'orderId': 777},
+        'trade_management_plan': mod.asdict(plan),
+        'protection_check': {'status': 'protected'},
+    }
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'status': 'monitoring',
+            'quantity': 10.0,
+            'remaining_quantity': 3.0,
+            'entry_price': 100.0,
+            'current_stop_price': 108.0,
+            'stop_order_id': 777,
+            'protection_status': 'protected',
+            'trade_management_plan': mod.asdict(plan),
+        }
+    })
+    captured = {}
+
+    monkeypatch.setattr(mod, 'fetch_klines', lambda client, symbol, interval='5m', limit=21: [[0, 0, 110.0, 0, 109.0, 0, 0, 0, 0, 0, 0, 0] for _ in range(limit)])
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    def fake_evaluate_management_actions(state, plan, current_price, ema5m, trailing_reference, trailing_buffer_pct, allow_runner_exit=False):
+        captured['state'] = dataclasses.replace(state)
+        return []
+
+    monkeypatch.setattr(mod, 'evaluate_management_actions', fake_evaluate_management_actions)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    result = mod.monitor_live_trade(client=DummyClient(), symbol='DOGEUSDT', meta=meta, args=args, trade=trade, store=store)
+
+    assert result['ok'] is True
+    restored_state = captured['state']
+    assert restored_state.remaining_quantity == 3.0
+    assert restored_state.moved_to_breakeven is True
+    assert restored_state.tp1_hit is True
+    assert restored_state.tp2_hit is True
+    assert restored_state.current_stop_price == 108.0
+
 
 def test_collect_book_ticker_samples_rate_limits_cache_miss_runtime_events(monkeypatch, tmp_path):
     mod = load_module()
@@ -2594,3 +2773,165 @@ def test_monitor_live_trade_prefers_book_ticker_cache_price_and_uses_close_fallb
     debug_payload = store.load_json('monitor_debug', {})
     assert debug_payload['current_price_source'] == 'book_ticker_cache_bid'
     assert debug_payload['book_ticker_snapshot']['mid_price'] == 105.0
+
+
+def test_run_with_timeout_returns_deadman_timeout_without_blocking_forever(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+
+    def blocking_task():
+        import time
+        time.sleep(0.25)
+        return {'ok': True}
+
+    result = mod.run_with_deadman_timeout(
+        blocking_task,
+        timeout_seconds=0.01,
+        store=store,
+        component='scanner',
+        operation='scan_cycle',
+    )
+
+    assert result['ok'] is False
+    assert result['reason'] == 'deadman_timeout'
+    assert result['component'] == 'scanner'
+    assert result['operation'] == 'scan_cycle'
+    assert store.json_state['runtime_heartbeat']['components']['scanner']['status'] == 'timeout'
+    assert store.events[-1]['event_type'] == 'runtime_deadman_timeout'
+
+
+def test_cleanup_symbol_runtime_state_ttl_removes_stale_symbol_cache():
+    mod = load_module()
+    store = DummyStore()
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    stale = (now - datetime.timedelta(seconds=120)).isoformat()
+    fresh = (now - datetime.timedelta(seconds=10)).isoformat()
+    store.json_state['book_ticker_cache'] = {
+        'OLDUSDT': [{'event_time': stale, 'bid_price': 1}],
+        'FRESHUSDT': [{'event_time': fresh, 'bid_price': 2}],
+    }
+    store.json_state['symbol_runtime_state'] = {
+        'OLDUSDT': {'updated_at': stale},
+        'FRESHUSDT': {'updated_at': fresh},
+    }
+
+    result = mod.cleanup_symbol_runtime_state_ttl(store, ttl_seconds=60, now=now)
+
+    assert result['removed_symbols'] == ['OLDUSDT']
+    assert sorted(store.json_state['book_ticker_cache'].keys()) == ['FRESHUSDT']
+    assert sorted(store.json_state['symbol_runtime_state'].keys()) == ['FRESHUSDT']
+    assert store.events[-1]['event_type'] == 'runtime_ttl_cleanup'
+
+
+def test_record_runtime_heartbeat_logs_queue_backlog_and_blocked_reason():
+    mod = load_module()
+    store = DummyStore()
+
+    payload = mod.record_runtime_heartbeat(
+        store,
+        component='scanner',
+        status='blocked',
+        blocked_reason='queue_backlog:execution_queue_full',
+        queue_depth=10,
+        queue_maxsize=10,
+    )
+
+    assert payload['status'] == 'blocked'
+    assert payload['blocked_reason'] == 'queue_backlog:execution_queue_full'
+    assert payload['queue_depth'] == 10
+    assert payload['queue_maxsize'] == 10
+    assert store.json_state['runtime_heartbeat']['components']['scanner']['blocked_reason'] == 'queue_backlog:execution_queue_full'
+
+
+def test_supervised_auto_loop_restarts_after_cycle_exception(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=0, supervisor_restart_limit=2)
+    calls = {'count': 0}
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda passed_args: store)
+    monkeypatch.setattr(mod, 'print_scan_output', lambda result, output_format: None)
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    def flaky_run_loop(client, passed_args):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            raise RuntimeError('scanner exploded')
+        return {'ok': True, 'cycles': [{'scan': {'candidate_count': 0}}]}
+
+    result = mod.run_supervised_auto_loop(DummyClient(), args, flaky_run_loop)
+
+    assert result == {'ok': True, 'cycles': [{'scan': {'candidate_count': 0}}], 'cycle_no': 2, 'auto_loop': True}
+    assert calls['count'] == 2
+    heartbeat = store.load_json('runtime_heartbeat', {})
+    assert heartbeat['components']['supervisor']['status'] == 'running'
+    events = [row['event_type'] for row in store.events]
+    assert 'supervisor_restart' in events
+    restart_event = next(row for row in store.events if row['event_type'] == 'supervisor_restart')
+    assert restart_event['status'] == 'restarting'
+    assert restart_event['blocked_reason'] == 'cycle_exception'
+
+
+def test_supervised_auto_loop_stops_after_restart_limit(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    args = make_args(auto_loop=True, max_scan_cycles=3, poll_interval_sec=0, supervisor_restart_limit=1)
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda passed_args: store)
+    monkeypatch.setattr(mod, 'print_scan_output', lambda result, output_format: None)
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    def broken_run_loop(client, passed_args):
+        raise RuntimeError('event loop wedged')
+
+    result = mod.run_supervised_auto_loop(DummyClient(), args, broken_run_loop)
+
+    assert result['ok'] is False
+    assert result['reason'] == 'supervisor_restart_limit_exceeded'
+    assert result['cycle_no'] == 2
+    supervisor = store.load_json('runtime_heartbeat', {})['components']['supervisor']
+    assert supervisor['status'] == 'halted'
+    assert supervisor['blocked_reason'] == 'restart_limit_exceeded'
+    assert [row['event_type'] for row in store.events].count('supervisor_restart') == 1
+    assert [row['event_type'] for row in store.events].count('supervisor_halted') == 1
+
+
+def test_book_ticker_supervisor_reconnects_after_monitor_exception():
+    class Store:
+        def __init__(self):
+            self.saved = {}
+            self.events = []
+        def save_json(self, name, payload):
+            self.saved[name] = payload
+        def append_event(self, event_type, payload):
+            self.events.append({'event_type': event_type, 'payload': payload})
+            return self.events[-1]
+    mod = load_module()
+    store = Store()
+    sockets = []
+    def open_ws(symbols, **kwargs):
+        ws = object()
+        sockets.append(ws)
+        return ws
+    calls = {'count': 0}
+    def monitor_cycle(store, ws, **kwargs):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            raise RuntimeError('recv loop wedged')
+        return {'status': 'healthy', 'messages_processed': 2, 'samples_written': 2}
+    result = mod.run_book_ticker_websocket_supervisor(
+        store,
+        initial_symbols=['BTCUSDT'],
+        symbol_provider=lambda: ['BTCUSDT'],
+        ws_module=object(),
+        open_websocket_fn=open_ws,
+        monitor_cycle_fn=monitor_cycle,
+        sleep_fn=lambda seconds: None,
+        max_supervisor_cycles=2,
+        reconnect_backoff_seconds=0,
+    )
+    assert result['cycles_completed'] == 2
+    assert result['reconnect_count'] == 1
+    assert len(sockets) == 2
+    assert any(event['event_type'] == 'book_ticker_ws_monitor_error' for event in store.events)
+    assert store.saved['book_ticker_ws_status']['status'] == 'healthy'

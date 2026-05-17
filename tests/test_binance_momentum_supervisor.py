@@ -36,6 +36,9 @@ def isolated_supervisor_files(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, 'EXTERNAL_SIGNAL_JSON', external_signal)
     monkeypatch.setattr(supervisor, 'RUNTIME_STATE_DIR', runtime_state_dir, raising=False)
     monkeypatch.setattr(supervisor, 'POSITIONS_STATE_FILE', positions_json, raising=False)
+    monkeypatch.setattr(supervisor, 'HALT_MARKER_FILE', runtime_state_dir / 'supervisor_halt.json', raising=False)
+    monkeypatch.setattr(supervisor, 'SINGLE_INSTANCE_LOCK_FILE', runtime_state_dir / 'supervisor.lock', raising=False)
+    monkeypatch.setattr(supervisor, 'SINGLE_INSTANCE_LOCK_HANDLE', None, raising=False)
     monkeypatch.setattr(supervisor, 'POLL_INTERVAL', 0)
     monkeypatch.setattr(supervisor, 'RESTART_DELAY', 0)
     monkeypatch.setattr(supervisor, 'load_env', lambda _path: None)
@@ -84,7 +87,7 @@ def test_main_starts_child_for_recoverable_runtime_position(monkeypatch, isolate
     with pytest.raises(Spawned):
         supervisor.main()
 
-    assert recorded['cmd'][0] == sys.executable
+    assert recorded['cmd'][0] == supervisor.resolve_strategy_python()
     assert recorded['cmd'][2] == str(supervisor.BOT_SCRIPT)
 
 

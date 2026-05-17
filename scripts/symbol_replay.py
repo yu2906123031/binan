@@ -140,6 +140,8 @@ def _new_session(position_key: str, row: Dict[str, Any]) -> Dict[str, Any]:
         'selected_alert_tier': '',
         'selected_entry_price': None,
         'selected_stop_price': None,
+        'selected_rank_score': None,
+        'selected_liquidity_grade': '',
         'entry_price': None,
         'stop_price': None,
         'quantity': None,
@@ -184,6 +186,8 @@ def _apply_row_to_session(session: Dict[str, Any], row: Dict[str, Any]) -> None:
         session['selected_alert_tier'] = _normalize_text(row.get('alert_tier'))
         session['selected_entry_price'] = _round(row.get('entry_price'), 10)
         session['selected_stop_price'] = _round(row.get('stop_price'), 10)
+        session['selected_rank_score'] = _round(row.get('rank_score') or row.get('score'), 4)
+        session['selected_liquidity_grade'] = _normalize_text(row.get('liquidity_grade'))
         session['quantity'] = _round(row.get('quantity'), 10)
         session['execution_exchange'] = _normalize_text(row.get('execution_exchange'))
         return
@@ -253,6 +257,84 @@ def _apply_row_to_session(session: Dict[str, Any], row: Dict[str, Any]) -> None:
         return
 
 
+def _closed_trade_sessions(sessions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        session for session in sessions
+        if session.get('status') == 'closed' and session.get('realized_pnl') is not None
+    ]
+
+
+def _summarize_trades(sessions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = _closed_trade_sessions(sessions)
+    pnl_values = [_to_float(session.get('realized_pnl')) for session in closed]
+    wins = sum(1 for value in pnl_values if value > 0)
+    losses = sum(1 for value in pnl_values if value < 0)
+    total = len(pnl_values)
+    total_pnl = sum(pnl_values)
+    return {
+        'closed_trade_count': total,
+        'winning_trade_count': wins,
+        'losing_trade_count': losses,
+        'win_rate': round(wins / total, 4) if total else 0.0,
+        'total_realized_pnl': round(total_pnl, 4),
+        'average_realized_pnl': round(total_pnl / total, 4) if total else 0.0,
+    }
+
+
+def _build_adaptive_parameters(trade_learning: Dict[str, Any]) -> Dict[str, Any]:
+    average_pnl = _to_float(trade_learning.get('average_realized_pnl'))
+    win_rate = _to_float(trade_learning.get('win_rate'))
+    closed_count = int(_to_float(trade_learning.get('closed_trade_count')))
+    if closed_count <= 0:
+        multiplier = 1.0
+        reason = 'insufficient_recent_trades'
+    elif average_pnl < 0 or win_rate < 0.4:
+        multiplier = 0.75
+        reason = 'negative_recent_expectancy'
+    elif average_pnl > 0 and win_rate >= 0.6:
+        multiplier = 1.15
+        reason = 'positive_recent_expectancy'
+    else:
+        multiplier = 1.0
+        reason = 'neutral_recent_expectancy'
+    return {
+        'dynamic_risk_multiplier': multiplier,
+        'reason': reason,
+        'source': 'symbol_replay_recent_closed_trades',
+    }
+
+
+def _bucket_performance(sessions: Iterable[Dict[str, Any]], field_name: str) -> List[Dict[str, Any]]:
+    buckets: Dict[str, List[float]] = {}
+    for session in _closed_trade_sessions(sessions):
+        bucket = _normalize_text(session.get(field_name), 'unknown')
+        buckets.setdefault(bucket, []).append(_to_float(session.get('realized_pnl')))
+    rows = []
+    for bucket, values in buckets.items():
+        count = len(values)
+        wins = sum(1 for value in values if value > 0)
+        total = sum(values)
+        rows.append({
+            'bucket': bucket,
+            'closed_trade_count': count,
+            'win_rate': round(wins / count, 4) if count else 0.0,
+            'average_realized_pnl': round(total / count, 4) if count else 0.0,
+            'total_realized_pnl': round(total, 4),
+        })
+    return sorted(rows, key=lambda row: (-_to_float(row.get('average_realized_pnl')), str(row.get('bucket'))))
+
+
+def _build_ranking_insights(sessions: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = _closed_trade_sessions(sessions)
+    rank_scores = [_to_float(session.get('selected_rank_score')) for session in closed if session.get('selected_rank_score') is not None]
+    return {
+        'by_alert_tier': _bucket_performance(closed, 'selected_alert_tier'),
+        'by_state': _bucket_performance(closed, 'selected_state'),
+        'by_liquidity_grade': _bucket_performance(closed, 'selected_liquidity_grade'),
+        'average_rank_score': round(sum(rank_scores) / len(rank_scores), 4) if rank_scores else 0.0,
+    }
+
+
 def build_symbol_replay_payload(rows: Iterable[Dict[str, Any]], symbol: str, side: str = '') -> Dict[str, Any]:
     filtered = filter_symbol_events(rows, symbol=symbol, side=side)
     sessions: List[Dict[str, Any]] = []
@@ -306,6 +388,7 @@ def build_symbol_replay_payload(rows: Iterable[Dict[str, Any]], symbol: str, sid
     closed_count = sum(1 for session in sessions if session.get('status') == 'closed')
     active_count = sum(1 for session in sessions if session.get('status') in {'selected', 'submitted', 'entered', 'protected'})
     superseded_count = sum(1 for session in sessions if session.get('status') == 'superseded')
+    trade_learning = _summarize_trades(sessions)
 
     return {
         'summary': {
@@ -324,6 +407,9 @@ def build_symbol_replay_payload(rows: Iterable[Dict[str, Any]], symbol: str, sid
         'by_event_type': _count_table(event_type_counter, 'event_type'),
         'by_exit_reason': _count_table(exit_reason_counter, 'exit_reason'),
         'by_reject_reason': _count_table(reject_reason_counter, 'reject_reason'),
+        'trade_learning': trade_learning,
+        'adaptive_parameters': _build_adaptive_parameters(trade_learning),
+        'ranking_insights': _build_ranking_insights(sessions),
         'sessions': sessions,
     }
 
@@ -376,6 +462,23 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
         session_rows,
         ['position_key', 'status', 'selected_at', 'entry_filled_at', 'closed_at', 'exit_reason', 'reject_reason', 'selected_score', 'entry_price', 'filled_quantity'],
     )
+    trade_learning = payload.get('trade_learning', {})
+    lines.append('## Trade learning')
+    lines.append('')
+    lines.append(f"- closed_trade_count: {trade_learning.get('closed_trade_count', 0)}")
+    lines.append(f"- win_rate: {trade_learning.get('win_rate', 0.0)}")
+    lines.append(f"- average_realized_pnl: {trade_learning.get('average_realized_pnl', 0.0)}")
+    lines.append('')
+    adaptive = payload.get('adaptive_parameters', {})
+    lines.append('## Adaptive parameters')
+    lines.append('')
+    lines.append(f"- dynamic_risk_multiplier: {adaptive.get('dynamic_risk_multiplier', 1.0)}")
+    lines.append(f"- reason: {adaptive.get('reason', '')}")
+    lines.append('')
+    ranking = payload.get('ranking_insights', {})
+    append_table('Ranking by alert tier', ranking.get('by_alert_tier', []), ['bucket', 'closed_trade_count', 'win_rate', 'average_realized_pnl', 'total_realized_pnl'])
+    append_table('Ranking by state', ranking.get('by_state', []), ['bucket', 'closed_trade_count', 'win_rate', 'average_realized_pnl', 'total_realized_pnl'])
+    append_table('Ranking by liquidity grade', ranking.get('by_liquidity_grade', []), ['bucket', 'closed_trade_count', 'win_rate', 'average_realized_pnl', 'total_realized_pnl'])
     append_table('By event type', payload.get('by_event_type', []), ['event_type', 'count'])
     append_table('By exit reason', payload.get('by_exit_reason', []), ['exit_reason', 'count'])
     append_table('By reject reason', payload.get('by_reject_reason', []), ['reject_reason', 'count'])
