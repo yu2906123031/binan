@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime
+import contextlib
+import fcntl
 import json
 import os
 import uuid
@@ -379,6 +381,19 @@ class RuntimeStateStore:
     def _events_path(self) -> Path:
         return self._dir() / 'events.jsonl'
 
+    def _lock_path(self, path: Path) -> Path:
+        return path.parent / f'.{path.name}.lock'
+
+    @contextlib.contextmanager
+    def _file_lock(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock_path(path).open('a+', encoding='utf-8') as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
     def _atomic_write_json(self, path: Path, payload: Any) -> Any:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.parent / f'.{path.name}.{uuid.uuid4().hex}.tmp'
@@ -396,25 +411,28 @@ class RuntimeStateStore:
 
     def load(self) -> Dict[str, Any]:
         path = self._path()
-        if not path.exists():
-            return {}
-        try:
-            return json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            return {}
+        with self._file_lock(path):
+            if not path.exists():
+                return {}
+            try:
+                return json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                return {}
 
     def save(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = self._path()
-        return self._atomic_write_json(path, payload)
+        with self._file_lock(path):
+            return self._atomic_write_json(path, payload)
 
     def load_json(self, name: str, default: Any = None) -> Any:
         path = self._json_path(name)
-        if not path.exists():
-            return default
-        try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            return default
+        with self._file_lock(path):
+            if not path.exists():
+                return default
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                return default
         if name == 'positions':
             migrated = migrate_positions_state(payload)
             materialized = materialize_positions_state(migrated, include_legacy_alias=False)
@@ -423,17 +441,18 @@ class RuntimeStateStore:
 
     def load_json_with_error(self, name: str, default: Any = None) -> Tuple[Any, Optional[Dict[str, Any]]]:
         path = self._json_path(name)
-        if not path.exists():
-            return default, None
-        try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
-        except Exception as exc:
-            return default, {
-                'state_key': str(name or ''),
-                'state_file': path.name,
-                'error_type': exc.__class__.__name__,
-                'error': str(exc),
-            }
+        with self._file_lock(path):
+            if not path.exists():
+                return default, None
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception as exc:
+                return default, {
+                    'state_key': str(name or ''),
+                    'state_file': path.name,
+                    'error_type': exc.__class__.__name__,
+                    'error': str(exc),
+                }
         if name == 'positions':
             migrated = migrate_positions_state(payload)
             materialized = materialize_positions_state(migrated, include_legacy_alias=False)
@@ -443,16 +462,18 @@ class RuntimeStateStore:
     def save_json(self, name: str, payload: Any) -> Any:
         path = self._json_path(name)
         normalized_payload = materialize_positions_state(migrate_positions_state(payload), include_legacy_alias=False) if name == 'positions' else payload
-        return self._atomic_write_json(path, normalized_payload)
+        with self._file_lock(path):
+            return self._atomic_write_json(path, normalized_payload)
 
     def append_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = self._events_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         row = {'event_type': event_type, 'recorded_at': _isoformat_utc(_utc_now()), **normalize_runtime_event_payload(payload or {})}
-        with path.open('a', encoding='utf-8') as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + '\n')
-            fh.flush()
-            os.fsync(fh.fileno())
+        with self._file_lock(path):
+            with path.open('a', encoding='utf-8') as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + '\n')
+                fh.flush()
+                os.fsync(fh.fileno())
         return row
 
     def read_events(self, limit: int = 1000) -> List[Dict[str, Any]]:

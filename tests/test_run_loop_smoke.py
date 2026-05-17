@@ -787,8 +787,8 @@ def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     assert exit_code == 0
     assert cycle_calls == [1, 2]
     assert sleeps == [7]
+    assert '"auto_loop": true' in captured.out
     assert '"cycle_no": 2' in captured.out
-
 
 def test_main_auto_loop_zero_cycles_runs_forever_until_keyboard_interrupt(monkeypatch, capsys):
     mod = load_module()

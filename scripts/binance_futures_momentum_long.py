@@ -10,6 +10,7 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import re
 import statistics
 import subprocess
@@ -1096,9 +1097,25 @@ def run_with_deadman_timeout(
         result = fn(*args, **kwargs)
         record_runtime_heartbeat(store, component=component, status='healthy', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'deadman_mode': 'inline_test'})
         return result
-    ctx = multiprocessing.get_context('fork') if 'fork' in multiprocessing.get_all_start_methods() else multiprocessing.get_context()
+    start_methods = multiprocessing.get_all_start_methods()
+    ctx = multiprocessing.get_context('fork') if 'fork' in start_methods else multiprocessing.get_context()
+    try:
+        pickle.dumps((fn, args, kwargs))
+        process_args = (fn, args, kwargs)
+    except Exception as exc:
+        if ctx.get_start_method() != 'fork':
+            payload = record_runtime_heartbeat(
+                store,
+                component=component,
+                status='blocked',
+                blocked_reason=f'{operation}_non_serializable_payload',
+                extra={'operation': operation, 'error': str(exc), 'start_method': ctx.get_start_method()},
+            )
+            append_runtime_event(store, 'runtime_deadman_payload_rejected', payload)
+            raise TypeError(f'{component}:{operation} deadman payload must be pickle-serializable under spawn') from exc
+        process_args = (fn, args, kwargs)
     result_queue: Any = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=_deadman_process_target, args=(result_queue, fn, args, kwargs), name=f'{component}-{operation}-deadman')
+    process = ctx.Process(target=_deadman_process_target, args=(result_queue, *process_args), name=f'{component}-{operation}-deadman')
     record_runtime_heartbeat(store, component=component, status='running', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)})
     process.start()
     process.join(max(float(timeout_seconds or 0.0), 0.001))
@@ -7827,6 +7844,141 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     return result
 
 
+async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]], stop_event: asyncio.Event) -> None:
+    cycle_no = 0
+    scanner_timeout_seconds = float(getattr(args, 'scanner_timeout_seconds', 45.0) or 45.0)
+    poll_interval = max(0, int(getattr(args, 'poll_interval_sec', 60) or 60))
+    while not stop_event.is_set():
+        cycle_no += 1
+        try:
+            await asyncio.wait_for(queues['scanner'].put({'cycle_no': cycle_no, 'kind': 'scan_cycle'}), timeout=1.0)
+            work_item = await asyncio.wait_for(queues['scanner'].get(), timeout=1.0)
+            record_runtime_heartbeat(store, component='scanner', status='running', blocked_reason='', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
+            result = await await_component_with_timeout(
+                asyncio.to_thread(run_loop_fn, client, args),
+                scanner_timeout_seconds,
+                store=store,
+                component='scanner',
+                operation='resident_scan_cycle',
+            )
+            queues['scanner'].task_done()
+            await asyncio.wait_for(queues['manager'].put({'kind': 'cycle_result', 'cycle_no': cycle_no, 'result': result, 'work_item': work_item}), timeout=1.0)
+            if isinstance(result, dict):
+                cycles = result.get('cycles') if isinstance(result.get('cycles'), list) else []
+                for cycle in cycles:
+                    if isinstance(cycle, dict) and cycle.get('live_execution'):
+                        await asyncio.wait_for(queues['execution'].put({'kind': 'execution_result', 'cycle_no': cycle_no, 'live_execution': cycle.get('live_execution')}), timeout=1.0)
+            record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
+        except asyncio.TimeoutError:
+            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='scanner_queue_timeout', queue_depth=queues['scanner'].qsize(), queue_maxsize=queues['scanner'].maxsize, extra={'cycle_no': cycle_no})
+        except KeyboardInterrupt:
+            store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
+            stop_event.set()
+            break
+        if int(getattr(args, 'max_scan_cycles', 0) or 0) and cycle_no >= int(getattr(args, 'max_scan_cycles', 0) or 0):
+            stop_event.set()
+            break
+        try:
+            await asyncio.to_thread(time.sleep, poll_interval)
+        except KeyboardInterrupt:
+            store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
+            stop_event.set()
+            break
+
+
+async def execution_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set() or not queues['execution'].empty():
+        try:
+            item = await asyncio.wait_for(queues['execution'].get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            record_runtime_heartbeat(store, component='execution', status='idle', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize)
+            continue
+        try:
+            record_runtime_heartbeat(store, component='execution', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'kind': item.get('kind'), 'cycle_no': item.get('cycle_no')})
+            append_runtime_event(store, 'resident_execution_observed', item)
+        finally:
+            queues['execution'].task_done()
+
+
+async def manager_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+    last_result: Dict[str, Any] = {'ok': True, 'cycles': []}
+    while not stop_event.is_set() or not queues['manager'].empty():
+        try:
+            item = await asyncio.wait_for(queues['manager'].get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            record_runtime_heartbeat(store, component='manager', status='idle', blocked_reason='', queue_depth=queues['manager'].qsize(), queue_maxsize=queues['manager'].maxsize)
+            continue
+        try:
+            if item.get('kind') == 'cycle_result' and isinstance(item.get('result'), dict):
+                last_result = dict(item['result'], cycle_no=item.get('cycle_no'), auto_loop=True)
+                store.save_json('resident_last_result', last_result)
+            record_runtime_heartbeat(store, component='manager', status='healthy', blocked_reason='', queue_depth=queues['manager'].qsize(), queue_maxsize=queues['manager'].maxsize, extra={'kind': item.get('kind'), 'cycle_no': item.get('cycle_no')})
+        finally:
+            queues['manager'].task_done()
+
+
+async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, stop_event: asyncio.Event) -> None:
+    interval = max(1.0, float(getattr(args, 'websocket_healthcheck_interval_seconds', 15.0) or 15.0))
+    while not stop_event.is_set():
+        try:
+            result = await await_component_with_timeout(
+                asyncio.to_thread(run_auto_loop_book_ticker_websocket_monitor, client=client, store=store, args=args),
+                float(getattr(args, 'websocket_healthcheck_timeout_seconds', 10.0) or 10.0),
+                store=store,
+                component='ws',
+                operation='book_ticker_healthcheck',
+            )
+            record_runtime_heartbeat(store, component='ws', status='healthy', blocked_reason='', extra={'summary': result.get('summary') if isinstance(result, dict) else {}})
+        except Exception as exc:
+            record_runtime_heartbeat(store, component='ws', status='restarting', blocked_reason='websocket_healthcheck_exception', extra={'error': str(exc), 'error_type': type(exc).__name__})
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def watchdog_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+    interval = 5.0
+    while not stop_event.is_set():
+        for name, queue in queues.items():
+            if queue.full():
+                payload = record_runtime_heartbeat(store, component='watchdog', status='blocked', blocked_reason=f'{name}_queue_full', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
+                append_runtime_event(store, 'resident_queue_backlog', payload)
+        await asyncio.sleep(interval)
+
+
+def build_async_runtime_task_queues(maxsize: int) -> Dict[str, asyncio.Queue]:
+    size = max(1, int(maxsize or 1))
+    return {'scanner': asyncio.Queue(maxsize=size), 'execution': asyncio.Queue(maxsize=size), 'manager': asyncio.Queue(maxsize=size)}
+
+
+async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]]) -> Dict[str, Any]:
+    store = get_runtime_state_store(args)
+    queues = build_async_runtime_task_queues(int(getattr(args, 'runtime_queue_maxsize', 128) or 128))
+    stop_event = asyncio.Event()
+    record_runtime_heartbeat(store, component='resident', status='starting', blocked_reason='', extra={'tasks': ['scanner', 'execution', 'manager', 'ws', 'watchdog']})
+    tasks = [
+        asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task'),
+        asyncio.create_task(execution_task(store, queues, stop_event), name='execution_task'),
+        asyncio.create_task(manager_task(store, queues, stop_event), name='manager_task'),
+        asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
+    ]
+    if bool(getattr(args, 'require_book_ticker_ws', True)):
+        tasks.append(asyncio.create_task(ws_task(client, args, store, stop_event), name='ws_task'))
+    try:
+        await tasks[0]
+    finally:
+        stop_event.set()
+        await asyncio.gather(*tasks[1:], return_exceptions=True)
+    record_runtime_heartbeat(store, component='resident', status='stopped', blocked_reason='')
+    last_result = store.load_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycles': []})
+    return last_result if isinstance(last_result, dict) else {'ok': True, 'auto_loop': True, 'cycles': []}
+
+
+def run_resident_runtime(client: Any, args: argparse.Namespace, run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]]) -> Dict[str, Any]:
+    return asyncio.run(run_resident_runtime_async(client, args, run_loop_fn))
+
+
 def run_supervised_auto_loop(client: Any, args: argparse.Namespace, run_loop_fn: Callable[[Any, argparse.Namespace], Dict[str, Any]]) -> Dict[str, Any]:
     store = get_runtime_state_store(args)
     max_cycles = int(getattr(args, 'max_scan_cycles', 0) or 0)
@@ -7923,7 +8075,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if getattr(args, 'auto_loop', False):
         try:
-            run_supervised_auto_loop(client, args, run_loop_fn)
+            result = run_resident_runtime(client, args, run_loop_fn)
+            print_scan_output(result, args.output_format)
         except KeyboardInterrupt:
             interrupted = {'ok': True, 'interrupted': True, 'auto_loop': True}
             print_scan_output(interrupted, args.output_format)
