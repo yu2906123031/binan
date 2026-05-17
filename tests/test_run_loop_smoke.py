@@ -1035,6 +1035,102 @@ def test_watchdog_detects_stale_core_heartbeats_and_emits_recovery(monkeypatch):
     recovery = [payload for event_type, payload in events if event_type == 'resident_watchdog_recovery'][-1]
     assert {'scanner_stale', 'ws_stale', 'execution_stale', 'event_loop_lag'} <= set(recovery['actions'])
 
+
+def test_scan_only_cycle_no_candidate_returns_manager_update_without_direct_state_write(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
+
+    class GuardedStore(DummyStore):
+        def save_json(self, name, payload):
+            if name == 'runtime_heartbeat':
+                return super().save_json(name, payload)
+            raise AssertionError(f'scanner direct write: {name}')
+        def append_event(self, event_type, payload):
+            raise AssertionError(f'scanner direct event write: {event_type}')
+
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'is_binance_simulated_trading', lambda args: True)
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'candidate_count': 0}, None, {}))
+    monkeypatch.setattr(mod, 'apply_reconcile_close_risk_state_updates', lambda *a, **k: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': mod.default_risk_state()})
+
+    result = mod.scan_only_cycle(DummyClient(), args, store=GuardedStore(), cycle_no=4)
+
+    assert result['ok'] is True
+    assert result['manager_update']['kind'] == 'cycle'
+    assert result['manager_update']['reason'] == 'no_candidate'
+    assert result['manager_update']['cycle']['cycle_no'] == 4
+
+
+def test_ws_task_resets_singleton_guard_after_exit(monkeypatch):
+    mod = load_module()
+    args = make_args(require_book_ticker_ws=True, websocket_healthcheck_interval_seconds=0.001, websocket_healthcheck_timeout_seconds=0.1, book_ticker_ws_stale_seconds=30.0)
+    store = DummyStore()
+    calls = []
+
+    def fake_monitor(*, client, store, args):
+        calls.append('start')
+        store.save_json('book_ticker_ws_status', {'status': 'healthy', 'updated_at': mod.datetime.now(mod.timezone.utc).isoformat(), 'messages_processed': 1})
+        return {'status': 'resident_started'}
+
+    async def run_once():
+        stop = __import__('asyncio').Event()
+        task = __import__('asyncio').create_task(mod.ws_task(DummyClient(), args, store, stop))
+        await __import__('asyncio').sleep(0.003)
+        stop.set()
+        await task
+
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', fake_monitor)
+    mod._BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
+    __import__('asyncio').run(run_once())
+    assert mod._BOOK_TICKER_WS_SUPERVISOR_ACTIVE is False
+    __import__('asyncio').run(run_once())
+    assert calls == ['start', 'start']
+
+
+def test_scanner_task_applies_backpressure_scan_delay_multiplier(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=2, require_book_ticker_ws=False)
+    store = DummyStore()
+    sleeps = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        if fn is mod.scan_only_cycle:
+            cycle_no = kwargs.get('cycle_no')
+            return {'ok': True, 'cycle': {'cycle_no': cycle_no}, 'execution_request': {'candidate_score': 0.01}, 'manager_update': {'kind': 'cycle', 'cycle': {'cycle_no': cycle_no}}}
+        if fn is mod.time.sleep:
+            sleeps.append(args[0])
+            return None
+        return fn(*args, **kwargs)
+
+    queues = {'execution': __import__('asyncio').Queue(maxsize=1), 'manager': __import__('asyncio').Queue(maxsize=4)}
+    queues['execution'].put_nowait({'existing': True})
+    monkeypatch.setattr(mod.asyncio, 'to_thread', fake_to_thread)
+
+    __import__('asyncio').run(mod.scanner_task(DummyClient(), args, store, queues, None, __import__('asyncio').Event()))
+
+    assert sleeps == [6]
+
+
+def test_watchdog_persists_recovery_request_for_supervisor(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    store.save_json('runtime_heartbeat', {
+        'components': {
+            'scanner': {'updated_at_ts': 1.0, 'extra': {'last_scan_ts': 1.0}},
+            'ws': {'updated_at_ts': 1.0, 'extra': {'last_ws_msg_ts': 1.0}},
+            'execution': {'updated_at_ts': 1.0, 'extra': {'last_execution_ts': 1.0}},
+            'event_loop': {'updated_at_ts': 1.0, 'extra': {'lag_seconds': 5.0}},
+        }
+    })
+    monkeypatch.setattr(mod.time, 'time', lambda: 100.0)
+
+    __import__('asyncio').run(mod.watchdog_task(store, {'manager': __import__('asyncio').Queue(maxsize=1)}, __import__('asyncio').Event(), interval=0.001, max_samples=1, stale_seconds=10.0, event_loop_lag_seconds=1.0))
+
+    recovery = store.load_json('runtime_recovery_request', {})
+    assert recovery['action'] == 'supervisor_restart'
+    assert {'scanner_stale', 'ws_stale', 'execution_stale', 'event_loop_lag'} <= set(recovery['actions'])
+
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=2, poll_interval_sec=7, base_url='https://example.com')
