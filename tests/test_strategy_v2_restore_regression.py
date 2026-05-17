@@ -1124,6 +1124,7 @@ def test_run_loop_records_rejection_event_when_risk_guard_blocks_live_trade(monk
         auto_loop=False,
         disable_notify=True,
         notify_target='',
+        require_book_ticker_ws=False,
     )
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1184,6 +1185,7 @@ def test_run_loop_records_rejection_event_when_max_open_positions_blocks_trade(m
         auto_loop=False,
         disable_notify=True,
         notify_target='',
+        require_book_ticker_ws=False,
     )
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1257,6 +1259,7 @@ def test_run_loop_okx_simulated_reconcile_clears_stale_position_before_max_open_
         disable_notify=True,
         notify_target='',
         repair_missing_protection=False,
+        require_book_ticker_ws=False,
     )
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -1340,6 +1343,7 @@ def test_run_loop_reconcile_closed_symbol_enters_cooldown_before_same_symbol_ree
         disable_notify=True,
         notify_target='',
         repair_missing_protection=False,
+        require_book_ticker_ws=False,
     )
     candidate = mod.Candidate(
         symbol='COSUSDT',

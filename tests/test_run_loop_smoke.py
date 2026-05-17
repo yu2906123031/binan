@@ -75,6 +75,7 @@ def make_args(**overrides):
         notify_target='',
         telegram_bot_token_env='TELEGRAM_BOT_TOKEN',
         output_format='json',
+        require_book_ticker_ws=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -229,10 +230,11 @@ def test_run_loop_auto_loop_resumes_managing_open_position_before_scan(monkeypat
     monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor_core', lambda **kwargs: {'summary': {'status': 'healthy'}, 'health': {'status': 'healthy'}})
     monkeypatch.setattr(mod, 'run_auto_loop_user_data_stream_monitor', lambda **kwargs: {'monitor': {'status': 'healthy'}})
 
-    def unexpected_scan(*args, **kwargs):
-        raise AssertionError('resident auto-loop should resume position management before scanning')
-
-    monkeypatch.setattr(mod, 'run_scan_once', unexpected_scan)
+    scan_calls = []
+    monkeypatch.setattr(mod, 'load_risk_state', lambda store: {'halted': False})
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'normalized_risk_state': {}})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: scan_calls.append(True) or ({'candidate_count': 0, 'candidates': []}, None, {}))
 
     result = mod.run_loop(DummyClient(), make_args(live=True, auto_loop=True, profile='state-machine-test'))
 
@@ -240,10 +242,10 @@ def test_run_loop_auto_loop_resumes_managing_open_position_before_scan(monkeypat
     cycle = result['cycles'][0]
     assert cycle['resident_resume']['state'] == 'MANAGING'
     assert cycle['resident_resume']['position_key'] == 'DOGEUSDT:LONG'
+    assert scan_calls == [True]
     loop_state = store.json_state['auto_loop_state']
-    assert loop_state['state'] == 'MANAGING'
-    assert loop_state['reason'] == 'resume_open_position'
-    assert loop_state['position_key'] == 'DOGEUSDT:LONG'
+    assert loop_state['state'] == 'SCAN'
+    assert loop_state['reason'] == 'no_candidate'
 
 
 def test_run_loop_scan_only_persists_candidate_selected_event(monkeypatch, tmp_path):
@@ -2935,3 +2937,103 @@ def test_book_ticker_supervisor_reconnects_after_monitor_exception():
     assert len(sockets) == 2
     assert any(event['event_type'] == 'book_ticker_ws_monitor_error' for event in store.events)
     assert store.saved['book_ticker_ws_status']['status'] == 'healthy'
+
+
+def test_websocket_freshness_rejects_legacy_health_without_updated_at():
+    mod = load_module()
+
+    result = mod.evaluate_websocket_freshness({'status': 'healthy', 'messages_processed': 10})
+
+    assert result['fresh'] is False
+    assert result['reason'] == 'unknown_websocket_health_without_updated_at'
+
+
+def test_book_ticker_monitor_zero_message_timeout_forces_reconnect_status():
+    mod = load_module()
+    store = DummyStore()
+
+    class TimeoutErrorForTest(Exception):
+        pass
+
+    class WsModule:
+        WebSocketTimeoutException = TimeoutErrorForTest
+        WebSocketException = RuntimeError
+
+    class Ws:
+        def settimeout(self, value):
+            self.timeout = value
+        def recv(self):
+            raise TimeoutErrorForTest('idle')
+
+    result = mod.run_book_ticker_cache_monitor_cycle(store, Ws(), WsModule, max_messages=1, recv_timeout_seconds=0.01)
+
+    assert result['status'] == 'idle_timeout'
+    assert result['zero_message_timeout'] is True
+    assert result['messages_processed'] == 0
+
+
+def test_book_ticker_supervisor_reconnects_after_consecutive_zero_message_timeouts():
+    mod = load_module()
+    store = DummyStore()
+    sockets = []
+
+    def open_ws(symbols, **kwargs):
+        ws = object()
+        sockets.append(ws)
+        return ws
+
+    def idle_cycle(store, ws, **kwargs):
+        return {'status': 'idle_timeout', 'messages_processed': 0, 'samples_written': 0, 'zero_message_timeout': True}
+
+    result = mod.run_book_ticker_websocket_supervisor(
+        store,
+        initial_symbols=['BTCUSDT'],
+        symbol_provider=lambda: ['BTCUSDT'],
+        ws_module=object(),
+        open_websocket_fn=open_ws,
+        monitor_cycle_fn=idle_cycle,
+        sleep_fn=lambda seconds: None,
+        max_supervisor_cycles=2,
+        zero_message_timeout_reconnect_threshold=2,
+    )
+
+    assert result['reconnect_count'] == 1
+    assert len(sockets) == 2
+    assert 'book_ticker_ws_zero_message_timeout' in [row['event_type'] for row in store.events]
+
+
+def test_cleanup_symbol_runtime_state_ttl_removes_bad_state_without_timestamp():
+    mod = load_module()
+    store = DummyStore()
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    fresh = (now - datetime.timedelta(seconds=10)).isoformat()
+    store.json_state['book_ticker_cache'] = {
+        'BADUSDT': [{'bid_price': 1}],
+        'FRESHUSDT': [{'event_time': fresh, 'bid_price': 2}],
+    }
+    store.json_state['symbol_runtime_state'] = {
+        'BADUSDT': {'state': 'legacy'},
+        'FRESHUSDT': {'updated_at': fresh},
+    }
+
+    result = mod.cleanup_symbol_runtime_state_ttl(store, ttl_seconds=60, now=now)
+
+    assert result['removed_symbols'] == ['BADUSDT']
+    assert sorted(store.json_state['book_ticker_cache'].keys()) == ['FRESHUSDT']
+    assert sorted(store.json_state['symbol_runtime_state'].keys()) == ['FRESHUSDT']
+
+
+@pytest.mark.asyncio
+async def test_runtime_task_queue_consumer_put_get_executes_handler():
+    mod = load_module()
+    store = DummyStore()
+    queues = mod.build_runtime_task_queues(maxsize=1)
+    handled = []
+
+    queued = await mod.submit_runtime_task(queues['scanner'], {'cycle': 1}, store=store, component='scanner')
+    await mod.runtime_queue_consumer('scanner', queues['scanner'], lambda item: handled.append(item), store=store, stop_after_one=True)
+
+    assert queued is True
+    assert handled == [{'cycle': 1}]
+    assert queues['scanner'].qsize() == 0
+    assert store.json_state['runtime_heartbeat']['components']['scanner']['status'] == 'idle'

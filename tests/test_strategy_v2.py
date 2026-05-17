@@ -4045,6 +4045,7 @@ def test_run_loop_records_execution_quality_rejection_event_when_risk_guard_bloc
         auto_loop=False,
         disable_notify=True,
         notify_target='',
+        require_book_ticker_ws=False,
     )
     candidate = mod.Candidate(
         symbol='TESTUSDT',

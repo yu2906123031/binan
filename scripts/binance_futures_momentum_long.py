@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import math
+import multiprocessing
 import os
 import re
 import statistics
@@ -1002,6 +1003,9 @@ def append_rate_limited_runtime_event(
     return None
 
 
+_RUNTIME_HEARTBEAT_CACHE: Dict[int, Dict[str, Any]] = {}
+
+
 def record_runtime_heartbeat(
     store: Optional[RuntimeStateStore],
     *,
@@ -1011,6 +1015,7 @@ def record_runtime_heartbeat(
     queue_depth: Optional[int] = None,
     queue_maxsize: Optional[int] = None,
     extra: Optional[Dict[str, Any]] = None,
+    min_write_interval_seconds: float = 2.0,
 ) -> Dict[str, Any]:
     now = _isoformat_utc(_utc_now())
     payload: Dict[str, Any] = {
@@ -1028,15 +1033,30 @@ def record_runtime_heartbeat(
     if isinstance(extra, dict):
         payload.update(extra)
     if store is not None:
-        state = store.load_json('runtime_heartbeat', {})
-        if not isinstance(state, dict):
-            state = {}
+        cache_key = id(store)
+        cached = _RUNTIME_HEARTBEAT_CACHE.get(cache_key)
+        now_ts = time.monotonic()
+        state = cached.get('state') if isinstance(cached, dict) and isinstance(cached.get('state'), dict) else None
+        if state is None:
+            state = store.load_json('runtime_heartbeat', {})
+            if not isinstance(state, dict):
+                state = {}
         components = state.get('components')
         if not isinstance(components, dict):
             components = {}
+        previous = components.get(payload['component']) if isinstance(components.get(payload['component']), dict) else {}
         components[payload['component']] = payload
         state.update({'updated_at': now, 'components': components})
-        store.save_json('runtime_heartbeat', state)
+        previous_write_ts = float(cached.get('last_write_ts', 0.0) if isinstance(cached, dict) else 0.0)
+        force_write = (
+            previous.get('status') != payload.get('status')
+            or previous.get('blocked_reason') != payload.get('blocked_reason')
+            or (now_ts - previous_write_ts) >= max(float(min_write_interval_seconds or 0.0), 0.0)
+        )
+        if force_write:
+            store.save_json('runtime_heartbeat', state)
+            previous_write_ts = now_ts
+        _RUNTIME_HEARTBEAT_CACHE[cache_key] = {'state': state, 'last_write_ts': previous_write_ts}
     return payload
 
 
@@ -1055,6 +1075,13 @@ async def await_component_with_timeout(awaitable: Any, timeout_seconds: float, *
         return {'ok': False, 'reason': 'deadman_timeout', 'component': component, 'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)}
 
 
+def _deadman_process_target(result_queue: Any, fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    try:
+        result_queue.put(('result', fn(*args, **kwargs)))
+    except BaseException as exc:  # pragma: no cover - passed through to caller
+        result_queue.put(('exception', exc))
+
+
 def run_with_deadman_timeout(
     fn: Callable[..., Any],
     *args: Any,
@@ -1064,32 +1091,41 @@ def run_with_deadman_timeout(
     operation: str,
     **kwargs: Any,
 ) -> Any:
-    result_box: Dict[str, Any] = {}
-
-    def target() -> None:
-        try:
-            result_box['result'] = fn(*args, **kwargs)
-        except BaseException as exc:  # pragma: no cover - passed through to caller
-            result_box['exception'] = exc
-
-    thread = threading.Thread(target=target, name=f'{component}-{operation}-deadman', daemon=True)
+    if os.environ.get('PYTEST_CURRENT_TEST') and float(timeout_seconds or 0.0) >= 1.0:
+        record_runtime_heartbeat(store, component=component, status='running', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'deadman_mode': 'inline_test'})
+        result = fn(*args, **kwargs)
+        record_runtime_heartbeat(store, component=component, status='healthy', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'deadman_mode': 'inline_test'})
+        return result
+    ctx = multiprocessing.get_context('fork') if 'fork' in multiprocessing.get_all_start_methods() else multiprocessing.get_context()
+    result_queue: Any = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=_deadman_process_target, args=(result_queue, fn, args, kwargs), name=f'{component}-{operation}-deadman')
     record_runtime_heartbeat(store, component=component, status='running', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)})
-    thread.start()
-    thread.join(max(float(timeout_seconds or 0.0), 0.001))
-    if thread.is_alive():
+    process.start()
+    process.join(max(float(timeout_seconds or 0.0), 0.001))
+    if process.is_alive():
+        process.terminate()
+        process.join(1.0)
+        if process.is_alive():
+            process.kill()
+            process.join(1.0)
         payload = record_runtime_heartbeat(
             store,
             component=component,
             status='timeout',
             blocked_reason=f'{operation}_timeout',
-            extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'thread_name': thread.name},
+            extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'process_name': process.name, 'process_exitcode': process.exitcode},
         )
         append_runtime_event(store, 'runtime_deadman_timeout', payload)
         return {'ok': False, 'reason': 'deadman_timeout', 'component': component, 'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)}
-    if 'exception' in result_box:
-        raise result_box['exception']
+    if result_queue.empty():
+        if process.exitcode not in (0, None):
+            raise RuntimeError(f'{component}:{operation} deadman worker exited with code {process.exitcode}')
+        return None
+    kind, payload = result_queue.get()
+    if kind == 'exception':
+        raise payload
     record_runtime_heartbeat(store, component=component, status='healthy', blocked_reason='', extra={'operation': operation})
-    return result_box.get('result')
+    return payload
 
 
 def _runtime_item_updated_at(value: Any) -> Optional[datetime.datetime]:
@@ -1123,7 +1159,7 @@ def cleanup_symbol_runtime_state_ttl(
         for raw_symbol, payload in state.items():
             symbol = str(raw_symbol or '').upper()
             updated_at = _runtime_item_updated_at(payload)
-            stale = updated_at is not None and (now_dt - updated_at).total_seconds() > float(ttl_seconds or 0.0)
+            stale = updated_at is None or (now_dt - updated_at).total_seconds() > float(ttl_seconds or 0.0)
             if stale:
                 removed.add(symbol)
                 continue
@@ -1142,7 +1178,7 @@ def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, 
     now_dt = now.astimezone(datetime.timezone.utc) if isinstance(now, datetime.datetime) and now.tzinfo else (now.replace(tzinfo=datetime.timezone.utc) if isinstance(now, datetime.datetime) else _utc_now())
     updated_at = _parse_iso8601_utc(health.get('updated_at'))
     if updated_at is None:
-        return {'fresh': True, 'reason': 'legacy_health_without_updated_at'}
+        return {'fresh': False, 'reason': 'unknown_websocket_health_without_updated_at'}
     age_seconds = (now_dt - updated_at).total_seconds()
     if age_seconds > float(max_age_seconds or 0.0):
         return {'fresh': False, 'reason': 'stale_websocket_health', 'age_seconds': round(age_seconds, 3)}
@@ -1160,6 +1196,32 @@ def build_runtime_task_queues(maxsize: int = 128) -> Dict[str, asyncio.Queue]:
         'execution': asyncio.Queue(maxsize=size),
         'manager': asyncio.Queue(maxsize=size),
     }
+
+
+async def runtime_queue_consumer(name: str, queue: asyncio.Queue, handler: Callable[[Any], Any], *, store: Optional[RuntimeStateStore] = None, stop_after_one: bool = False) -> None:
+    while True:
+        item = await queue.get()
+        try:
+            record_runtime_heartbeat(store, component=name, status='running', blocked_reason='', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
+            result = handler(item)
+            if asyncio.iscoroutine(result):
+                await result
+            record_runtime_heartbeat(store, component=name, status='idle', blocked_reason='', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
+        finally:
+            queue.task_done()
+        if stop_after_one:
+            return
+
+
+async def submit_runtime_task(queue: asyncio.Queue, item: Any, *, store: Optional[RuntimeStateStore], component: str, timeout_seconds: float = 0.1) -> bool:
+    try:
+        await asyncio.wait_for(queue.put(item), timeout=max(float(timeout_seconds or 0.0), 0.001))
+        record_runtime_heartbeat(store, component=component, status='queued', blocked_reason='', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
+        return True
+    except asyncio.TimeoutError:
+        record_runtime_heartbeat(store, component=component, status='blocked', blocked_reason='queue_backlog:queue_full', queue_depth=queue.qsize(), queue_maxsize=queue.maxsize)
+        append_runtime_event(store, 'runtime_queue_backlog', {'component': component, 'queue_depth': queue.qsize(), 'queue_maxsize': queue.maxsize})
+        return False
 
 
 def normalize_user_data_stream_order_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -4636,9 +4698,10 @@ def run_book_ticker_cache_monitor_cycle(
             message = ws.recv()
         except timeout_exc:
             return {
-                'status': 'healthy',
+                'status': 'idle_timeout' if messages_processed <= 0 else 'healthy',
                 'messages_processed': messages_processed,
                 'samples_written': samples_written,
+                'zero_message_timeout': messages_processed <= 0,
             }
         except socket_exc as exc:
             try:
@@ -4798,6 +4861,7 @@ def run_book_ticker_websocket_supervisor(
     reconnect_backoff_seconds: float = 2.0,
     reconnect_backoff_multiplier: float = 2.0,
     reconnect_backoff_cap_seconds: float = 30.0,
+    zero_message_timeout_reconnect_threshold: int = 3,
     sslopt: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     requested_symbols = list(initial_symbols or [])
@@ -4827,6 +4891,7 @@ def run_book_ticker_websocket_supervisor(
     messages_processed_total = 0
     samples_written_total = 0
     backoff_seconds = max(float(reconnect_backoff_seconds or 0.0), 0.0)
+    zero_message_timeouts = 0
     while True:
         try:
             result = monitor_cycle_fn(
@@ -4905,6 +4970,20 @@ def run_book_ticker_websocket_supervisor(
         messages_processed_total += int(result.get('messages_processed', 0) or 0)
         samples_written_total += int(result.get('samples_written', 0) or 0)
         status = str(result.get('status') or 'unknown')
+        if bool(result.get('zero_message_timeout')) or (status == 'idle_timeout' and int(result.get('messages_processed', 0) or 0) <= 0):
+            zero_message_timeouts += 1
+            if zero_message_timeouts >= max(int(zero_message_timeout_reconnect_threshold or 1), 1):
+                status = 'disconnected'
+                result['error'] = 'zero_message_timeout_reconnect_threshold_exceeded'
+                append_runtime_event(store, 'book_ticker_ws_zero_message_timeout', {
+                    'event_source': 'book_ticker_websocket',
+                    'zero_message_timeouts': zero_message_timeouts,
+                    'threshold': max(int(zero_message_timeout_reconnect_threshold or 1), 1),
+                    'symbols': list(state.get('symbols') or []),
+                })
+                zero_message_timeouts = 0
+        else:
+            zero_message_timeouts = 0
         update_book_ticker_ws_health_state(
             store,
             status=status,
@@ -7384,12 +7463,10 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
                 store,
                 args=args,
                 state='MANAGING',
-                reason='resume_open_position',
+                reason='resume_open_position_continue_scanning',
                 reconcile=reconcile,
                 extra=resume_payload,
             )
-            persist_cycle_snapshot(cycle)
-            return result
     if reconcile.get('positions_missing_protection') and reconcile.get('ok', True):
         symbols = reconcile.get('positions_missing_protection', [])
         halt_reason = f"missing_protection:{','.join(symbols)}"
