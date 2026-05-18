@@ -11,16 +11,19 @@ import math
 import multiprocessing
 import os
 import pickle
+import random
 import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
+
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -99,6 +102,232 @@ def load_dotenv(path: Optional[Path] = None, override: bool = False) -> Dict[str
     return loaded
 
 
+def normalize_scanner_proxy_url(raw_url: str) -> str:
+    raw_url = str(raw_url or '').strip()
+    if not raw_url:
+        return ''
+    if '://' not in raw_url:
+        raw_url = f'socks5://{raw_url}'
+    scheme, remainder = raw_url.split('://', 1)
+    scheme = scheme.strip().lower() or 'socks5'
+    remainder = remainder.strip().strip('/')
+    if '@' in remainder:
+        return f'{scheme}://{remainder}'
+    parts = remainder.split(':')
+    if len(parts) == 4:
+        host, port, username, password = parts
+        return f'{scheme}://{quote(username, safe="")}:{quote(password, safe="")}@{host}:{port}'
+    return f'{scheme}://{remainder}'
+
+
+def parse_scanner_proxy_urls(raw_urls: Any) -> List[str]:
+    if raw_urls is None:
+        return []
+    if isinstance(raw_urls, str):
+        candidates = re.split(r'[\s,]+', raw_urls.strip())
+    else:
+        candidates = [str(item or '').strip() for item in raw_urls]
+    normalized = [normalize_scanner_proxy_url(candidate) for candidate in candidates]
+    return [url for url in normalized if url]
+
+
+def choose_scanner_proxy_url(proxy_urls: Sequence[str]) -> str:
+    if not proxy_urls:
+        return ''
+    return random.choice(list(proxy_urls))
+
+
+_BINANCE_REST_GUARD_LOCK = threading.Lock()
+_BINANCE_REST_GUARD_STATE: Dict[str, Any] = {
+    'window_started_at': 0.0,
+    'request_count': 0,
+    'circuit_open_until_ms': 0,
+    'last_used_weight_1m': 0,
+    'state': 'CLOSED',
+    'reason': '',
+    'next_probe_at_ms': 0,
+    'half_open_probe_used': False,
+    'recovering_until_ms': 0,
+}
+
+REST_WEIGHT_SLOWDOWN_THRESHOLD = 1200
+REST_WEIGHT_SCANNER_BLOCK_THRESHOLD = 1500
+REST_WEIGHT_CORE_ONLY_THRESHOLD = 1800
+REST_429_COOLDOWN_SECONDS = 120.0
+REST_418_COOLDOWN_SECONDS = 3600.0
+
+
+def _extract_response_used_weight_1m(response: Any) -> int:
+    try:
+        value = response.headers.get('X-MBX-USED-WEIGHT-1M') or response.headers.get('x-mbx-used-weight-1m')
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _extract_retry_after_ms_from_message(message: Any) -> Optional[int]:
+    match = re.search(r'banned until\s+(\d{10,})', str(message), flags=re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _rest_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _set_binance_rest_circuit_state(state: str, *, reason: str = '', open_for_seconds: float = 0.0) -> None:
+    now_ms = _rest_now_ms()
+    open_until_ms = int(now_ms + max(0.0, float(open_for_seconds or 0.0)) * 1000) if open_for_seconds else 0
+    with _BINANCE_REST_GUARD_LOCK:
+        _BINANCE_REST_GUARD_STATE['state'] = state
+        _BINANCE_REST_GUARD_STATE['reason'] = reason
+        _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = open_until_ms
+        _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = open_until_ms
+        _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+        if state == 'RECOVERING':
+            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = now_ms + 180_000
+        elif state in {'CLOSED', 'OPEN', 'DEGRADED'}:
+            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = 0
+
+
+def _binance_rest_guard_snapshot() -> Dict[str, Any]:
+    now_ms = _rest_now_ms()
+    with _BINANCE_REST_GUARD_LOCK:
+        state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
+        open_until_ms = int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0)
+        next_probe_at_ms = int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or open_until_ms or 0)
+        used_weight = int(_BINANCE_REST_GUARD_STATE.get('last_used_weight_1m') or 0)
+        recovering_until_ms = int(_BINANCE_REST_GUARD_STATE.get('recovering_until_ms') or 0)
+        if state == 'OPEN' and open_until_ms and now_ms >= open_until_ms:
+            state = 'HALF_OPEN'
+            _BINANCE_REST_GUARD_STATE['state'] = state
+            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+        elif state == 'RECOVERING' and recovering_until_ms and now_ms >= recovering_until_ms and used_weight < REST_WEIGHT_SLOWDOWN_THRESHOLD:
+            state = 'CLOSED'
+            _BINANCE_REST_GUARD_STATE['state'] = state
+            _BINANCE_REST_GUARD_STATE['reason'] = ''
+            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = 0
+        state = str(_BINANCE_REST_GUARD_STATE.get('state') or state)
+        return {
+            'state': state,
+            'reason': str(_BINANCE_REST_GUARD_STATE.get('reason') or ''),
+            'rest_used_weight_1m': used_weight,
+            'circuit_open_until_ms': int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0),
+            'next_rest_probe_at_ms': int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0),
+            'next_retry_after_seconds': max(0, int(((int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0) or now_ms) - now_ms) / 1000)),
+            'half_open_probe_used': bool(_BINANCE_REST_GUARD_STATE.get('half_open_probe_used')),
+        }
+
+
+def _binance_rest_guard_before_request(max_requests_per_second: int = 2, *, purpose: str = 'scanner') -> None:
+    purpose = str(purpose or 'scanner')
+    scanner_purpose = purpose in {'scanner', 'market_data', 'public'}
+    core_purpose = purpose in {'execution', 'emergency', 'order_status', 'signed', 'account'}
+    while True:
+        with _BINANCE_REST_GUARD_LOCK:
+            now = time.monotonic()
+            now_ms = _rest_now_ms()
+            state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
+            open_until_ms = int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0)
+            used_weight = int(_BINANCE_REST_GUARD_STATE.get('last_used_weight_1m') or 0)
+            if state == 'OPEN' and open_until_ms and now_ms >= open_until_ms:
+                state = 'HALF_OPEN'
+                _BINANCE_REST_GUARD_STATE['state'] = state
+                _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+            if state == 'OPEN' and open_until_ms and now_ms < open_until_ms:
+                if scanner_purpose or used_weight >= REST_WEIGHT_CORE_ONLY_THRESHOLD:
+                    raise BinanceAPIError(f'Binance REST circuit open until {open_until_ms}')
+            if state == 'HALF_OPEN':
+                if scanner_purpose and bool(_BINANCE_REST_GUARD_STATE.get('half_open_probe_used')):
+                    raise BinanceAPIError(f'Binance REST circuit half-open probe already used until {open_until_ms}')
+                if scanner_purpose:
+                    _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = True
+            if scanner_purpose and used_weight >= REST_WEIGHT_SCANNER_BLOCK_THRESHOLD:
+                _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
+                _BINANCE_REST_GUARD_STATE['reason'] = f'rest_used_weight_1m:{used_weight}'
+                _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = max(int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0), now_ms + 120_000)
+                raise BinanceAPIError(f'Binance REST circuit open until {_BINANCE_REST_GUARD_STATE["next_probe_at_ms"]}')
+            if used_weight >= REST_WEIGHT_CORE_ONLY_THRESHOLD and not core_purpose:
+                _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
+                _BINANCE_REST_GUARD_STATE['reason'] = f'rest_core_only_used_weight_1m:{used_weight}'
+                raise BinanceAPIError(f'Binance REST core-only due to used weight {used_weight}')
+            if now - float(_BINANCE_REST_GUARD_STATE.get('window_started_at') or 0.0) >= 1.0:
+                _BINANCE_REST_GUARD_STATE['window_started_at'] = now
+                _BINANCE_REST_GUARD_STATE['request_count'] = 0
+            effective_rps = max_requests_per_second
+            if used_weight >= REST_WEIGHT_SLOWDOWN_THRESHOLD:
+                effective_rps = 1
+            if state in {'HALF_OPEN', 'RECOVERING'}:
+                effective_rps = 1
+            if int(_BINANCE_REST_GUARD_STATE.get('request_count') or 0) < effective_rps:
+                _BINANCE_REST_GUARD_STATE['request_count'] = int(_BINANCE_REST_GUARD_STATE.get('request_count') or 0) + 1
+                return
+            sleep_for = max(0.01, 1.0 - (now - float(_BINANCE_REST_GUARD_STATE.get('window_started_at') or now)))
+        time.sleep(sleep_for)
+
+
+def _binance_rest_guard_after_response(response: Any) -> None:
+    used_weight_1m = _extract_response_used_weight_1m(response)
+    status_code = int(getattr(response, 'status_code', 0) or 0)
+    now_ms = _rest_now_ms()
+    with _BINANCE_REST_GUARD_LOCK:
+        if used_weight_1m:
+            _BINANCE_REST_GUARD_STATE['last_used_weight_1m'] = used_weight_1m
+        state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
+        if status_code == 418:
+            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
+            _BINANCE_REST_GUARD_STATE['reason'] = 'http_418_ip_ban'
+            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = now_ms + int(REST_418_COOLDOWN_SECONDS * 1000)
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            return
+        if status_code == 429:
+            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
+            _BINANCE_REST_GUARD_STATE['reason'] = 'http_429_rate_limit'
+            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = now_ms + int(REST_429_COOLDOWN_SECONDS * 1000)
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            return
+        if used_weight_1m >= REST_WEIGHT_CORE_ONLY_THRESHOLD:
+            _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
+            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_core_only_used_weight_1m:{used_weight_1m}'
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 120_000
+        elif used_weight_1m >= REST_WEIGHT_SCANNER_BLOCK_THRESHOLD:
+            _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
+            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_scanner_block_used_weight_1m:{used_weight_1m}'
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 120_000
+        elif used_weight_1m >= REST_WEIGHT_SLOWDOWN_THRESHOLD:
+            _BINANCE_REST_GUARD_STATE['state'] = 'RECOVERING' if state in {'OPEN', 'HALF_OPEN'} else 'DEGRADED'
+            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_slowdown_used_weight_1m:{used_weight_1m}'
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 60_000
+        elif state in {'HALF_OPEN', 'RECOVERING', 'DEGRADED'}:
+            _BINANCE_REST_GUARD_STATE['state'] = 'RECOVERING'
+            _BINANCE_REST_GUARD_STATE['reason'] = 'rest_weight_recovered'
+            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = now_ms + 180_000
+
+
+def _binance_rest_guard_after_error(error: Any, fallback_cooldown_seconds: float = 900.0) -> None:
+    message = str(error)
+    lowered = message.lower()
+    retry_after_ms = _extract_retry_after_ms_from_message(message)
+    if 'binance api error 418' in lowered or 'ip banned' in lowered:
+        with _BINANCE_REST_GUARD_LOCK:
+            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
+            _BINANCE_REST_GUARD_STATE['reason'] = 'binance_418_ip_ban'
+            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_418_COOLDOWN_SECONDS) * 1000)
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+    elif 'binance api error 429' in lowered or 'too many requests' in lowered:
+        with _BINANCE_REST_GUARD_LOCK:
+            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
+            _BINANCE_REST_GUARD_STATE['reason'] = 'binance_429_rate_limit'
+            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_429_COOLDOWN_SECONDS) * 1000)
+            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+
+
 class BinanceFuturesClient:
     RECV_WINDOW_MS = 10_000
 
@@ -111,6 +340,7 @@ class BinanceFuturesClient:
         max_get_retries: int = 3,
         get_retry_sleep_sec: float = 0.5,
         data_base_url: str = '',
+        scanner_proxy_urls: Optional[Sequence[str]] = None,
     ):
         self.base_url = base_url.rstrip('/')
         self.data_base_url = (data_base_url or os.getenv('BINANCE_FUTURES_DATA_BASE_URL', 'https://fapi.binance.com')).rstrip('/')
@@ -119,6 +349,7 @@ class BinanceFuturesClient:
         self.session = session or requests.Session()
         self.max_get_retries = max(1, int(max_get_retries or 1))
         self.get_retry_sleep_sec = max(0.0, float(get_retry_sleep_sec or 0.0))
+        self.scanner_proxy_urls = parse_scanner_proxy_urls(scanner_proxy_urls)
         self._server_time_offset_ms: Optional[int] = None
         if self.api_key:
             self.session.headers.setdefault('X-MBX-APIKEY', self.api_key)
@@ -127,21 +358,30 @@ class BinanceFuturesClient:
         last_exc: Optional[BaseException] = None
         base_url = self.data_base_url if str(path or '').startswith('/futures/data/') else self.base_url
         url = f'{base_url}{path}'
+        response = None
         for attempt in range(self.max_get_retries):
             try:
-                response = self.session.get(url, params=params or {}, timeout=timeout)
+                proxy_url = choose_scanner_proxy_url(self.scanner_proxy_urls)
+                request_kwargs = {'params': params or {}, 'timeout': timeout}
+                if proxy_url:
+                    request_kwargs['proxies'] = {'http': proxy_url, 'https': proxy_url}
+                _binance_rest_guard_before_request(purpose='scanner')
+                response = self.session.get(url, **request_kwargs)
+                _binance_rest_guard_after_response(response)
                 self._raise_for_status(response)
                 return response.json()
             except BinanceAPIError as exc:
                 last_exc = exc
-                if not self._is_retryable_public_get_error(response) or attempt + 1 >= self.max_get_retries:
+                _binance_rest_guard_after_error(exc)
+                if is_binance_ip_ban_error(exc) or response is None or not self._is_retryable_public_get_error(response) or attempt + 1 >= self.max_get_retries:
                     break
-                time.sleep(self.get_retry_sleep_sec * (2 ** attempt))
+                time.sleep(self.get_retry_sleep_sec * (2 ** attempt) + random.uniform(0.0, self.get_retry_sleep_sec))
             except requests.RequestException as exc:
                 last_exc = exc
+                _binance_rest_guard_after_error(exc)
                 if attempt + 1 >= self.max_get_retries:
                     break
-                time.sleep(self.get_retry_sleep_sec * (2 ** attempt))
+                time.sleep(self.get_retry_sleep_sec * (2 ** attempt) + random.uniform(0.0, self.get_retry_sleep_sec))
         if last_exc is not None:
             raise last_exc
         raise BinanceAPIError(f'GET request failed without response: {path}')
@@ -177,6 +417,8 @@ class BinanceFuturesClient:
         signature = hmac.new(self.api_secret.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
         payload['signature'] = signature
         url = f'{self.base_url}{path}'
+        signed_purpose = 'execution' if method in {'POST', 'PUT', 'DELETE'} else 'order_status'
+        _binance_rest_guard_before_request(purpose=signed_purpose)
         if method == 'GET':
             response = self.session.get(url, params=payload, timeout=timeout)
         elif method == 'POST':
@@ -187,7 +429,12 @@ class BinanceFuturesClient:
             response = self.session.delete(url, params=payload, timeout=timeout)
         else:
             raise ValueError(f'unsupported signed method: {method}')
-        self._raise_for_status(response)
+        _binance_rest_guard_after_response(response)
+        try:
+            self._raise_for_status(response)
+        except BinanceAPIError as exc:
+            _binance_rest_guard_after_error(exc)
+            raise
         return response.json()
 
     def _timestamp_ms(self) -> int:
@@ -235,6 +482,68 @@ class BinanceFuturesClient:
             except Exception:
                 payload = response.text
             raise BinanceAPIError(f'Binance API error {response.status_code}: {payload}')
+
+
+def is_binance_ip_ban_error(error: Any) -> bool:
+    message = str(error)
+    lowered = message.lower()
+    return 'binance api error 418' in lowered or 'ip banned' in lowered or "code': -1003" in message or 'code": -1003' in message
+
+
+def extract_binance_ip_ban_until_ms(error: Any) -> Optional[int]:
+    message = str(error)
+    match = re.search(r'banned until\s+(\d{10,})', message, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def current_time_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def build_scanner_rest_circuit_payload(*, reason: str, retry_after_ms: Optional[int], error: str = '', fallback_cooldown_seconds: float = 900.0) -> Dict[str, Any]:
+    opened_at_ms = current_time_ms()
+    payload: Dict[str, Any] = {
+        'state': 'open',
+        'reason': reason,
+        'opened_at_ms': opened_at_ms,
+    }
+    if retry_after_ms is None and fallback_cooldown_seconds > 0:
+        retry_after_ms = opened_at_ms + int(float(fallback_cooldown_seconds) * 1000)
+        payload['fallback_cooldown_seconds'] = float(fallback_cooldown_seconds)
+    if retry_after_ms is not None:
+        payload['retry_after_ms'] = int(retry_after_ms)
+    if error:
+        payload['error'] = error
+    return payload
+
+
+def load_open_scanner_rest_circuit(store: Any) -> Optional[Dict[str, Any]]:
+    try:
+        payload = store.load_json('scanner_rest_circuit_breaker', None)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or str(payload.get('state') or '').lower() != 'open':
+        return None
+    retry_after_ms = _to_float(payload.get('retry_after_ms'), default=0.0)
+    if retry_after_ms > 0 and current_time_ms() < int(retry_after_ms):
+        return payload
+    closed_payload = dict(payload)
+    closed_payload.update({
+        'state': 'closed',
+        'previous_state': 'open',
+        'closed_reason': 'retry_after_elapsed',
+        'closed_at_ms': current_time_ms(),
+    })
+    try:
+        store.save_json('scanner_rest_circuit_breaker', closed_payload)
+    except Exception:
+        pass
+    return None
 
 
 class OKXClient:
@@ -1084,11 +1393,14 @@ async def await_component_with_timeout(awaitable: Any, timeout_seconds: float, *
         return {'ok': False, 'reason': 'deadman_timeout', 'component': component, 'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)}
 
 
-def _deadman_process_target(result_queue: Any, fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+def _deadman_process_target(result_queue: Any, result_path: str, fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
     try:
-        result_queue.put(('result', fn(*args, **kwargs)))
+        payload = ('result', fn(*args, **kwargs))
     except BaseException as exc:  # pragma: no cover - passed through to caller
-        result_queue.put(('exception', exc))
+        payload = ('exception', exc)
+    with open(result_path, 'wb') as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    result_queue.put(('file', result_path))
 
 
 def run_with_deadman_timeout(
@@ -1123,7 +1435,10 @@ def run_with_deadman_timeout(
             raise TypeError(f'{component}:{operation} deadman payload must be pickle-serializable under spawn') from exc
         process_args = (fn, args, kwargs)
     result_queue: Any = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=_deadman_process_target, args=(result_queue, *process_args), name=f'{component}-{operation}-deadman')
+    result_file = tempfile.NamedTemporaryFile(prefix=f'{component}-{operation}-', suffix='.pickle', delete=False)
+    result_path = result_file.name
+    result_file.close()
+    process = ctx.Process(target=_deadman_process_target, args=(result_queue, result_path, *process_args), name=f'{component}-{operation}-deadman')
     record_runtime_heartbeat(store, component=component, status='running', blocked_reason='', extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)})
     process.start()
     process.join(max(float(timeout_seconds or 0.0), 0.001))
@@ -1141,12 +1456,27 @@ def run_with_deadman_timeout(
             extra={'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0), 'process_name': process.name, 'process_exitcode': process.exitcode},
         )
         append_runtime_event(store, 'runtime_deadman_timeout', payload)
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
         return {'ok': False, 'reason': 'deadman_timeout', 'component': component, 'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)}
     if result_queue.empty():
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
         if process.exitcode not in (0, None):
             raise RuntimeError(f'{component}:{operation} deadman worker exited with code {process.exitcode}')
         return None
     kind, payload = result_queue.get()
+    if kind == 'file':
+        with open(payload, 'rb') as fh:
+            kind, payload = pickle.load(fh)
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
     if kind == 'exception':
         raise payload
     record_runtime_heartbeat(store, component=component, status='healthy', blocked_reason='', extra={'operation': operation})
@@ -1727,8 +2057,16 @@ class AutoLoopBookTickerWebsocketMonitorConfig:
 def make_auto_loop_book_ticker_symbol_provider(
     client: BinanceFuturesClient,
     args: argparse.Namespace,
+    store: Optional[RuntimeStateStore] = None,
 ) -> Callable[[], List[str]]:
-    return lambda: resolve_auto_loop_book_ticker_symbols(client, args)
+    def _provide_symbols() -> List[str]:
+        try:
+            return resolve_auto_loop_book_ticker_symbols(client, args, store=store)
+        except TypeError as exc:
+            if "unexpected keyword argument 'store'" not in str(exc):
+                raise
+            return resolve_auto_loop_book_ticker_symbols(client, args)
+    return _provide_symbols
 
 
 def make_auto_loop_book_ticker_health_loader(
@@ -1809,8 +2147,14 @@ def build_auto_loop_book_ticker_websocket_monitor_config(
         health_store_key=health_store_key,
     )
     default_seams = build_auto_loop_book_ticker_monitor_default_seams()
+    try:
+        symbol_provider = make_auto_loop_book_ticker_symbol_provider(client, args, store=store)
+    except TypeError as exc:
+        if "unexpected keyword argument 'store'" not in str(exc):
+            raise
+        symbol_provider = make_auto_loop_book_ticker_symbol_provider(client, args)
     return AutoLoopBookTickerWebsocketMonitorConfig(
-        symbol_provider=make_auto_loop_book_ticker_symbol_provider(client, args),
+        symbol_provider=symbol_provider,
         health_loader=optional_store_seams['health_loader'],
         health_store_key=health_store_key,
         websocket_capability_probe=default_seams['websocket_capability_probe'],
@@ -1846,11 +2190,17 @@ def resolve_auto_loop_book_ticker_symbol_provider(
     client: BinanceFuturesClient,
     args: argparse.Namespace,
     config: AutoLoopBookTickerWebsocketMonitorConfig,
+    store: Optional[RuntimeStateStore] = None,
 ) -> Callable[[], Sequence[str]]:
     symbol_provider = config.symbol_provider
     if symbol_provider is not None:
         return symbol_provider
-    return make_auto_loop_book_ticker_symbol_provider(client, args)
+    try:
+        return make_auto_loop_book_ticker_symbol_provider(client, args, store=store)
+    except TypeError as exc:
+        if "unexpected keyword argument 'store'" not in str(exc):
+            raise
+        return make_auto_loop_book_ticker_symbol_provider(client, args)
 
 
 def resolve_auto_loop_book_ticker_websocket_capability_probe(
@@ -1892,14 +2242,24 @@ def _book_ticker_websocket_supervisor_target(
     store: RuntimeStateStore,
     symbol_provider: Callable[[], Sequence[str]],
     ws_module: Any,
+    generation_id: int,
 ) -> None:
     try:
+        with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+            current_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        if current_generation != int(generation_id):
+            append_runtime_event(store, 'book_ticker_ws_supervisor_generation_exit', {'generation_id': generation_id, 'current_generation_id': current_generation, 'stage': 'before_start'})
+            return
         build_auto_loop_book_ticker_supervisor_summary(
             store=store,
             symbol_provider=symbol_provider,
             ws_module=ws_module,
             max_supervisor_cycles=0,
         )
+        with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+            current_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        if current_generation != int(generation_id):
+            append_runtime_event(store, 'book_ticker_ws_supervisor_generation_exit', {'generation_id': generation_id, 'current_generation_id': current_generation, 'stage': 'after_return'})
     except Exception as exc:
         append_runtime_event(store, 'book_ticker_ws_supervisor_crashed', {
             'event_source': 'book_ticker_websocket',
@@ -1909,6 +2269,8 @@ def _book_ticker_websocket_supervisor_target(
             store,
             status='error',
             symbols=list(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('symbols') or []),
+            reconnect_count=int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('reconnect_count', 0) or 0),
+            subscription_version=int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('subscription_version', 0) or 0),
             last_error=str(exc),
         )
 
@@ -1916,11 +2278,13 @@ def _book_ticker_websocket_supervisor_target(
 def force_close_book_ticker_websocket_supervisor(store: Optional[RuntimeStateStore] = None, *, reason: str = 'forced_restart') -> Dict[str, Any]:
     closed = False
     error = ''
+    thread = None
     with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
         previous_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
         _BOOK_TICKER_WS_SUPERVISOR_STATE['generation_id'] = previous_generation + 1
         _BOOK_TICKER_WS_SUPERVISOR_STATE['force_restart_requested_at'] = _isoformat_utc(_utc_now())
         ws = _BOOK_TICKER_WS_SUPERVISOR_STATE.get('ws')
+        thread = _BOOK_TICKER_WS_SUPERVISOR_STATE.get('thread')
         _BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] = None
         _BOOK_TICKER_WS_SUPERVISOR_STATE['thread_name'] = ''
         _BOOK_TICKER_WS_SUPERVISOR_STATE['started_at'] = ''
@@ -1931,7 +2295,13 @@ def force_close_book_ticker_websocket_supervisor(store: Optional[RuntimeStateSto
             closed = True
         except Exception as exc:
             error = str(exc)
-    payload = {'reason': reason, 'previous_generation_id': previous_generation, 'generation_id': previous_generation + 1, 'closed': closed}
+    joined = False
+    join_timed_out = False
+    if isinstance(thread, threading.Thread) and thread.is_alive():
+        thread.join(timeout=2.0)
+        joined = not thread.is_alive()
+        join_timed_out = not joined
+    payload = {'reason': reason, 'previous_generation_id': previous_generation, 'generation_id': previous_generation + 1, 'closed': closed, 'thread_joined': joined, 'thread_join_timed_out': join_timed_out}
     if error:
         payload['error'] = error
     append_runtime_event(store, 'book_ticker_ws_forced_restart', payload)
@@ -1966,6 +2336,7 @@ def ensure_auto_loop_book_ticker_websocket_supervisor_running(
                 'store': store,
                 'symbol_provider': symbol_provider,
                 'ws_module': ws_module,
+                'generation_id': generation_id,
             },
             name=f'book-ticker-ws-supervisor-g{generation_id}',
             daemon=True,
@@ -2994,6 +3365,67 @@ def cancel_order(client, symbol: str, order_id: Optional[int] = None, client_ord
     return client.signed_post('/fapi/v1/order/cancel', params)
 
 
+def build_protection_client_order_id(symbol: str, position_side: str, runtime_trade_id: Optional[str], kind: str) -> str:
+    raw = f"bm_{str(symbol).upper()}_{normalize_position_side(position_side).lower()}_{str(kind or 'prot')[:4]}_{str(runtime_trade_id or int(time.time() * 1000))}"
+    return ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in raw)[:36]
+
+
+def order_client_id(order: Dict[str, Any]) -> str:
+    return str(order.get('clientOrderId') or order.get('origClientOrderId') or order.get('clientAlgoId') or order.get('algoClientOrderId') or '')
+
+
+def is_protection_order(order: Dict[str, Any]) -> bool:
+    order_type = str(order.get('type') or order.get('origType') or '').upper()
+    algo_type = str(order.get('algoType') or '').upper()
+    client_id = order_client_id(order).lower()
+    return (
+        order_type in {'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET'}
+        or algo_type == 'CONDITIONAL'
+        or client_id.startswith('bm_')
+    )
+
+
+def order_position_key(order: Dict[str, Any]) -> str:
+    side = order.get('positionSide') or (POSITION_SIDE_SHORT if str(order.get('side', '')).upper() == 'BUY' else POSITION_SIDE_LONG)
+    return build_position_key(order.get('symbol'), side)
+
+
+def cancel_protection_order(client: Any, order: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(order.get('symbol') or '')
+    order_id = order.get('orderId') or order.get('algoId')
+    client_id = order_client_id(order) or None
+    return cancel_order(client, symbol, order_id=order_id, client_order_id=client_id)
+
+
+def reconcile_positions_and_orders(client: Any, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
+    positions = fetch_open_positions(client)
+    regular_orders = fetch_open_orders(client)
+    algo_orders = fetch_open_algo_orders(client)
+    open_position_keys = {build_position_key(row.get('symbol'), position_side_from_exchange_position(row)) for row in positions if isinstance(row, dict)}
+    detected: List[Dict[str, Any]] = []
+    cancelled: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for order in list(regular_orders or []) + list(algo_orders or []):
+        if not isinstance(order, dict) or not is_protection_order(order):
+            continue
+        pos_key = order_position_key(order)
+        if pos_key in open_position_keys:
+            continue
+        payload = {'symbol': order.get('symbol'), 'position_key': pos_key, 'orderId': order.get('orderId') or order.get('algoId'), 'clientOrderId': order_client_id(order), 'type': order.get('type') or order.get('origType')}
+        detected.append(payload)
+        append_runtime_event(store, 'orphan_order_detected', payload)
+        try:
+            result = cancel_protection_order(client, order)
+            cancel_payload = {**payload, 'cancel_result': result}
+            cancelled.append(cancel_payload)
+            append_runtime_event(store, 'orphan_order_cancelled', cancel_payload)
+        except Exception as exc:
+            error_payload = {**payload, 'error': str(exc)}
+            errors.append(error_payload)
+            append_runtime_event(store, 'orphan_order_cancel_failed', error_payload)
+    return {'ok': not errors, 'positions': len(positions), 'open_orders': len(list(regular_orders or [])) + len(list(algo_orders or [])), 'orphan_order_detected': len(detected), 'orphan_order_cancelled': len(cancelled), 'errors': errors}
+
+
 def should_send_position_side(client: Any) -> bool:
     return str(getattr(client, 'position_mode', 'HEDGE') or 'HEDGE').upper() != 'ONE_WAY'
 
@@ -3015,7 +3447,7 @@ def mark_one_way_position_mode(client: Any) -> None:
         pass
 
 
-def place_stop_market_order(client, symbol: str, stop_price: float, quantity: float, meta: SymbolMeta, side: str = POSITION_SIDE_LONG):
+def place_stop_market_order(client, symbol: str, stop_price: float, quantity: float, meta: SymbolMeta, side: str = POSITION_SIDE_LONG, runtime_trade_id: Optional[str] = None):
     position_side = normalize_position_side(side)
     order_side = 'BUY' if position_side == POSITION_SIDE_SHORT else 'SELL'
     trigger_price = round_step(stop_price, meta.tick_size, meta.price_precision)
@@ -3027,28 +3459,31 @@ def place_stop_market_order(client, symbol: str, stop_price: float, quantity: fl
         'type': 'STOP_MARKET',
         'triggerPrice': format_decimal(trigger_price, meta.price_precision),
         'quantity': format_decimal(qty, meta.quantity_precision),
+        'reduceOnly': 'true',
+        'newClientOrderId': build_protection_client_order_id(symbol, position_side, runtime_trade_id, 'stop'),
     }
     if should_send_position_side(client):
         params['positionSide'] = position_side
-        params['reduceOnly'] = 'true'
     try:
         return client.signed_post('/fapi/v1/algoOrder', params)
     except Exception as exc:
-        if 'reduceOnly' in params:
+        if is_reduce_only_not_required_error(exc):
             params.pop('reduceOnly', None)
-            try:
-                return client.signed_post('/fapi/v1/algoOrder', params)
-            except Exception as retry_exc:
-                exc = retry_exc
+            return client.signed_post('/fapi/v1/algoOrder', params)
         if not should_send_position_side(client) or not is_position_side_mode_error(exc):
             raise
         mark_one_way_position_mode(client)
         params.pop('positionSide', None)
-        params.pop('reduceOnly', None)
-        return client.signed_post('/fapi/v1/algoOrder', params)
+        try:
+            return client.signed_post('/fapi/v1/algoOrder', params)
+        except Exception as retry_exc:
+            if is_reduce_only_not_required_error(retry_exc):
+                params.pop('reduceOnly', None)
+                return client.signed_post('/fapi/v1/algoOrder', params)
+            raise
 
 
-def place_take_profit_market_order(client, symbol: str, trigger_price: float, quantity: float, meta: SymbolMeta, side: str = POSITION_SIDE_LONG):
+def place_take_profit_market_order(client, symbol: str, trigger_price: float, quantity: float, meta: SymbolMeta, side: str = POSITION_SIDE_LONG, runtime_trade_id: Optional[str] = None):
     position_side = normalize_position_side(side)
     order_side = 'BUY' if position_side == POSITION_SIDE_SHORT else 'SELL'
     trigger_price = round_step(trigger_price, meta.tick_size, meta.price_precision)
@@ -3060,25 +3495,28 @@ def place_take_profit_market_order(client, symbol: str, trigger_price: float, qu
         'type': 'TAKE_PROFIT_MARKET',
         'triggerPrice': format_decimal(trigger_price, meta.price_precision),
         'quantity': format_decimal(qty, meta.quantity_precision),
+        'reduceOnly': 'true',
+        'newClientOrderId': build_protection_client_order_id(symbol, position_side, runtime_trade_id, 'tp'),
     }
     if should_send_position_side(client):
         params['positionSide'] = position_side
-        params['reduceOnly'] = 'true'
     try:
         return client.signed_post('/fapi/v1/algoOrder', params)
     except Exception as exc:
-        if 'reduceOnly' in params:
+        if is_reduce_only_not_required_error(exc):
             params.pop('reduceOnly', None)
-            try:
-                return client.signed_post('/fapi/v1/algoOrder', params)
-            except Exception as retry_exc:
-                exc = retry_exc
+            return client.signed_post('/fapi/v1/algoOrder', params)
         if not should_send_position_side(client) or not is_position_side_mode_error(exc):
             raise
         mark_one_way_position_mode(client)
         params.pop('positionSide', None)
-        params.pop('reduceOnly', None)
-        return client.signed_post('/fapi/v1/algoOrder', params)
+        try:
+            return client.signed_post('/fapi/v1/algoOrder', params)
+        except Exception as retry_exc:
+            if is_reduce_only_not_required_error(retry_exc):
+                params.pop('reduceOnly', None)
+                return client.signed_post('/fapi/v1/algoOrder', params)
+            raise
 
 
 def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeManagementState, action: Dict[str, Any], active_stop_order: Optional[Dict[str, Any]]):
@@ -4543,6 +4981,92 @@ def fetch_order_book(client: BinanceFuturesClient, symbol: str, limit: int = 20)
     return client.get('/fapi/v1/depth', params={'symbol': symbol, 'limit': int(limit or 20)})
 
 
+def _cache_payload_is_fresh(payload: Any, max_age_seconds: float) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    updated_at = _parse_iso8601_utc(payload.get('updated_at') or payload.get('cached_at'))
+    if updated_at is None:
+        return False
+    return max((_utc_now() - updated_at).total_seconds(), 0.0) <= float(max_age_seconds)
+
+
+def load_scan_ticker_cache(store: Optional[RuntimeStateStore], max_age_seconds: float = 10.0) -> List[Dict[str, Any]]:
+    if store is None:
+        return []
+    cache_state = store.load_json('ticker_24hr_cache', {})
+    if isinstance(cache_state, list):
+        return [dict(row) for row in cache_state if isinstance(row, dict)]
+    if not _cache_payload_is_fresh(cache_state, max_age_seconds):
+        return []
+    rows = cache_state.get('tickers') or cache_state.get('rows') or cache_state.get('data')
+    if not isinstance(rows, list):
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def load_scan_kline_cache(store: Optional[RuntimeStateStore], symbol: str, interval: str, limit: int, max_age_seconds: float = 120.0) -> List[List[Any]]:
+    if store is None:
+        return []
+    cache_state = store.load_json('kline_cache', {})
+    if not isinstance(cache_state, dict):
+        return []
+    symbol_state = cache_state.get(str(symbol or '').strip().upper())
+    if not isinstance(symbol_state, dict):
+        return []
+    interval_state = symbol_state.get(str(interval or '').strip())
+    if not _cache_payload_is_fresh(interval_state, max_age_seconds):
+        return []
+    rows = interval_state.get('klines') or interval_state.get('rows') or interval_state.get('data')
+    if not isinstance(rows, list):
+        return []
+    cleaned = [list(row) for row in rows if isinstance(row, (list, tuple))]
+    return cleaned[-max(int(limit or 0), 0):] if limit else cleaned
+
+
+def load_scan_order_book_cache(store: Optional[RuntimeStateStore], symbol: str, max_age_seconds: float = 3.0) -> Dict[str, Any]:
+    if store is None:
+        return {}
+    cache_state = store.load_json('order_book_cache', {})
+    if not isinstance(cache_state, dict):
+        return {}
+    payload = cache_state.get(str(symbol or '').strip().upper())
+    if not _cache_payload_is_fresh(payload, max_age_seconds):
+        return {}
+    order_book = payload.get('order_book') if isinstance(payload.get('order_book'), dict) else payload
+    bids = order_book.get('bids') if isinstance(order_book, dict) else None
+    asks = order_book.get('asks') if isinstance(order_book, dict) else None
+    if not isinstance(bids, list) or not isinstance(asks, list):
+        return {}
+    return {'bids': bids, 'asks': asks}
+
+
+def scanner_rest_fallback_enabled(args: argparse.Namespace) -> bool:
+    if hasattr(args, 'scanner_rest_fallback'):
+        return bool(getattr(args, 'scanner_rest_fallback'))
+    return True
+
+
+def resolve_scan_tickers(client: BinanceFuturesClient, store: Optional[RuntimeStateStore], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    cached = load_scan_ticker_cache(store, max_age_seconds=float(getattr(args, 'scanner_ticker_cache_max_age_seconds', 10.0) or 10.0))
+    if cached:
+        return cached
+    return fetch_tickers(client) if scanner_rest_fallback_enabled(args) else []
+
+
+def resolve_scan_klines(client: BinanceFuturesClient, store: Optional[RuntimeStateStore], args: argparse.Namespace, symbol: str, interval: str, limit: int) -> List[List[Any]]:
+    cached = load_scan_kline_cache(store, symbol, interval, limit, max_age_seconds=float(getattr(args, 'scanner_kline_cache_max_age_seconds', 120.0) or 120.0))
+    if cached:
+        return cached
+    return fetch_klines(client, symbol, interval, limit) if scanner_rest_fallback_enabled(args) else []
+
+
+def resolve_scan_order_book(client: BinanceFuturesClient, store: Optional[RuntimeStateStore], args: argparse.Namespace, symbol: str, limit: int = 20) -> Dict[str, Any]:
+    cached = load_scan_order_book_cache(store, symbol, max_age_seconds=float(getattr(args, 'scanner_order_book_cache_max_age_seconds', 3.0) or 3.0))
+    if cached:
+        return cached
+    return fetch_order_book(client, symbol, limit=limit) if scanner_rest_fallback_enabled(args) else {}
+
+
 def load_book_ticker_cache_snapshot(store: Optional[RuntimeStateStore], symbol: str, max_age_seconds: float = 3.0) -> Optional[Dict[str, Any]]:
     if store is None:
         return None
@@ -4690,13 +5214,13 @@ def append_book_ticker_cache_sample(
         symbol_state['last_event_time'] = int(sample['eventTime'])
     cache_state[symbol_key] = symbol_state
     store.save_json('book_ticker_cache', cache_state)
-    event = append_runtime_event(store, 'book_ticker_ws_sample_written', {
+    event = append_rate_limited_runtime_event(store, 'book_ticker_ws_sample_written', {
         'event_source': 'book_ticker_websocket',
         'symbol': symbol_key,
         'samples_cached': len(samples),
         'event_count': event_count,
         'updated_at': updated_at,
-    })
+    }, key=symbol_key, min_interval_seconds=60.0)
     return {
         'symbol': symbol_key,
         'samples_cached': len(samples),
@@ -4706,7 +5230,7 @@ def append_book_ticker_cache_sample(
     }
 
 
-def process_book_ticker_stream_message(store: RuntimeStateStore, message: Any, max_samples: int = 20) -> Optional[Dict[str, Any]]:
+def extract_book_ticker_stream_sample(message: Any) -> Optional[Dict[str, Any]]:
     payload = message
     if isinstance(message, str):
         try:
@@ -4725,7 +5249,96 @@ def process_book_ticker_stream_message(store: RuntimeStateStore, message: Any, m
     normalized = normalize_book_ticker_payload(data)
     if normalized is None:
         return None
-    return append_book_ticker_cache_sample(store, normalized['symbol'], data, max_samples=max_samples)
+    return normalized
+
+
+def process_book_ticker_stream_message(store: RuntimeStateStore, message: Any, max_samples: int = 20) -> Optional[Dict[str, Any]]:
+    normalized = extract_book_ticker_stream_sample(message)
+    if normalized is None:
+        return None
+    return append_book_ticker_cache_sample(store, normalized['symbol'], normalized['sample'], max_samples=max_samples)
+
+
+def flush_book_ticker_cache_samples(
+    store: RuntimeStateStore,
+    pending_samples: Sequence[Dict[str, Any]],
+    max_samples: int = 20,
+) -> Dict[str, Any]:
+    valid_samples: List[Dict[str, Any]] = []
+    for row in list(pending_samples or []):
+        if not isinstance(row, dict):
+            continue
+        symbol_key = str(row.get('symbol') or '').strip().upper()
+        sample = row.get('sample') if isinstance(row.get('sample'), dict) else None
+        if not symbol_key or not sample:
+            continue
+        valid_samples.append({'symbol': symbol_key, 'sample': sample})
+    if not valid_samples:
+        return {'symbols_updated': 0, 'samples_flushed': 0, 'events_written': 0}
+
+    cache_state = store.load_json('book_ticker_cache', {})
+    if not isinstance(cache_state, dict):
+        cache_state = {}
+    ring_size = max(int(max_samples or 0), 1)
+    symbols_updated = set()
+    last_event_payloads: Dict[str, Dict[str, Any]] = {}
+    for row in valid_samples:
+        symbol_key = row['symbol']
+        sample = row['sample']
+        symbol_state = cache_state.get(symbol_key, {})
+        if not isinstance(symbol_state, dict):
+            symbol_state = {}
+        prior_samples = symbol_state.get('samples', [])
+        if not isinstance(prior_samples, list):
+            prior_samples = []
+        samples = [dict(item) for item in prior_samples if isinstance(item, dict) and item]
+        samples.append({key: value for key, value in sample.items() if key in {'bidPrice', 'askPrice', 'bidQty', 'askQty'}})
+        samples = samples[-ring_size:]
+        event_count = int(symbol_state.get('event_count', 0) or 0) + 1
+        updated_at = _isoformat_utc(_utc_now())
+        symbol_state.update({
+            'updated_at': updated_at,
+            'samples': samples,
+            'last_bid': sample.get('bidPrice'),
+            'last_ask': sample.get('askPrice'),
+            'last_bid_qty': sample.get('bidQty'),
+            'last_ask_qty': sample.get('askQty'),
+            'event_count': event_count,
+            'source': 'websocket',
+        })
+        if sample.get('eventTime'):
+            symbol_state['last_event_time'] = int(sample['eventTime'])
+        cache_state[symbol_key] = symbol_state
+        symbols_updated.add(symbol_key)
+        last_event_payloads[symbol_key] = {
+            'event_source': 'book_ticker_websocket',
+            'symbol': symbol_key,
+            'samples_cached': len(samples),
+            'event_count': event_count,
+            'updated_at': updated_at,
+        }
+
+    store.save_json('book_ticker_cache', cache_state)
+    for payload in last_event_payloads.values():
+        append_rate_limited_runtime_event(
+            store,
+            'book_ticker_ws_sample_written',
+            payload,
+            key=str(payload.get('symbol') or 'global'),
+            min_interval_seconds=60.0,
+        )
+    flush_event = append_rate_limited_runtime_event(store, 'book_ticker_ws_samples_flushed', {
+        'event_source': 'book_ticker_websocket',
+        'symbols_updated': len(symbols_updated),
+        'samples_flushed': len(valid_samples),
+        'flush_mode': 'batch',
+    }, key='batch', min_interval_seconds=60.0)
+    events_written = len([row for row in last_event_payloads.values() if row]) + (1 if flush_event else 0)
+    return {
+        'symbols_updated': len(symbols_updated),
+        'samples_flushed': len(valid_samples),
+        'events_written': events_written,
+    }
 
 
 def run_book_ticker_cache_monitor_cycle(
@@ -4739,17 +5352,28 @@ def run_book_ticker_cache_monitor_cycle(
     timeout_exc = getattr(ws_module, 'WebSocketTimeoutException', TimeoutError)
     socket_exc = getattr(ws_module, 'WebSocketException', Exception)
     ws.settimeout(float(recv_timeout_seconds))
-    append_runtime_event(store, 'book_ticker_ws_connected', {
+    append_rate_limited_runtime_event(store, 'book_ticker_ws_connected', {
         'event_source': 'book_ticker_websocket',
         'recv_timeout_seconds': float(recv_timeout_seconds),
         'max_messages': int(max_messages or 0),
-    })
+    }, key='monitor_cycle', min_interval_seconds=60.0)
     messages_processed = 0
     samples_written = 0
+    pending_samples: List[Dict[str, Any]] = []
+
+    def flush_pending() -> Dict[str, Any]:
+        nonlocal pending_samples
+        if not pending_samples:
+            return {'symbols_updated': 0, 'samples_flushed': 0, 'events_written': 0}
+        result = flush_book_ticker_cache_samples(store, pending_samples, max_samples=max_samples)
+        pending_samples = []
+        return result
+
     for _ in range(max(int(max_messages or 0), 1)):
         try:
             message = ws.recv()
         except timeout_exc:
+            flush_pending()
             return {
                 'status': 'idle_timeout' if messages_processed <= 0 else 'healthy',
                 'messages_processed': messages_processed,
@@ -4757,6 +5381,7 @@ def run_book_ticker_cache_monitor_cycle(
                 'zero_message_timeout': messages_processed <= 0,
             }
         except socket_exc as exc:
+            flush_pending()
             try:
                 ws.close()
             finally:
@@ -4772,11 +5397,13 @@ def run_book_ticker_cache_monitor_cycle(
                 'samples_written': samples_written,
                 'error': str(exc),
             }
-        result = process_book_ticker_stream_message(store, message, max_samples=max_samples)
+        result = extract_book_ticker_stream_sample(message)
         if result is None:
             continue
+        pending_samples.append(result)
         messages_processed += 1
         samples_written += 1
+    flush_pending()
     return {
         'status': 'healthy',
         'messages_processed': messages_processed,
@@ -5121,6 +5748,7 @@ def collect_book_ticker_samples(
     interval_ms: int = 150,
     store: Optional[RuntimeStateStore] = None,
     cache_max_age_seconds: float = 3.0,
+    allow_rest_fallback: bool = True,
 ) -> List[Dict[str, Any]]:
     cached_samples = load_book_ticker_cache_samples(store, symbol, sample_count=sample_count, max_age_seconds=cache_max_age_seconds)
     if cached_samples:
@@ -5131,6 +5759,15 @@ def collect_book_ticker_samples(
             'cache_max_age_seconds': float(cache_max_age_seconds),
         })
         return cached_samples
+    if not allow_rest_fallback:
+        append_rate_limited_runtime_event(store, 'book_ticker_cache_miss', {
+            'event_source': 'book_ticker_cache',
+            'symbol': symbol,
+            'requested_sample_count': max(int(sample_count or 0), 0),
+            'cache_max_age_seconds': float(cache_max_age_seconds),
+            'fallback': 'disabled',
+        }, key=f'{symbol}:disabled', min_interval_seconds=60.0)
+        return []
     if not hasattr(client, 'get'):
         return []
     append_rate_limited_runtime_event(store, 'book_ticker_cache_miss', {
@@ -5477,7 +6114,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
 
     square_symbols = list(explicit_square_symbols or load_manual_square_symbols(args))
     metas = fetch_exchange_meta(client)
-    tickers = fetch_tickers(client)
+    tickers = resolve_scan_tickers(client, store, args)
     merged_payload = merged_candidate_symbols(
         square_symbols=square_symbols,
         tickers=tickers,
@@ -5491,13 +6128,17 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         merged_symbols, hot_rank_map, gainer_rank_map = merged_payload
         loser_rank_map = {}
     raw_merged_symbol_count = len(merged_symbols)
+    max_candidates = int(getattr(args, 'max_candidates', 8) or 8)
+    prefilter_multiplier = max(1, int(getattr(args, 'scan_prefilter_multiplier', 2) or 2))
+    prefilter_limit = max(max_candidates, max_candidates * prefilter_multiplier)
+    merged_symbols = merged_symbols[:prefilter_limit]
     okx_unavailable_symbols: List[str] = []
     okx_available_inst_count = 0
     ticker_map = {row['symbol']: row for row in tickers}
 
     regime_payload = compute_market_regime_filter(
-        btc_klines=fetch_klines(client, 'BTCUSDT', '15m', 30) if client else None,
-        sol_klines=fetch_klines(client, 'SOLUSDT', '15m', 30) if client else None,
+        btc_klines=resolve_scan_klines(client, store, args, 'BTCUSDT', '15m', 30) if client else None,
+        sol_klines=resolve_scan_klines(client, store, args, 'SOLUSDT', '15m', 30) if client else None,
     )
 
     rejected_events: List[Dict[str, Any]] = []
@@ -5505,8 +6146,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     candidates: List[Candidate] = []
     built_candidates: List[Candidate] = []
     candidate_alerts: List[Dict[str, Any]] = []
-    max_candidates = int(getattr(args, 'max_candidates', 8) or 8)
-    evaluated_symbols = merged_symbols[: max(max_candidates * 2, max_candidates)]
+    evaluated_symbols = merged_symbols[: max(max_candidates * prefilter_multiplier, max_candidates)]
     allowed_trade_sides = resolve_allowed_trade_sides(getattr(args, 'allowed_trade_sides', 'long,short'))
     evaluated_side_count = 0
     for symbol in evaluated_symbols:
@@ -5514,17 +6154,17 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         ticker = ticker_map.get(symbol)
         if not meta or not ticker:
             continue
-        klines_5m = fetch_klines(client, symbol, '5m', max(getattr(args, 'lookback_bars', 12) + 30, 40))
-        klines_15m = fetch_klines(client, symbol, '15m', 40)
-        klines_1h = fetch_klines(client, symbol, '1h', 40)
-        klines_4h = fetch_klines(client, symbol, '4h', 40)
+        klines_5m = resolve_scan_klines(client, store, args, symbol, '5m', max(getattr(args, 'lookback_bars', 12) + 30, 40))
+        klines_15m = resolve_scan_klines(client, store, args, symbol, '15m', 40)
+        klines_1h = resolve_scan_klines(client, store, args, symbol, '1h', 40)
+        klines_4h = resolve_scan_klines(client, store, args, symbol, '4h', 40)
         funding_rates = fetch_funding_rates(client, symbol, limit=3)
         funding_rate = funding_rates[-1] if funding_rates else None
         funding_rate_avg = sum(funding_rates) / len(funding_rates) if funding_rates else None
         oi_history = fetch_open_interest_hist(client, symbol, period='5m', limit=30)
         top_ratio = fetch_top_account_long_short_ratio(client, symbol, period='5m', limit=10)
-        order_book = fetch_order_book(client, symbol, limit=20)
-        book_ticker_samples = collect_book_ticker_samples(client, symbol, sample_count=6, interval_ms=150, store=store)
+        order_book = resolve_scan_order_book(client, store, args, symbol, limit=20)
+        book_ticker_samples = collect_book_ticker_samples(client, symbol, sample_count=6, interval_ms=150, store=store, allow_rest_fallback=bool(getattr(args, 'book_ticker_rest_fallback', False)))
         micro = derive_microstructure_inputs(
             oi_history=oi_history,
             taker_5m=klines_5m[-1] if klines_5m else [],
@@ -5821,6 +6461,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--top-gainers', type=int, default=20)
     parser.add_argument('--top-losers', type=int, default=20)
     parser.add_argument('--max-candidates', type=int, default=8)
+    parser.add_argument('--scan-prefilter-multiplier', type=int, default=2, help='Prefilter expensive per-symbol scanner fetches to max_candidates * multiplier.')
     parser.add_argument('--lookback-bars', type=int, default=12)
     parser.add_argument('--swing-bars', type=int, default=6)
     parser.add_argument('--risk-usdt', type=float, default=10.0)
@@ -5869,6 +6510,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--user-stream-refresh-interval-minutes', type=float, default=30.0, help='Refresh listen key after this many minutes.')
     parser.add_argument('--user-stream-disconnect-timeout-minutes', type=float, default=65.0, help='Mark user data stream disconnected when refresh heartbeat is older than this many minutes.')
     parser.add_argument('--base-url', default=os.getenv('BINANCE_FUTURES_BASE_URL', 'https://fapi.binance.com'))
+    parser.add_argument('--scanner-proxy-urls', default=os.getenv('BINANCE_SCANNER_PROXY_URLS', ''), help='Comma or whitespace separated proxy URLs used only by public scanner REST fetches; supports socks5://host:port:user:pass and socks5://user:pass@host:port.')
     parser.add_argument('--okx-sentiment-inline', default='')
     parser.add_argument('--okx-sentiment-file', default='')
     parser.add_argument('--okx-sentiment-command', default='')
@@ -5886,6 +6528,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-scan-cycles', type=int, default=1, help='Maximum scan cycles when auto-loop is enabled. Set 0 for infinite loop.')
     parser.add_argument('--scanner-timeout-seconds', type=float, default=45.0, help='Deadman timeout for one scanner cycle.')
     parser.add_argument('--execution-timeout-seconds', type=float, default=30.0, help='Deadman timeout for live order execution.')
+    parser.add_argument('--scanner-rest-ban-cooldown-seconds', type=float, default=180.0, help='Fallback REST scanner circuit cooldown when Binance 418/-1003 does not include a ban-until timestamp.')
+    parser.add_argument('--position-order-reconcile-interval-seconds', type=float, default=60.0, help='Seconds between background position/order reconciliation checks.')
+    parser.add_argument('--scanner-rest-fallback', action='store_true', help='Allow scanner ticker/kline/depth REST fallback when websocket runtime caches are empty or stale.')
+    parser.add_argument('--scanner-ticker-cache-max-age-seconds', type=float, default=10.0)
+    parser.add_argument('--scanner-kline-cache-max-age-seconds', type=float, default=120.0)
+    parser.add_argument('--scanner-order-book-cache-max-age-seconds', type=float, default=3.0)
     parser.add_argument('--runtime-ttl-seconds', type=float, default=900.0, help='TTL for per-symbol runtime cache cleanup.')
     parser.add_argument('--runtime-queue-maxsize', type=int, default=128, help='Max queue depth for scanner/execution/manager isolation queues.')
     parser.add_argument('--supervisor-restart-limit', type=int, default=3, help='Consecutive auto-loop cycle failures before supervisor halts.')
@@ -5947,10 +6595,12 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'repair_missing_protection': True,
         'scanner_timeout_seconds': 45.0,
         'execution_timeout_seconds': 30.0,
+        'scanner_rest_ban_cooldown_seconds': 180.0,
         'runtime_ttl_seconds': 900.0,
         'runtime_queue_maxsize': 128,
         'supervisor_restart_limit': 3,
         'output_format': 'cn',
+        'scanner_proxy_urls': os.getenv('BINANCE_SCANNER_PROXY_URLS', ''),
         'allowed_trade_sides': 'long,short',
         'enable_symbol_quality_tier': False,
         'enable_market_regime_gate': False,
@@ -7143,7 +7793,7 @@ def start_trade_monitor_thread(client: Any, symbol: str, meta: SymbolMeta, args:
     )
 
 
-def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: argparse.Namespace) -> List[str]:
+def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: argparse.Namespace, store: Optional[RuntimeStateStore] = None) -> List[str]:
     top_gainers = int(getattr(args, 'top_gainers', 20) or 20)
     top_losers = int(getattr(args, 'top_losers', top_gainers) or 0)
     try:
@@ -7179,7 +7829,10 @@ def resolve_auto_loop_book_ticker_symbols(client: BinanceFuturesClient, args: ar
     external_signal_map_symbols = _normalize_allowed_symbol_list(((external_signal_payload or {}).get('signal_map') or {}).keys())
 
     try:
-        tickers = fetch_tickers(client)
+        if store is None:
+            tickers = fetch_tickers(client)
+        else:
+            tickers = resolve_scan_tickers(client, store, args)
     except Exception:
         tickers = []
     merged_payload = merged_candidate_symbols(
@@ -7444,6 +8097,17 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         except Exception:
             pass
 
+    open_circuit = load_open_scanner_rest_circuit(store)
+    if open_circuit is not None:
+        cycle = {
+            'scan': {'ok': False, 'blocked_reason': 'binance_ip_ban_circuit_open', 'circuit_breaker': open_circuit},
+            'blocked_reason': 'binance_ip_ban_circuit_open',
+        }
+        record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='binance_ip_ban_circuit_open', extra=cycle['scan'])
+        append_runtime_event(store, 'scanner_blocked', {'blocked_reason': 'binance_ip_ban_circuit_open', 'circuit_breaker': open_circuit})
+        persist_cycle_snapshot(cycle)
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'binance_ip_ban_circuit_open'}}
+
     if binance_simulated_trading:
         reconcile = {
             'ok': True,
@@ -7483,6 +8147,25 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
                     'positions_missing_protection': [],
                     'protection_repairs': [],
                 }
+            elif is_binance_ip_ban_error(exc):
+                message = str(exc)
+                retry_after_ms = extract_binance_ip_ban_until_ms(message)
+                circuit_payload = build_scanner_rest_circuit_payload(
+                    reason='binance_ip_ban',
+                    retry_after_ms=retry_after_ms,
+                    error=message,
+                    fallback_cooldown_seconds=float(getattr(args, 'scanner_rest_ban_cooldown_seconds', 180.0) or 0.0),
+                )
+                store.save_json('scanner_rest_circuit_breaker', circuit_payload)
+                cycle = {
+                    'reconcile': {'ok': False, 'blocked_reason': 'binance_ip_ban', 'error': message, 'retry_after_ms': retry_after_ms},
+                    'scan': {'ok': False, 'blocked_reason': 'binance_ip_ban', 'circuit_breaker': circuit_payload},
+                    'blocked_reason': 'binance_ip_ban',
+                }
+                record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='binance_ip_ban', extra=cycle['scan'])
+                append_runtime_event(store, 'scanner_blocked', {'blocked_reason': 'binance_ip_ban', 'error': message, 'retry_after_ms': retry_after_ms})
+                persist_cycle_snapshot(cycle)
+                return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'binance_ip_ban'}}
             else:
                 raise
     if getattr(args, 'reconcile_only', False):
@@ -7908,10 +8591,57 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     store = store or get_runtime_state_store(args)
     scanner_timeout_seconds = float(getattr(args, 'scanner_timeout_seconds', 45.0) or 45.0)
     cleanup_symbol_runtime_state_ttl(store, ttl_seconds=float(getattr(args, 'runtime_ttl_seconds', 900.0) or 900.0))
+    rest_snapshot = _binance_rest_guard_snapshot()
+    ws_market_state_age_ms = None
+    if isinstance(websocket_status, dict):
+        candidates = [websocket_status.get('last_message_at_ms'), websocket_status.get('updated_at_ms'), websocket_status.get('last_update_at_ms')]
+        for value in candidates:
+            try:
+                if value:
+                    ws_market_state_age_ms = max(0, int(time.time() * 1000) - int(float(value)))
+                    break
+            except Exception:
+                continue
+    if str(rest_snapshot.get('state') or '').upper() in {'OPEN', 'HALF_OPEN', 'DEGRADED'} and int(rest_snapshot.get('next_retry_after_seconds') or 0) > 0:
+        blocked_payload = {
+            'ok': False,
+            'degraded': True,
+            'blocked_reason': 'binance_rest_circuit_open',
+            'scanner_degraded_wait': True,
+            'rest_used_weight_1m': rest_snapshot.get('rest_used_weight_1m'),
+            'rest_circuit_state': rest_snapshot.get('state'),
+            'rest_circuit_reason': rest_snapshot.get('reason'),
+            'next_rest_probe_at': rest_snapshot.get('next_rest_probe_at_ms'),
+            'next_retry_after_seconds': rest_snapshot.get('next_retry_after_seconds'),
+            'ws_market_state_age_ms': ws_market_state_age_ms,
+        }
+        cycle: Dict[str, Any] = {'scan': blocked_payload, 'blocked_reason': 'binance_rest_circuit_open', 'reconcile': {'ok': True, 'skipped': True, 'skip_reason': 'rest_circuit_open'}}
+        if cycle_no is not None:
+            cycle['cycle_no'] = cycle_no
+        if websocket_status is not None:
+            cycle['book_ticker_websocket'] = websocket_status
+        record_runtime_heartbeat(store, component='scanner', status='degraded_wait', blocked_reason='binance_rest_circuit_open', extra=blocked_payload)
+        append_runtime_event(store, 'scanner_degraded_wait', blocked_payload)
+        return {'ok': True, 'cycle': cycle, 'scanner_degraded_wait': True, 'scan_delay_multiplier': max(3.0, float(blocked_payload['next_retry_after_seconds'] or 0) / max(1.0, float(getattr(args, 'poll_interval_sec', 60) or 60))), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'DEGRADED', 'reason': 'binance_rest_circuit_open'}}
     binance_simulated_trading = is_binance_simulated_trading(args)
     execution_exchange = execution_exchange_label(args)
+    reconcile_interval_seconds = max(900.0, float(getattr(args, 'position_order_reconcile_interval_seconds', 1200.0) or 1200.0))
+    reconcile_cursor = store.load_json('scanner_reconcile_cursor', {})
+    if not isinstance(reconcile_cursor, dict):
+        reconcile_cursor = {}
+    last_scanner_reconcile_at = float(reconcile_cursor.get('last_full_reconcile_at_monotonic') or 0.0)
+    if last_scanner_reconcile_at <= 0.0:
+        last_scanner_reconcile_at = time.monotonic()
+    scanner_reconcile_cursor_update: Optional[Dict[str, Any]] = None
+    due_scanner_full_reconcile = (time.monotonic() - last_scanner_reconcile_at) >= reconcile_interval_seconds
     if binance_simulated_trading:
         reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'binance_simulated_trading', 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
+    elif not due_scanner_full_reconcile:
+        reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'scanner_rest_full_reconcile_not_due', 'mode': 'ws_local_lightweight', 'interval_seconds': reconcile_interval_seconds, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
+    elif str(_binance_rest_guard_snapshot().get('state') or '').upper() in {'OPEN', 'HALF_OPEN', 'DEGRADED'}:
+        rest_snapshot_for_reconcile = _binance_rest_guard_snapshot()
+        reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'rest_circuit_open', 'skipped_rest_reconcile_due_to_circuit': True, 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': [], 'rest_circuit': rest_snapshot_for_reconcile}
+        append_runtime_event(store, 'skipped_rest_reconcile_due_to_circuit', {'component': 'scanner', **rest_snapshot_for_reconcile})
     else:
         try:
             try:
@@ -7925,14 +8655,56 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
                 reconcile = {'ok': True, 'skipped': True, 'skip_reason': 'missing_api_secret', 'orphan_positions': [], 'positions_missing_protection': [], 'protection_repairs': []}
             else:
                 raise
+        if isinstance(reconcile, dict) and reconcile.get('ok', True):
+            scanner_reconcile_cursor_update = {'last_full_reconcile_at_monotonic': time.monotonic(), 'updated_at': _isoformat_utc(_utc_now())}
     cycle: Dict[str, Any] = {'reconcile': reconcile}
+    if scanner_reconcile_cursor_update:
+        cycle['scanner_reconcile_cursor_update'] = scanner_reconcile_cursor_update
     if cycle_no is not None:
         cycle['cycle_no'] = cycle_no
     if websocket_status is not None:
         cycle['book_ticker_websocket'] = websocket_status
     if getattr(args, 'reconcile_only', False) or not reconcile.get('ok', True):
         return {'ok': bool(reconcile.get('ok', True)), 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'reconcile': reconcile}}
-    scan_call_result = run_with_deadman_timeout(run_scan_once, client, args, timeout_seconds=scanner_timeout_seconds, store=store, component='scanner', operation='scan_cycle')
+    open_circuit = load_open_scanner_rest_circuit(store)
+    if open_circuit is not None:
+        blocked_payload = {
+            'ok': False,
+            'blocked_reason': 'binance_ip_ban_circuit_open',
+            'circuit_breaker': open_circuit,
+        }
+        cycle['scan'] = blocked_payload
+        cycle['blocked_reason'] = 'binance_ip_ban_circuit_open'
+        record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='binance_ip_ban_circuit_open', extra=blocked_payload)
+        append_runtime_event(store, 'scanner_blocked', {'blocked_reason': 'binance_ip_ban_circuit_open', 'circuit_breaker': open_circuit})
+        return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'binance_ip_ban_circuit_open'}}
+    try:
+        scan_call_result = run_with_deadman_timeout(run_scan_once, client, args, timeout_seconds=scanner_timeout_seconds, store=store, component='scanner', operation='scan_cycle')
+    except BinanceAPIError as exc:
+        message = str(exc)
+        if is_binance_ip_ban_error(message):
+            retry_after_ms = extract_binance_ip_ban_until_ms(message)
+            blocked_payload = {
+                'ok': False,
+                'blocked_reason': 'binance_ip_ban',
+                'error': message,
+            }
+            if retry_after_ms is not None:
+                blocked_payload['retry_after_ms'] = retry_after_ms
+            circuit_payload = build_scanner_rest_circuit_payload(
+                reason='binance_ip_ban',
+                retry_after_ms=retry_after_ms,
+                error=message,
+                fallback_cooldown_seconds=float(getattr(args, 'scanner_rest_ban_cooldown_seconds', 180.0) or 0.0),
+            )
+            store.save_json('scanner_rest_circuit_breaker', circuit_payload)
+            blocked_payload['circuit_breaker'] = circuit_payload
+            cycle['scan'] = blocked_payload
+            cycle['blocked_reason'] = 'binance_ip_ban'
+            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='binance_ip_ban', extra=blocked_payload)
+            append_runtime_event(store, 'scanner_blocked', {'blocked_reason': 'binance_ip_ban', 'error': message, 'retry_after_ms': retry_after_ms})
+            return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'binance_ip_ban'}}
+        raise
     if isinstance(scan_call_result, dict) and scan_call_result.get('reason') == 'deadman_timeout':
         cycle['scan'] = {'ok': False, 'blocked_reason': 'scanner_timeout', 'deadman': scan_call_result}
         cycle['blocked_reason'] = 'scanner_timeout'
@@ -8071,6 +8843,10 @@ def build_backpressure_policy(component: str, reason: str, item: Optional[Dict[s
     }
 
 
+CRITICAL_MANAGER_UPDATE_KINDS = frozenset({'execution_result', 'execution_error', 'position_opened', 'state_transition', 'event_updates'})
+COALESCABLE_RUNTIME_EVENT_TYPES = frozenset({'scan_cycle_summary', 'cycle_summary', 'scanner_heartbeat', 'heartbeat_metrics'})
+
+
 def is_coalescable_manager_update(item: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(item, dict) or item.get('kind') != 'manager_update':
         return False
@@ -8078,7 +8854,19 @@ def is_coalescable_manager_update(item: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(update, dict):
         return False
     kind = str(update.get('kind') or update.get('state') or '').lower()
-    return kind in {'cycle', 'scan_cycle', 'runtime_event', 'heartbeat', 'metrics', 'scan'} or bool(update.get('cycle'))
+    if kind in CRITICAL_MANAGER_UPDATE_KINDS:
+        return False
+    if kind in {'cycle', 'scan_cycle', 'scan_summary', 'cycle_summary', 'scan'}:
+        return True
+    if kind == 'runtime_event':
+        event_type = str(update.get('event_type') or '').lower()
+        return event_type in COALESCABLE_RUNTIME_EVENT_TYPES
+    cycle = update.get('cycle')
+    if isinstance(cycle, dict):
+        cycle_kind = str(cycle.get('kind') or cycle.get('state') or '').lower()
+        event_type = str(cycle.get('event_type') or '').lower()
+        return cycle_kind in {'cycle', 'scan_cycle', 'scan_summary', 'cycle_summary', 'scan'} or event_type in COALESCABLE_RUNTIME_EVENT_TYPES
+    return False
 
 
 def coalesce_manager_queue_update(queue: asyncio.Queue, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -8150,10 +8938,29 @@ async def event_loop_latency_task(store: RuntimeStateStore, stop_event: asyncio.
 
 
 async def position_manager_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
+    full_reconcile_interval = max(900.0, float(getattr(args, 'position_order_reconcile_interval_seconds', 1200.0) or 1200.0))
+    lightweight_reconcile_interval = 60.0
+    last_full_reconcile_at = time.monotonic()
+    last_lightweight_reconcile_at = 0.0
     while not stop_event.is_set() or not queues['position_manager'].empty():
         try:
             item = await asyncio.wait_for(queues['position_manager'].get(), timeout=1.0)
         except asyncio.TimeoutError:
+            now = time.monotonic()
+            if now - last_lightweight_reconcile_at >= lightweight_reconcile_interval:
+                last_lightweight_reconcile_at = now
+                append_runtime_event(store, 'position_order_lightweight_reconciliation', {'ok': True, 'mode': 'ws_local', 'rest_used': False, 'rest_circuit': _binance_rest_guard_snapshot()})
+            if now - last_full_reconcile_at >= full_reconcile_interval:
+                last_full_reconcile_at = now
+                rest_snapshot = _binance_rest_guard_snapshot()
+                if str(rest_snapshot.get('state') or '').upper() in {'OPEN', 'HALF_OPEN', 'DEGRADED'}:
+                    append_runtime_event(store, 'skipped_rest_reconcile_due_to_circuit', {'ok': True, 'skipped_rest_reconcile_due_to_circuit': True, 'rest_used_weight_1m': rest_snapshot.get('rest_used_weight_1m'), 'rest_circuit_state': rest_snapshot.get('state'), 'rest_circuit_reason': rest_snapshot.get('reason'), 'next_rest_probe_at': rest_snapshot.get('next_rest_probe_at_ms')})
+                else:
+                    try:
+                        reconcile = await asyncio.wait_for(asyncio.to_thread(reconcile_positions_and_orders, client, store), timeout=float(getattr(args, 'execution_timeout_seconds', 15.0) or 15.0))
+                        append_runtime_event(store, 'position_order_reconciliation', dict(reconcile, mode='rest_full', rest_circuit=_binance_rest_guard_snapshot()))
+                    except Exception as exc:
+                        append_runtime_event(store, 'position_order_reconciliation_failed', {'error': str(exc), 'rest_circuit': _binance_rest_guard_snapshot()})
             record_runtime_heartbeat(store, component='position_manager', status='idle', blocked_reason='', queue_depth=queues['position_manager'].qsize(), queue_maxsize=queues['position_manager'].maxsize)
             continue
         try:
@@ -8184,15 +8991,39 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
                 component='scanner',
                 operation='resident_scan_only_cycle',
             )
+            if scan_result is None:
+                scan_result = {
+                    'ok': True,
+                    'cycle': {
+                        'cycle_no': cycle_no,
+                        'blocked_reason': 'scanner_timeout',
+                        'scan': {'ok': False, 'blocked_reason': 'scanner_timeout'},
+                    },
+                    'manager_update': {
+                        'kind': 'cycle',
+                        'cycle': {
+                            'cycle_no': cycle_no,
+                            'blocked_reason': 'scanner_timeout',
+                            'scan': {'ok': False, 'blocked_reason': 'scanner_timeout'},
+                        },
+                        'state': 'SCAN',
+                        'reason': 'scanner_timeout',
+                    },
+                }
             cycle = scan_result.get('cycle') if isinstance(scan_result, dict) else {}
+            if not isinstance(cycle, dict):
+                cycle = {}
             scan_delay_multiplier = 1.0
+            if isinstance(scan_result, dict) and scan_result.get('scanner_degraded_wait'):
+                scan_delay_multiplier = max(scan_delay_multiplier, float(scan_result.get('scan_delay_multiplier') or 3.0))
             if isinstance(scan_result, dict) and scan_result.get('execution_request'):
                 execution_item = {'kind': 'execution_request', 'cycle_no': cycle_no, 'request': scan_result['execution_request']}
                 policy = build_backpressure_policy('scanner', 'execution_queue_full', scan_result['execution_request'])
                 candidate_score = float(scan_result['execution_request'].get('candidate_score', getattr(scan_result['execution_request'].get('candidate'), 'score', 1.0)) or 0.0)
                 min_candidate_score = float(policy.get('min_candidate_score', 0.2) or 0.2)
                 if policy.get('drop_candidate') and (queues['execution'].full() or candidate_score < min_candidate_score):
-                    append_runtime_event(store, 'runtime_candidate_dropped_by_backpressure', {'cycle_no': cycle_no, 'policy': policy, 'reason': 'execution_queue_full' if queues['execution'].full() else 'candidate_score_below_backpressure_minimum', 'candidate_score': candidate_score})
+                    drop_payload = {'cycle_no': cycle_no, 'policy': policy, 'reason': 'execution_queue_full' if queues['execution'].full() else 'candidate_score_below_backpressure_minimum', 'candidate_score': candidate_score}
+                    await apply_queue_backpressure(queues['manager'], store=store, component='scanner', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': cycle_no, 'update': {'kind': 'event_updates', 'events': [{'event_type': 'runtime_candidate_dropped_by_backpressure', 'payload': drop_payload}]}})
                     scan_delay_multiplier = max(scan_delay_multiplier, float(policy.get('scan_delay_multiplier', 1.0) or 1.0))
                 else:
                     bp_result = await apply_queue_backpressure(queues['execution'], store=store, component='scanner', reason='execution_queue_full', item=execution_item)
@@ -8202,9 +9033,19 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
                 bp_result = await apply_queue_backpressure(queues['manager'], store=store, component='scanner', reason='manager_queue_full', item={'kind': 'manager_update', 'cycle_no': cycle_no, 'update': scan_result['manager_update']})
                 if isinstance(bp_result, dict) and bp_result.get('degraded'):
                     scan_delay_multiplier = max(scan_delay_multiplier, float((bp_result.get('policy') or {}).get('scan_delay_multiplier', 1.0) or 1.0))
-            record_runtime_heartbeat(store, component='scanner', status='healthy', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no, 'candidate_found': bool(cycle.get('scan')), 'scan_delay_multiplier': scan_delay_multiplier})
+            hb_status = 'degraded_wait' if isinstance(scan_result, dict) and scan_result.get('scanner_degraded_wait') else 'healthy'
+            hb_reason = 'binance_rest_circuit_open' if hb_status == 'degraded_wait' else ''
+            record_runtime_heartbeat(store, component='scanner', status=hb_status, blocked_reason=hb_reason, queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no, 'candidate_found': bool(cycle.get('scan')), 'scan_delay_multiplier': scan_delay_multiplier, 'rest_circuit': _binance_rest_guard_snapshot()})
         except asyncio.TimeoutError:
             record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason='scanner_queue_timeout', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no})
+        except BinanceAPIError as exc:
+            error_message = str(exc)
+            blocked_reason = 'binance_rest_circuit_open' if 'circuit open' in error_message.lower() or 'core-only' in error_message.lower() else 'binance_api_error'
+            rest_snapshot = _binance_rest_guard_snapshot()
+            payload = {'cycle_no': cycle_no, 'blocked_reason': blocked_reason, 'error': error_message, 'scanner_degraded_wait': blocked_reason == 'binance_rest_circuit_open', 'rest_used_weight_1m': rest_snapshot.get('rest_used_weight_1m'), 'rest_circuit_state': rest_snapshot.get('state'), 'rest_circuit_reason': rest_snapshot.get('reason'), 'next_rest_probe_at': rest_snapshot.get('next_rest_probe_at_ms'), 'next_retry_after_seconds': rest_snapshot.get('next_retry_after_seconds')}
+            append_runtime_event(store, 'scanner_degraded_wait' if blocked_reason == 'binance_rest_circuit_open' else 'scanner_blocked', payload)
+            record_runtime_heartbeat(store, component='scanner', status='degraded_wait' if blocked_reason == 'binance_rest_circuit_open' else 'blocked', blocked_reason=blocked_reason, queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra=payload)
+            scan_delay_multiplier = max(locals().get('scan_delay_multiplier', 1.0), max(3.0, float(rest_snapshot.get('next_retry_after_seconds') or 0) / max(1.0, float(poll_interval or 1))))
         except KeyboardInterrupt:
             store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
             stop_event.set()
@@ -8255,7 +9096,13 @@ async def manager_task(args: argparse.Namespace, store: RuntimeStateStore, queue
         try:
             update = item.get('update') if item.get('kind') == 'manager_update' else item.get('result')
             if isinstance(update, dict):
-                management_result = management_cycle(args, update, store=store)
+                if update.get('kind') == 'event_updates':
+                    for event in list(update.get('events') or []):
+                        if isinstance(event, dict):
+                            append_runtime_event(store, str(event.get('event_type') or 'runtime_event'), event.get('payload') if isinstance(event.get('payload'), dict) else event)
+                    management_result = {'ok': True, 'event_updates': len(list(update.get('events') or []))}
+                else:
+                    management_result = management_cycle(args, update, store=store)
                 cycle = update.get('cycle') if isinstance(update.get('cycle'), dict) else None
                 if cycle is not None:
                     last_result = {'ok': True, 'cycles': [cycle], 'cycle_no': item.get('cycle_no'), 'auto_loop': True}
@@ -8371,10 +9218,48 @@ async def watchdog_task(store: RuntimeStateStore, queues: Dict[str, asyncio.Queu
         except (TypeError, ValueError):
             pass
         if actions:
-            payload = record_runtime_heartbeat(store, component='watchdog', status='recovering', blocked_reason=';'.join(sorted(set(actions))), extra={'actions': sorted(set(actions))})
-            recovery_request = {**payload, 'action': 'supervisor_restart', 'actions': sorted(set(actions))}
-            store.save_json('runtime_recovery_request', recovery_request)
-            append_runtime_event(store, 'resident_watchdog_recovery', recovery_request)
+            now = time.time()
+            state = store.load_json('runtime_watchdog_state', {})
+            if not isinstance(state, dict):
+                state = {}
+            cooldown = max(0.0, float(state.get('cooldown_seconds', 60.0) or 60.0))
+            max_per_hour = max(1, int(state.get('max_restart_per_hour', 6) or 6))
+            last_restart_at = float(state.get('last_restart_at', 0.0) or 0.0)
+            restart_times = [float(ts) for ts in list(state.get('restart_times') or []) if now - float(ts or 0.0) <= 3600.0]
+            payload = record_runtime_heartbeat(store, component='watchdog', status='recovering', blocked_reason=';'.join(sorted(set(actions))), extra={'actions': sorted(set(actions)), 'restart_count_last_hour': len(restart_times), 'cooldown_seconds': cooldown, 'max_restart_per_hour': max_per_hour})
+            if now - last_restart_at < cooldown:
+                skipped = {**payload, 'action': 'cooldown_skip', 'cooldown_remaining_seconds': round(cooldown - (now - last_restart_at), 3)}
+                append_runtime_event(store, 'resident_watchdog_recovery_cooldown', skipped)
+            elif len(restart_times) >= max_per_hour:
+                halted = {**payload, 'action': 'halted', 'reason': 'watchdog_restart_limit_exceeded', 'restart_count_last_hour': len(restart_times), 'max_restart_per_hour': max_per_hour}
+                state.update({'status': 'HALTED', 'halted_at': _isoformat_utc(_utc_now()), 'halt_reason': 'watchdog_restart_limit_exceeded', 'restart_times': restart_times})
+                store.save_json('runtime_watchdog_state', state)
+                store.save_json('runtime_recovery_request', halted)
+                append_runtime_event(store, 'resident_watchdog_halted', halted)
+            else:
+                restart_times.append(now)
+                state.update({'status': 'recovering', 'last_restart_at': now, 'restart_count': int(state.get('restart_count', 0) or 0) + 1, 'restart_times': restart_times, 'cooldown_seconds': cooldown, 'max_restart_per_hour': max_per_hour})
+                store.save_json('runtime_watchdog_state', state)
+                recovery_request = {**payload, 'action': 'supervisor_restart', 'actions': sorted(set(actions)), 'restart_count_last_hour': len(restart_times), 'restart_count': state['restart_count']}
+                store.save_json('runtime_recovery_request', recovery_request)
+                append_runtime_event(store, 'resident_watchdog_recovery', recovery_request)
+        else:
+            now = time.time()
+            state = store.load_json('runtime_watchdog_state', {})
+            if not isinstance(state, dict):
+                state = {}
+            restart_times = [float(ts) for ts in list(state.get('restart_times') or []) if now - float(ts or 0.0) <= 3600.0]
+            state.update({
+                'status': 'healthy',
+                'last_healthy_at': _isoformat_utc(_utc_now()),
+                'restart_times': restart_times,
+                'restart_count_last_hour': len(restart_times),
+            })
+            store.save_json('runtime_watchdog_state', state)
+            recovery_request = store.load_json('runtime_recovery_request', {})
+            if isinstance(recovery_request, dict) and recovery_request.get('consumed'):
+                store.save_json('runtime_recovery_request', {})
+            record_runtime_heartbeat(store, component='watchdog', status='healthy', blocked_reason='', extra={'actions': [], 'restart_count_last_hour': len(restart_times)})
         samples += 1
         if max_samples is not None and samples >= int(max_samples):
             return
@@ -8392,16 +9277,39 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     stop_event = asyncio.Event()
     resident_started_at = _utc_now()
     record_runtime_heartbeat(store, component='resident', status='starting', blocked_reason='', extra={'tasks': ['scanner', 'execution', 'manager', 'position_manager', 'ws', 'watchdog', 'event_loop'], 'resident_started_at': _isoformat_utc(resident_started_at)})
+    try:
+        startup_reconcile = await asyncio.wait_for(asyncio.to_thread(reconcile_positions_and_orders, client, store), timeout=float(getattr(args, 'execution_timeout_seconds', 15.0) or 15.0))
+        append_runtime_event(store, 'startup_position_order_reconciliation', startup_reconcile)
+    except Exception as exc:
+        append_runtime_event(store, 'startup_position_order_reconciliation_failed', {'error': str(exc)})
     tasks: List[asyncio.Task] = []
 
     def drain_runtime_queues() -> None:
-        for queue in queues.values():
-            while True:
-                try:
-                    queue.get_nowait()
-                    queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
+        # Shutdown cleanup may discard only lossy scan/cycle summaries. Critical execution
+        # requests, position_opened, execution_result/error and state transitions remain
+        # queued so replay/persistence paths can preserve them across supervisor restarts.
+        queue = queues.get('manager')
+        if queue is None:
+            return
+        kept: List[Any] = []
+        dropped = 0
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if is_coalescable_manager_update(item):
+                dropped += 1
+                queue.task_done()
+            else:
+                kept.append(item)
+        for item in kept:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                append_runtime_event(store, 'resident_shutdown_queue_replay_backlog', {'queue': 'manager', 'item_kind': item.get('kind') if isinstance(item, dict) else type(item).__name__})
+        if dropped:
+            append_runtime_event(store, 'resident_shutdown_dropped_lossy_summaries', {'queue': 'manager', 'dropped': dropped})
 
     async def stop_runtime_tasks(reason: str) -> None:
         stop_event.set()
@@ -8430,15 +9338,46 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
             asyncio.create_task(execution_task(client, args, store, queues, stop_event), name='execution_task'),
             asyncio.create_task(manager_task(args, store, queues, stop_event), name='manager_task'),
             asyncio.create_task(position_manager_task(client, args, store, queues, stop_event), name='position_manager_task'),
-            asyncio.create_task(watchdog_task(store, queues, stop_event), name='watchdog_task'),
+            asyncio.create_task(watchdog_task(
+                store,
+                queues,
+                stop_event,
+                stale_seconds=max(
+                    120.0,
+                    float(getattr(args, 'scanner_timeout_seconds', 120.0) or 120.0) + float(getattr(args, 'poll_interval_sec', 0.0) or 0.0) + 30.0,
+                ),
+            ), name='watchdog_task'),
             asyncio.create_task(event_loop_latency_task(store, stop_event, interval=float(getattr(args, 'event_loop_lag_interval_seconds', 1.0) or 1.0), warn_threshold_seconds=float(getattr(args, 'event_loop_lag_warn_seconds', 0.25) or 0.25)), name='event_loop_latency_task'),
         ])
         return next(task for task in tasks if task.get_name() == 'scanner_task')
 
     scanner_runtime_task = await start_runtime_tasks()
+    record_runtime_heartbeat(
+        store,
+        component='resident',
+        status='running',
+        blocked_reason='',
+        extra={
+            'tasks': [task.get_name() for task in tasks],
+            'resident_started_at': _isoformat_utc(resident_started_at),
+            'tasks_started': True,
+            'scanner_task': scanner_runtime_task.get_name(),
+        },
+    )
     try:
         while True:
             recovery_request = store.load_json('runtime_recovery_request', {})
+            if isinstance(recovery_request, dict) and recovery_request.get('action') and not recovery_request.get('consumed'):
+                request_updated_at = _parse_iso8601_utc(recovery_request.get('updated_at'))
+                if request_updated_at is not None and request_updated_at < resident_started_at:
+                    stale_consumed = dict(recovery_request, consumed=True, ignored=True, consumed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), ignore_reason='stale_recovery_request_from_previous_runtime')
+                    store.save_json('runtime_recovery_request', stale_consumed)
+                    append_runtime_event(store, 'resident_recovery_request_ignored_stale', stale_consumed)
+                    recovery_request = stale_consumed
+            if isinstance(recovery_request, dict) and recovery_request.get('action') == 'halted' and not recovery_request.get('consumed'):
+                append_runtime_event(store, 'resident_supervisor_halted_by_watchdog', recovery_request)
+                record_runtime_heartbeat(store, component='resident', status='halted', blocked_reason=str(recovery_request.get('reason') or 'watchdog_halted'), extra={'recovery_request': recovery_request})
+                return {'ok': False, 'auto_loop': True, 'reason': str(recovery_request.get('reason') or 'watchdog_halted'), 'recovery_request': recovery_request}
             if isinstance(recovery_request, dict) and recovery_request.get('action') == 'supervisor_restart' and not recovery_request.get('consumed'):
                 request_updated_at = _parse_iso8601_utc(recovery_request.get('updated_at'))
                 if request_updated_at is not None and request_updated_at < resident_started_at:
@@ -8452,8 +9391,32 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
                     record_runtime_heartbeat(store, component='resident', status='restarting', blocked_reason='watchdog_recovery_request', extra={'recovery_request': consumed})
                     await stop_runtime_tasks('watchdog_recovery_request')
                     scanner_runtime_task = await start_runtime_tasks()
+                    record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'recovery_request': consumed, 'scanner_task': scanner_runtime_task.get_name()})
             done, _pending = await asyncio.wait({scanner_runtime_task}, timeout=1.0)
             if done:
+                max_scan_cycles = int(getattr(args, 'max_scan_cycles', 0) or 0)
+                scanner_exc = scanner_runtime_task.exception()
+                if scanner_exc is not None:
+                    payload = {
+                        'task': scanner_runtime_task.get_name(),
+                        'error': str(scanner_exc),
+                        'error_type': type(scanner_exc).__name__,
+                        'max_scan_cycles': max_scan_cycles,
+                    }
+                    append_runtime_event(store, 'resident_scanner_task_failed', payload)
+                    record_runtime_heartbeat(store, component='resident', status='recovering', blocked_reason='scanner_task_failed', extra=payload)
+                    if max_scan_cycles == 0 and not stop_event.is_set():
+                        scanner_runtime_task = asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task')
+                        append_runtime_event(store, 'resident_scanner_task_restarted', {'reason': 'scanner_task_failed'})
+                        record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'restarted_task': scanner_runtime_task.get_name(), 'previous_error_type': type(scanner_exc).__name__})
+                        continue
+                    raise scanner_exc
+                if max_scan_cycles == 0 and not stop_event.is_set():
+                    append_runtime_event(store, 'resident_scanner_task_unexpected_exit', {'reason': 'scanner_task_completed_in_unlimited_runtime'})
+                    record_runtime_heartbeat(store, component='resident', status='recovering', blocked_reason='scanner_task_completed_unexpectedly')
+                    scanner_runtime_task = asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task')
+                    record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'restarted_task': scanner_runtime_task.get_name(), 'previous_exit': 'scanner_task_completed_unexpectedly'})
+                    continue
                 break
         await queues['execution'].join()
         await queues['manager'].join()
@@ -8572,6 +9535,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         base_url=args.base_url,
         api_key=binance_api_key,
         api_secret=binance_api_secret,
+        scanner_proxy_urls=getattr(args, 'scanner_proxy_urls', ''),
     )
     run_loop_fn = globals().get('run_loop')
     if not callable(run_loop_fn):

@@ -38,8 +38,10 @@ def test_build_command_preserves_forwarded_max_open_positions(tmp_path):
 
 
 def test_parse_args_accepts_runner_timeout_sec():
-    args = watcher.parse_args(['--runner-timeout-sec', '12'])
+    args = watcher.parse_args(['--runner-timeout-sec', '12', '--runner-timeout-restart-limit', '2', '--runner-timeout-restart-backoff-sec', '0.5'])
     assert args.runner_timeout_sec == 12.0
+    assert args.runner_timeout_restart_limit == 2
+    assert args.runner_timeout_restart_backoff_sec == 0.5
 
 
 def test_run_once_passes_timeout_to_subprocess(monkeypatch):
@@ -93,6 +95,37 @@ def test_main_emits_timeout_event_and_returns_timeout_exit_code(tmp_path, monkey
     assert '"timeout_sec": 7.0' in captured.out
     assert '"status": "strategy_run_timeout"' in captured.err
     assert '"timeout_sec": 7.0' in captured.err
+
+
+def test_main_restarts_timed_out_runner_before_timeout_exit(tmp_path, monkeypatch, capsys, isolated_runtime_layout):
+    runtime_state_dir, _ = isolated_runtime_layout
+    runner = tmp_path / 'main.py'
+    runner.write_text('')
+    calls = {'count': 0}
+
+    def fake_run_once(cmd, print_command, timeout_sec):
+        calls['count'] += 1
+        raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=timeout_sec)
+
+    monkeypatch.setattr(watcher, '_run_once', fake_run_once)
+    monkeypatch.setattr(watcher.time, 'sleep', lambda _seconds: None)
+
+    exit_code = watcher.main([
+        '--runner', str(runner),
+        '--runtime-state-dir', str(runtime_state_dir),
+        '--poll-interval-sec', '0',
+        '--runner-timeout-sec', '7',
+        '--runner-timeout-restart-limit', '2',
+        '--runner-timeout-restart-backoff-sec', '0',
+        '--', '--live', '--profile', 'default'
+    ])
+
+    assert exit_code == watcher.EXIT_RUNNER_TIMEOUT
+    assert calls['count'] == 3
+    captured = capsys.readouterr()
+    assert captured.out.count('"event_type": "watcher_runner_timeout"') == 3
+    assert captured.out.count('"event_type": "watcher_runner_timeout_restart"') == 2
+    assert '"restart_count": 2' in captured.out
 
 
 def test_main_returns_missing_runner_exit_code_without_spawning(tmp_path, monkeypatch, capsys, isolated_runtime_layout):

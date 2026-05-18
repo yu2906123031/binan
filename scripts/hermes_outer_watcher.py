@@ -65,6 +65,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--max-pre-entry-cycles', type=int, default=0, help='Maximum scan cycles before entry fill. 0 keeps watching.')
     parser.add_argument('--max-post-entry-checks', type=int, default=0, help='Maximum post-entry checks while waiting for exit/cleanup. 0 keeps watching.')
     parser.add_argument('--runner-timeout-sec', type=float, default=0.0, help='Timeout for each spawned strategy run. 0 waits without a timeout.')
+    parser.add_argument('--runner-timeout-restart-limit', type=int, default=0, help='Restart timed-out strategy runs up to this many times before exiting. 0 preserves fail-fast behavior.')
+    parser.add_argument('--runner-timeout-restart-backoff-sec', type=float, default=5.0, help='Seconds to wait before restarting a timed-out strategy run.')
     parser.add_argument('--reset-events', action='store_true', help='Archive existing runtime events before starting a new watcher session.')
     parser.add_argument('--print-command', action='store_true', help='Print each spawned strategy command.')
     parser.add_argument('strategy_args', nargs=argparse.REMAINDER, help='Arguments forwarded to main.py. Include --live and any profile flags here.')
@@ -219,6 +221,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     exit_event: Optional[Dict[str, Any]] = None
     pre_entry_cycles = 0
     post_entry_checks = 0
+    timeout_restart_count = 0
     idle_started_at: Optional[float] = None
     target_open_positions = _extract_max_open_positions(forwarded)
 
@@ -294,8 +297,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                restart_limit = max(0, int(args.runner_timeout_restart_limit or 0))
+                if timeout_restart_count < restart_limit:
+                    timeout_restart_count += 1
+                    _emit(
+                        'watcher_runner_timeout_restart',
+                        ok=False,
+                        status='strategy_run_timeout_restart',
+                        timeout_sec=max(args.runner_timeout_sec, 0.0),
+                        pre_entry_cycles=pre_entry_cycles,
+                        restart_count=timeout_restart_count,
+                        restart_limit=restart_limit,
+                        backoff_sec=max(args.runner_timeout_restart_backoff_sec, 0.0),
+                        command=' '.join(cmd),
+                    )
+                    time.sleep(max(args.runner_timeout_restart_backoff_sec, 0.0))
+                    continue
                 return EXIT_RUNNER_TIMEOUT
             pre_entry_cycles += 1
+            timeout_restart_count = 0
             print(completed.stdout, end='')
             if completed.stderr:
                 print(completed.stderr, file=sys.stderr, end='')

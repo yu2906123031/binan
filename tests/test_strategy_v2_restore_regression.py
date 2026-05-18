@@ -5711,11 +5711,11 @@ def test_runtime_store_save_json_writes_via_atomic_replace(tmp_path, monkeypatch
     })
 
     assert persisted['BTCUSDT:LONG']['position_key'] == 'BTCUSDT:LONG'
-    assert len(replace_calls) == 1
-    assert replace_calls[0][1] == 'positions.json'
-    assert replace_calls[0][0].startswith('.positions.json.')
+    positions_replace_calls = [call for call in replace_calls if call[1] == 'positions.json']
+    assert len(positions_replace_calls) == 1
+    assert positions_replace_calls[0][0].startswith('.positions.json.')
     assert target_path.exists()
-    assert not (tmp_path / replace_calls[0][0]).exists()
+    assert not (tmp_path / positions_replace_calls[0][0]).exists()
 
 
 def test_runtime_store_append_event_backfills_side_and_position_key_from_payload(tmp_path):
@@ -6055,3 +6055,75 @@ def test_monitor_live_trade_reads_and_persists_short_side_aware_position_key(mon
     assert debug_state['actions'][0]['type'] == 'take_profit_1'
     assert debug_state['current_price'] == 89.0
     assert debug_state['current_price_source'] == 'kline_close_fallback'
+
+
+
+def test_scan_only_cycle_converts_binance_ip_ban_to_blocked_manager_update(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        auto_loop=True,
+        reconcile_only=False,
+        live=True,
+        scan_only=False,
+        scanner_timeout_seconds=180.0,
+        runtime_ttl_seconds=900.0,
+    )
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'is_binance_simulated_trading', lambda _args: False)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(
+        mod,
+        'run_with_deadman_timeout',
+        lambda *a, **k: (_ for _ in ()).throw(mod.BinanceAPIError("Binance API error 418: {'code': -1003, 'msg': 'Way too much request weight used; IP banned until 1234567890'}")),
+    )
+
+    result = mod.scan_only_cycle(client=object(), args=args, store=store, cycle_no=7)
+
+    assert result['ok'] is True
+    assert result['cycle']['blocked_reason'] == 'binance_ip_ban'
+    assert result['manager_update']['blocked_reason'] == 'binance_ip_ban'
+    heartbeat = store.load_json('runtime_heartbeat', {})
+    assert heartbeat['components']['scanner']['status'] == 'blocked'
+    assert heartbeat['components']['scanner']['blocked_reason'] == 'binance_ip_ban'
+
+
+def test_book_ticker_websocket_supervisor_target_records_error_health_when_startup_crashes(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    events = []
+
+    with mod._BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        mod._BOOK_TICKER_WS_SUPERVISOR_STATE.clear()
+        mod._BOOK_TICKER_WS_SUPERVISOR_STATE.update({
+            'generation_id': 7,
+            'symbols': ['BTCUSDT', 'ETHUSDT'],
+        })
+
+    def fake_summary(**kwargs):
+        raise RuntimeError('ws dns unavailable')
+
+    monkeypatch.setattr(mod, 'build_auto_loop_book_ticker_supervisor_summary', fake_summary)
+    monkeypatch.setattr(
+        mod,
+        'append_runtime_event',
+        lambda store_arg, event_type, payload: events.append((store_arg, event_type, payload)),
+    )
+
+    mod._book_ticker_websocket_supervisor_target(
+        store=store,
+        symbol_provider=lambda: ['BTCUSDT'],
+        ws_module=object(),
+        generation_id=7,
+    )
+
+    health = store.load_json('book_ticker_ws_status', {})
+    assert health['status'] == 'error'
+    assert health['symbols'] == ['BTCUSDT', 'ETHUSDT']
+    assert health['reconnect_count'] == 0
+    assert health['subscription_version'] == 0
+    assert health['last_error'] == 'ws dns unavailable'
+    assert events == [(
+        store,
+        'book_ticker_ws_supervisor_crashed',
+        {'event_source': 'book_ticker_websocket', 'error': 'ws dns unavailable'},
+    )]

@@ -391,6 +391,43 @@ def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     assert extracted_result['entry_order_feedback']['status'] == 'FILLED'
 
 
+
+class ReduceOnlyRejectingClient:
+    def __init__(self):
+        self.calls = []
+        self.position_mode = 'HEDGE'
+
+    def signed_post(self, path, params):
+        self.calls.append((path, dict(params)))
+        if path == '/fapi/v1/algoOrder' and 'reduceOnly' in params:
+            raise mod.BinanceAPIError("Binance API error 400: {'code': -1106, 'msg': \"Parameter 'reduceonly' sent when not required.\"}")
+        return {'orderId': len(self.calls), 'clientAlgoId': 'algo-ok', 'params': dict(params)}
+
+
+def test_place_stop_market_order_retries_algo_order_without_reduce_only_when_binance_rejects_it():
+    client = ReduceOnlyRejectingClient()
+
+    result = mod.place_stop_market_order(client, 'TESTUSDT', 98.0, 6.0, make_meta(), side=mod.POSITION_SIDE_LONG)
+
+    assert result['clientAlgoId'] == 'algo-ok'
+    assert len(client.calls) == 2
+    assert client.calls[0][1]['reduceOnly'] == 'true'
+    assert 'reduceOnly' not in client.calls[1][1]
+    assert client.calls[1][1]['positionSide'] == mod.POSITION_SIDE_LONG
+
+
+def test_place_take_profit_market_order_retries_algo_order_without_reduce_only_when_binance_rejects_it():
+    client = ReduceOnlyRejectingClient()
+
+    result = mod.place_take_profit_market_order(client, 'TESTUSDT', 105.0, 3.0, make_meta(), side=mod.POSITION_SIDE_SHORT)
+
+    assert result['clientAlgoId'] == 'algo-ok'
+    assert len(client.calls) == 2
+    assert client.calls[0][1]['reduceOnly'] == 'true'
+    assert 'reduceOnly' not in client.calls[1][1]
+    assert client.calls[1][1]['positionSide'] == mod.POSITION_SIDE_SHORT
+
+
 def test_execution_module_matches_script_resolve_position_protection_status(monkeypatch):
     positions = [{'symbol': 'DOGEUSDT', 'positionAmt': '5', 'positionSide': 'LONG'}]
     algo_orders = [{

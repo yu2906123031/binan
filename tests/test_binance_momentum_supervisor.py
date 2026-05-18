@@ -39,6 +39,7 @@ def isolated_supervisor_files(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, 'HALT_MARKER_FILE', runtime_state_dir / 'supervisor_halt.json', raising=False)
     monkeypatch.setattr(supervisor, 'SINGLE_INSTANCE_LOCK_FILE', runtime_state_dir / 'supervisor.lock', raising=False)
     monkeypatch.setattr(supervisor, 'SINGLE_INSTANCE_LOCK_HANDLE', None, raising=False)
+    monkeypatch.setattr(supervisor, 'SHUTDOWN_REQUESTED', False, raising=False)
     monkeypatch.setattr(supervisor, 'POLL_INTERVAL', 0)
     monkeypatch.setattr(supervisor, 'RESTART_DELAY', 0)
     monkeypatch.setattr(supervisor, 'load_env', lambda _path: None)
@@ -119,3 +120,40 @@ def test_main_blocks_when_runtime_state_cannot_recover_account_position(monkeypa
 
     captured = capsys.readouterr()
     assert '"reason": "account_not_flat"' in captured.out
+
+
+def test_classify_child_exit_treats_sigterm_as_clean_stop(monkeypatch):
+    monkeypatch.setattr(supervisor, 'SHUTDOWN_REQUESTED', False, raising=False)
+
+    decision = supervisor.classify_child_exit(return_code=-supervisor.signal.SIGTERM, consecutive_failures=1)
+
+    assert decision['action'] == 'exit'
+    assert decision['reason'] == 'shutdown_requested'
+
+
+def test_temporary_ban_writes_halt_marker_and_backoff(monkeypatch, isolated_supervisor_files, capsys):
+    positions_json = isolated_supervisor_files
+    ban_until_ms = int(supervisor.time.time() * 1000) + 120_000
+    positions_json.write_text('{}', encoding='utf-8')
+    monkeypatch.setattr(
+        supervisor,
+        'fetch_account_state',
+        lambda: (_ for _ in ()).throw(supervisor.BinanceTemporaryBan('banned until 1779008201172', ban_until_ms=ban_until_ms)),
+    )
+    monkeypatch.setattr(supervisor.subprocess, 'Popen', lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('should stay blocked')))
+
+    def stop_sleep(seconds):
+        assert seconds >= 60
+        raise KeyboardInterrupt('stop after ban backoff')
+
+    monkeypatch.setattr(supervisor.time, 'sleep', stop_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.main()
+
+    marker = supervisor.HALT_MARKER_FILE
+    payload = json.loads(marker.read_text(encoding='utf-8'))
+    assert payload['reason'] == 'binance_temporary_ban'
+    assert payload['ban_until_ms'] == ban_until_ms
+    captured = capsys.readouterr()
+    assert '"reason": "binance_temporary_ban"' in captured.out

@@ -743,6 +743,7 @@ def test_main_auto_loop_degrades_to_single_scan_when_run_loop_missing(monkeypatc
     mod = load_module()
     monkeypatch.setattr(mod, 'parse_args', lambda argv=None: make_args(auto_loop=True, max_scan_cycles=0, base_url='https://example.com'))
     monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: DummyStore())
     monkeypatch.delattr(mod, 'run_loop', raising=False)
     monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'selected': 'DOGEUSDT', 'auto_loop_requested': True}, None, {}))
 
@@ -757,6 +758,8 @@ def test_main_single_run_prints_scan_payload(monkeypatch, capsys):
     mod = load_module()
     monkeypatch.setattr(mod, 'parse_args', lambda argv=None: make_args(auto_loop=False, base_url='https://example.com'))
     monkeypatch.setattr(mod, 'BinanceFuturesClient', lambda **kwargs: DummyClient())
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: DummyStore())
+    monkeypatch.setattr(mod, 'run_loop', lambda client, args: {'ok': True, 'cycle': {'scan': {'ok': True, 'selected': 'DOGEUSDT'}}})
     monkeypatch.setattr(mod, 'run_scan_once', lambda client, args: ({'ok': True, 'selected': 'DOGEUSDT'}, None, {}))
 
     exit_code = mod.main([])
@@ -1058,6 +1061,32 @@ def test_watchdog_accepts_component_updated_at_iso_as_fresh(monkeypatch):
     assert not any(event_type == 'resident_watchdog_recovery' for event_type, _payload in events)
 
 
+def test_watchdog_clears_recovering_status_when_components_are_fresh(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    now = datetime.datetime.fromtimestamp(100.0, tz=datetime.timezone.utc).isoformat()
+    store.save_json('runtime_watchdog_state', {'status': 'recovering', 'restart_times': [90.0]})
+    store.save_json('runtime_heartbeat', {
+        'components': {
+            'scanner': {'updated_at': now, 'status': 'healthy'},
+            'ws': {'updated_at': now, 'status': 'healthy'},
+            'execution': {'updated_at': now, 'status': 'idle'},
+            'event_loop': {'updated_at': now, 'lag_seconds': 0.0},
+            'watchdog': {'updated_at': now, 'status': 'recovering', 'blocked_reason': 'scanner_stale'},
+        }
+    })
+    monkeypatch.setattr(mod.time, 'time', lambda: 100.0)
+
+    __import__('asyncio').run(mod.watchdog_task(store, {'manager': __import__('asyncio').Queue(maxsize=1)}, __import__('asyncio').Event(), interval=0.001, max_samples=1, stale_seconds=10.0, event_loop_lag_seconds=1.0))
+
+    state = store.load_json('runtime_watchdog_state', {})
+    heartbeat = store.load_json('runtime_heartbeat', {})
+    assert state['status'] == 'healthy'
+    assert state['restart_count_last_hour'] == 1
+    assert heartbeat['components']['watchdog']['status'] == 'healthy'
+    assert heartbeat['components']['watchdog']['blocked_reason'] == ''
+
+
 def test_scan_only_cycle_no_candidate_returns_manager_update_without_direct_state_write(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
@@ -1134,6 +1163,53 @@ def test_scanner_task_applies_backpressure_scan_delay_multiplier(monkeypatch):
     assert sleeps == [6]
 
 
+def test_scanner_task_converts_timeout_none_to_manager_update(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, poll_interval_sec=0, require_book_ticker_ws=False)
+    store = DummyStore()
+    queues = {'execution': __import__('asyncio').Queue(maxsize=1), 'manager': __import__('asyncio').Queue(maxsize=4)}
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mod.asyncio, 'to_thread', fake_to_thread)
+
+    __import__('asyncio').run(mod.scanner_task(DummyClient(), args, store, queues, None, __import__('asyncio').Event()))
+
+    assert queues['manager'].qsize() == 1
+    item = queues['manager'].get_nowait()
+    assert item['update']['reason'] == 'scanner_timeout'
+    assert item['update']['cycle']['blocked_reason'] == 'scanner_timeout'
+
+
+def test_watchdog_clears_consumed_recovery_request_when_healthy(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    store.save_json('runtime_heartbeat', {
+        'components': {
+            'scanner': {'updated_at_ts': 100.0, 'extra': {'last_scan_ts': 100.0}},
+            'ws': {'updated_at_ts': 100.0, 'extra': {'last_ws_msg_ts': 100.0}},
+            'execution': {'updated_at_ts': 100.0, 'extra': {'last_execution_ts': 100.0}},
+            'event_loop': {'updated_at_ts': 100.0, 'extra': {'lag_seconds': 0.0}},
+        }
+    })
+    store.save_json('runtime_recovery_request', {
+        'component': 'watchdog',
+        'status': 'recovering',
+        'action': 'supervisor_restart',
+        'blocked_reason': 'scanner_stale;ws_stale',
+        'consumed': True,
+    })
+    monkeypatch.setattr(mod.time, 'time', lambda: 100.0)
+
+    __import__('asyncio').run(mod.watchdog_task(store, {'manager': __import__('asyncio').Queue(maxsize=1)}, __import__('asyncio').Event(), interval=0.001, max_samples=1, stale_seconds=10.0, event_loop_lag_seconds=1.0))
+
+    assert store.load_json('runtime_recovery_request', {}) == {}
+    heartbeat = store.load_json('runtime_heartbeat', {})
+    assert heartbeat['components']['watchdog']['status'] == 'healthy'
+    assert heartbeat['components']['watchdog']['blocked_reason'] == ''
+
+
 def test_watchdog_persists_recovery_request_for_supervisor(monkeypatch):
     mod = load_module()
     store = DummyStore()
@@ -1181,9 +1257,10 @@ def test_scan_only_cycle_emits_manager_side_effects_without_direct_event_or_risk
 
     update = result['manager_update']
     assert update['reason'] == 'risk_guard_blocked'
-    assert update['reconcile'] == {'ok': True, 'closed_positions': ['OLD:LONG']}
-    assert any(e['event_type'] == 'candidate_selected' for e in update['event_updates'])
-    assert any(e['event_type'] == 'candidate_rejected' for e in update['event_updates'])
+    assert update['reconcile']['ok'] is True
+    assert update['reconcile']['mode'] == 'ws_local_lightweight'
+    assert update['reconcile']['skip_reason'] == 'scanner_rest_full_reconcile_not_due'
+
     assert any(e['event_type'] == 'missed_trade' for e in update['event_updates'])
 
 
@@ -1267,6 +1344,102 @@ def test_resident_runtime_consumes_recovery_request_and_restarts_tasks(monkeypat
     assert any(e['event_type'] == 'resident_supervisor_restart_consumed' for e in store.events)
 
 
+def test_resident_runtime_passes_scanner_timeout_budget_to_watchdog(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.1, scanner_timeout_seconds=180, poll_interval_sec=60)
+    store = DummyStore()
+    captured = {}
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+
+    async def scanner(client, args, store, queues, run_loop_fn, stop_event):
+        stop_event.set()
+
+    async def one_tick(*args, **kwargs):
+        return None
+
+    async def watchdog(store, queues, stop_event, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(mod, 'scanner_task', scanner)
+    monkeypatch.setattr(mod, 'execution_task', one_tick)
+    monkeypatch.setattr(mod, 'manager_task', one_tick)
+    monkeypatch.setattr(mod, 'position_manager_task', one_tick)
+    monkeypatch.setattr(mod, 'watchdog_task', watchdog)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', one_tick)
+
+    result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
+
+    assert result.get('ok') is True
+    assert captured['stale_seconds'] == 270.0
+
+
+def test_resident_runtime_ignores_stale_halted_recovery_request(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=1, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.1)
+    store = DummyStore()
+    stale_updated_at = (mod.datetime.datetime.now(mod.datetime.timezone.utc) - mod.datetime.timedelta(hours=1)).isoformat()
+    store.save_json('runtime_recovery_request', {'action': 'halted', 'reason': 'watchdog_restart_limit_exceeded', 'updated_at': stale_updated_at})
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+
+    async def one_tick(*args, **kwargs):
+        return None
+
+    scanner_starts = []
+
+    async def scanner(client, args, store, queues, run_loop_fn, stop_event):
+        scanner_starts.append(stop_event)
+        stop_event.set()
+
+    monkeypatch.setattr(mod, 'scanner_task', scanner)
+    monkeypatch.setattr(mod, 'execution_task', one_tick)
+    monkeypatch.setattr(mod, 'manager_task', one_tick)
+    monkeypatch.setattr(mod, 'position_manager_task', one_tick)
+    monkeypatch.setattr(mod, 'watchdog_task', one_tick)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', one_tick)
+
+    result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
+
+    assert result.get('ok') is True
+    assert scanner_starts
+    recovery = store.load_json('runtime_recovery_request', {})
+    assert recovery.get('consumed') is True
+    assert recovery.get('ignored') is True
+    assert recovery.get('ignore_reason') == 'stale_recovery_request_from_previous_runtime'
+    assert any(e['event_type'] == 'resident_recovery_request_ignored_stale' for e in store.events)
+
+
+def test_resident_runtime_restarts_unexpected_scanner_exit_in_unlimited_mode(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, max_scan_cycles=0, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.1)
+    store = DummyStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    starts = []
+
+    async def scanner(*call_args):
+        stop_event = call_args[-1]
+        starts.append('scanner')
+        if len(starts) >= 2:
+            stop_event.set()
+        return None
+
+    async def one_tick(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mod, 'scanner_task', scanner)
+    monkeypatch.setattr(mod, 'execution_task', one_tick)
+    monkeypatch.setattr(mod, 'manager_task', one_tick)
+    monkeypatch.setattr(mod, 'position_manager_task', one_tick)
+    monkeypatch.setattr(mod, 'watchdog_task', one_tick)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', one_tick)
+
+    result = __import__('asyncio').run(mod.run_resident_runtime_async(DummyClient(), args, lambda c, a: {'ok': True}))
+
+    assert result.get('ok') is True
+    assert starts == ['scanner', 'scanner']
+    assert any(e['event_type'] == 'resident_scanner_task_unexpected_exit' for e in store.events)
+
+
 def test_resident_runtime_shutdown_cancels_stuck_tasks_with_timeout(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=1, runtime_queue_maxsize=4, require_book_ticker_ws=False, resident_shutdown_timeout_seconds=0.01)
@@ -1307,7 +1480,14 @@ def test_scanner_task_drops_low_score_candidate_under_backpressure(monkeypatch):
     __import__('asyncio').run(mod.scanner_task(DummyClient(), args, store, queues, None, __import__('asyncio').Event()))
 
     assert queues['execution'].empty()
-    assert any(e['event_type'] == 'runtime_candidate_dropped_by_backpressure' for e in store.events)
+    manager_items = []
+    while not queues['manager'].empty():
+        manager_items.append(queues['manager'].get_nowait())
+    assert any(
+        event.get('event_type') == 'runtime_candidate_dropped_by_backpressure'
+        for item in manager_items
+        for event in item.get('update', {}).get('events', [])
+    )
 
 
 def test_main_auto_loop_runs_multiple_cycles_and_sleeps(monkeypatch, capsys):
@@ -3635,3 +3815,247 @@ def test_apply_queue_backpressure_coalesces_low_priority_manager_updates():
     latest = queue.get_nowait()
     assert latest['cycle_no'] == 3
     assert any(e['event_type'] == 'manager_queue_coalesced' for e in store.events)
+
+
+def test_apply_queue_backpressure_preserves_critical_manager_updates_when_full():
+    mod = load_module()
+    store = DummyStore()
+    queue = __import__('asyncio').Queue(maxsize=2)
+    critical = {'kind': 'manager_update', 'cycle_no': 1, 'update': {'kind': 'execution_result', 'cycle': {'cycle_no': 1}, 'ok': True}}
+    lossy = {'kind': 'manager_update', 'cycle_no': 2, 'update': {'kind': 'cycle', 'cycle': {'cycle_no': 2}}}
+    queue.put_nowait(critical)
+    queue.put_nowait(lossy)
+
+    result = __import__('asyncio').run(mod.apply_queue_backpressure(
+        queue,
+        store=store,
+        component='scanner',
+        reason='manager_queue_full',
+        item={'kind': 'manager_update', 'cycle_no': 3, 'update': {'kind': 'cycle', 'cycle': {'cycle_no': 3}}},
+    ))
+
+    assert result['accepted'] is True
+    assert result['coalesced'] is True
+    items = [queue.get_nowait(), queue.get_nowait()]
+    assert critical in items
+    assert any(item.get('cycle_no') == 3 for item in items)
+    assert all(item.get('cycle_no') != 2 for item in items)
+
+
+def test_reconcile_positions_and_orders_cancels_orphan_protection_orders():
+    mod = load_module()
+    store = DummyStore()
+
+    class Client:
+        def __init__(self):
+            self.deleted = []
+        def signed_get(self, path, params=None):
+            if path == '/fapi/v2/positionRisk':
+                return [{'symbol': 'DOGEUSDT', 'positionAmt': '2', 'positionSide': 'LONG', 'markPrice': '1', 'entryPrice': '1', 'notional': '2'}]
+            if path == '/fapi/v1/openOrders':
+                return [
+                    {'symbol': 'DOGEUSDT', 'orderId': 1, 'type': 'STOP_MARKET', 'positionSide': 'LONG', 'clientOrderId': 'bm_DOGEUSDT_long_stop_live'},
+                    {'symbol': 'BTCUSDT', 'orderId': 2, 'type': 'STOP_MARKET', 'positionSide': 'LONG', 'clientOrderId': 'bm_BTCUSDT_long_stop_old'},
+                    {'symbol': 'ETHUSDT', 'orderId': 3, 'type': 'LIMIT', 'positionSide': 'LONG', 'clientOrderId': 'manual_limit'},
+                ]
+            if path == '/fapi/v1/openAlgoOrders':
+                return []
+            raise AssertionError(path)
+        def signed_post(self, path, params):
+            self.deleted.append((path, params))
+            return {'ok': True, 'params': params}
+
+    client = Client()
+    result = mod.reconcile_positions_and_orders(client, store)
+
+    assert result['ok'] is True
+    assert result['orphan_order_detected'] == 1
+    assert result['orphan_order_cancelled'] == 1
+    assert client.deleted == [('/fapi/v1/order/cancel', {'symbol': 'BTCUSDT', 'orderId': 2, 'origClientOrderId': 'bm_BTCUSDT_long_stop_old'})]
+    event_types = [row['event_type'] for row in store.events]
+    assert 'orphan_order_detected' in event_types
+    assert 'orphan_order_cancelled' in event_types
+
+
+
+def test_run_scan_once_prefilter_caps_expensive_symbol_fetches(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    symbols = [f'COIN{i}USDT' for i in range(20)]
+    meta = mod.SymbolMeta(symbol='', price_precision=2, quantity_precision=2, tick_size=0.01, step_size=0.01, min_qty=0.01, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL')
+    metas = {symbol: dataclasses.replace(meta, symbol=symbol) for symbol in symbols + ['BTCUSDT', 'SOLUSDT']}
+    calls = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'load_okx_sentiment_map', lambda args: {})
+    monkeypatch.setattr(mod, 'load_okx_sentiment_map_auto', lambda args: {})
+    monkeypatch.setattr(mod, 'load_manual_smart_money_map', lambda args: {})
+    monkeypatch.setattr(mod, 'load_external_signal_payload', lambda args: {})
+    monkeypatch.setattr(mod, 'normalize_external_signal_map', lambda payload: {})
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda client: metas)
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': symbol, 'priceChangePercent': str(20 - idx), 'quoteVolume': '100000000', 'lastPrice': '1'} for idx, symbol in enumerate(symbols)])
+    monkeypatch.setattr(mod, 'fetch_klines', lambda client, symbol, interval, limit: calls.append((symbol, interval)) or [])
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda client, symbol, limit=3: [])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda client, symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda client, symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'fetch_order_book', lambda client, symbol, limit=20: {})
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda client, symbol, **kwargs: [])
+    monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: None)
+
+    args = make_args(runtime_state_dir=str(tmp_path), top_gainers=20, top_losers=0, max_candidates=3, scan_prefilter_multiplier=1)
+    result, best, meta_map = mod.run_scan_once(DummyClient(), args)
+
+    scanned_symbols = {symbol for symbol, interval in calls if symbol.startswith('COIN')}
+    assert len(scanned_symbols) == 3
+    assert result['funnel']['evaluated_symbol_count'] == 3
+
+
+def test_collect_book_ticker_samples_rest_fallback_can_be_disabled_on_cache_miss():
+    mod = load_module()
+    store = DummyStore()
+
+    class Client:
+        def get(self, path, params=None):
+            raise AssertionError('REST bookTicker fallback should be disabled')
+
+    samples = mod.collect_book_ticker_samples(Client(), 'DOGEUSDT', sample_count=6, store=store, allow_rest_fallback=False)
+
+    assert samples == []
+    assert any(row['event_type'] == 'book_ticker_cache_miss' and row.get('fallback') == 'disabled' for row in store.events)
+
+
+def test_scan_only_cycle_records_deadman_timeout_as_blocked_without_exception(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed_symbols': []})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda *a, **k: {'ok': False, 'reason': 'deadman_timeout', 'component': 'scanner', 'operation': 'scan_cycle'})
+
+    result = mod.scan_only_cycle(DummyClient(), make_args(scanner_timeout_seconds=0.01), store=store, cycle_no=7)
+
+    assert result['ok'] is True
+    assert result['cycle']['blocked_reason'] == 'scanner_timeout'
+    assert result['manager_update']['blocked_reason'] == 'scanner_timeout'
+
+
+def test_scanner_rest_circuit_breaker_blocks_after_ip_ban_until_retry_window(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed_symbols': []})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda *a, **k: (_ for _ in ()).throw(mod.BinanceAPIError("Binance API error 418: {'code': -1003, 'msg': 'Way too much request weight used; IP banned until 1893456000000.'}")))
+
+    args = make_args(scanner_timeout_seconds=1.0)
+    first = mod.scan_only_cycle(DummyClient(), args, store=store, cycle_no=1)
+    second = mod.scan_only_cycle(DummyClient(), args, store=store, cycle_no=2)
+
+    assert first['cycle']['blocked_reason'] == 'binance_ip_ban'
+    assert second['cycle']['blocked_reason'] == 'binance_ip_ban_circuit_open'
+    assert store.json_state['scanner_rest_circuit_breaker']['reason'] == 'binance_ip_ban'
+
+
+def test_scanner_rest_circuit_breaker_uses_fallback_cooldown_when_retry_after_missing(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(mod, 'current_time_ms', lambda: now)
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed_symbols': []})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda *a, **k: (_ for _ in ()).throw(mod.BinanceAPIError("Binance API error 418: {'code': -1003, 'msg': 'IP banned.'}")))
+
+    args = make_args(scanner_timeout_seconds=1.0, scanner_rest_ban_cooldown_seconds=120)
+    first = mod.scan_only_cycle(DummyClient(), args, store=store, cycle_no=1)
+    second = mod.scan_only_cycle(DummyClient(), args, store=store, cycle_no=2)
+
+    assert first['cycle']['blocked_reason'] == 'binance_ip_ban'
+    assert second['cycle']['blocked_reason'] == 'binance_ip_ban_circuit_open'
+    assert store.json_state['scanner_rest_circuit_breaker']['retry_after_ms'] == now + 120_000
+
+
+def test_run_loop_records_reconcile_ip_ban_as_blocked_circuit(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed_symbols': []})
+    monkeypatch.setattr(
+        mod,
+        'reconcile_runtime_state',
+        lambda *a, **k: (_ for _ in ()).throw(
+            mod.BinanceAPIError("Binance API error 418: {'code': -1003, 'msg': 'IP banned until 1893456000000.'}")
+        ),
+    )
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: (_ for _ in ()).throw(AssertionError('scanner should be blocked before scan')))
+
+    result = mod.run_loop(DummyClient(), make_args(live=True, scanner_timeout_seconds=0.01))
+
+    assert result['cycle']['blocked_reason'] == 'binance_ip_ban'
+    assert store.json_state['scanner_rest_circuit_breaker']['reason'] == 'binance_ip_ban'
+    assert store.json_state['last_cycle']['cycle']['scan']['blocked_reason'] == 'binance_ip_ban'
+
+
+def test_run_loop_open_circuit_blocks_before_reconcile(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    store.json_state['scanner_rest_circuit_breaker'] = {
+        'state': 'open',
+        'reason': 'binance_ip_ban',
+        'retry_after_ms': 1893456000000,
+    }
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: {'removed_symbols': []})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: (_ for _ in ()).throw(AssertionError('reconcile should be blocked by circuit')))
+
+    result = mod.run_loop(DummyClient(), make_args(live=True, scanner_timeout_seconds=0.01))
+
+    assert result['cycle']['blocked_reason'] == 'binance_ip_ban_circuit_open'
+    assert store.json_state['last_cycle']['cycle']['scan']['blocked_reason'] == 'binance_ip_ban_circuit_open'
+
+def test_resident_marks_running_after_initial_runtime_tasks_start(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    args = make_args(auto_loop=True, max_scan_cycles=0, require_book_ticker_ws=False, runtime_queue_maxsize=8)
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda args: store)
+    async def fake_reconcile(*a, **k):
+        return {'ok': True}
+    monkeypatch.setattr(mod, 'reconcile_positions_and_orders', lambda *a, **k: {'ok': True})
+
+    async def wait_for_stop(*call_args, **call_kwargs):
+        stop_event = call_args[-1]
+        await stop_event.wait()
+
+    monkeypatch.setattr(mod, 'scanner_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'execution_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'manager_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'position_manager_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'watchdog_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'event_loop_latency_task', wait_for_stop)
+    monkeypatch.setattr(mod, 'force_close_book_ticker_websocket_supervisor', lambda *a, **k: {'closed': False})
+
+    async def exercise():
+        task = mod.asyncio.create_task(mod.run_resident_runtime_async(DummyClient(), args, lambda *a, **k: {'ok': True}))
+        try:
+            for _ in range(20):
+                if task.done():
+                    exc = task.exception()
+                    raise AssertionError(f'resident task ended before running heartbeat: {exc!r}')
+                heartbeat = store.json_state.get('runtime_heartbeat', {})
+                resident = heartbeat.get('components', {}).get('resident', {}) if isinstance(heartbeat, dict) else {}
+                if resident.get('status') == 'running':
+                    return resident
+                await mod.asyncio.sleep(0.01)
+            return store.json_state.get('runtime_heartbeat', {}).get('components', {}).get('resident', {})
+        finally:
+            task.cancel()
+            await mod.asyncio.gather(task, return_exceptions=True)
+
+    resident = mod.asyncio.run(exercise())
+
+    assert resident['status'] == 'running'
+    assert resident['blocked_reason'] == ''
+    assert resident['tasks_started'] is True
+

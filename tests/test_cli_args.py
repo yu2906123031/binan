@@ -1,4 +1,5 @@
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 
@@ -53,6 +54,7 @@ def test_parse_args_exposes_runtime_and_execution_flags():
         '--same-theme-heat-cap-r', '1.1',
         '--same-correlation-heat-cap-r', '0.9',
         '--runtime-state-dir', '/tmp/runtime',
+        '--scanner-rest-ban-cooldown-seconds', '180',
     ])
     assert args.symbol == 'DOGEUSDT'
     assert args.scan_only is True
@@ -87,6 +89,14 @@ def test_parse_args_exposes_runtime_and_execution_flags():
     assert abs(args.same_theme_heat_cap_r - 1.1) < 1e-9
     assert abs(args.same_correlation_heat_cap_r - 0.9) < 1e-9
     assert args.runtime_state_dir == '/tmp/runtime'
+    assert args.scanner_rest_ban_cooldown_seconds == 180
+
+
+def test_parse_args_default_scanner_rest_ban_cooldown_is_proxy_friendly():
+    mod = load_module()
+    args = mod.parse_args([])
+
+    assert args.scanner_rest_ban_cooldown_seconds == 180.0
 
 
 def test_parse_args_accepts_supervisor_live_flags():
@@ -497,6 +507,80 @@ def test_binance_public_get_retries_transient_timeout(monkeypatch):
     assert session.calls == 2
 
 
+def test_parse_scanner_proxy_urls_accepts_host_port_user_pass_format():
+    mod = load_module()
+
+    assert mod.parse_scanner_proxy_urls('socks5://1.2.3.4:6234:user:pass\n5.6.7.8:6414:u2:p2') == [
+        'socks5://user:pass@1.2.3.4:6234',
+        'socks5://u2:p2@5.6.7.8:6414',
+    ]
+
+
+def test_binance_public_get_randomizes_scanner_proxy(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod.random, 'choice', lambda values: values[-1])
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {'ok': True}
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return Response()
+
+    session = Session()
+    client = mod.BinanceFuturesClient(
+        'https://example.test',
+        session=session,
+        scanner_proxy_urls='socks5://1.2.3.4:6234:user:pass socks5://5.6.7.8:6414:u2:p2',
+    )
+
+    assert client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'}) == {'ok': True}
+    assert session.calls[0][1]['proxies'] == {
+        'http': 'socks5://u2:p2@5.6.7.8:6414',
+        'https': 'socks5://u2:p2@5.6.7.8:6414',
+    }
+
+
+def test_signed_get_does_not_use_scanner_proxy(monkeypatch):
+    mod = load_module()
+
+    class Response:
+        status_code = 200
+        text = ''
+
+        def json(self):
+            return {'assets': []}
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return Response()
+
+    session = Session()
+    client = mod.BinanceFuturesClient(
+        'https://example.test',
+        api_key='k',
+        api_secret='s',
+        session=session,
+        scanner_proxy_urls='socks5://1.2.3.4:6234:user:pass',
+    )
+
+    assert client.signed_get('/fapi/v2/account') == {'assets': []}
+    assert 'proxies' not in session.calls[0][1]
+
+
 def test_binance_public_get_retries_transient_http_rate_limit(monkeypatch):
     mod = load_module()
     sleeps = []
@@ -530,9 +614,10 @@ def test_binance_public_get_retries_transient_http_rate_limit(monkeypatch):
         get_retry_sleep_sec=0.25,
     )
 
-    assert client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'}) == {'ok': True}
-    assert session.calls == 2
-    assert sleeps == [0.25]
+    with pytest.raises(mod.BinanceAPIError, match='Too many requests'):
+        client.get('/fapi/v1/klines', {'symbol': 'BTCUSDT'})
+    assert session.calls == 1
+    assert sleeps == []
 
 
 def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):
@@ -565,7 +650,7 @@ def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):
                 return Response(status_code=400, payload={'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'})
             return Response(payload={'assets': []})
 
-    now_values = iter([1000.0, 1000.1, 1000.15, 2000.0, 2000.1, 2000.15])
+    now_values = itertools.chain([1000.0, 1000.1, 1000.15, 2000.0, 2000.1, 2000.15, 2000.2, 2000.25, 2000.3], itertools.repeat(2000.35))
     monkeypatch.setattr(mod.time, 'time', lambda: next(now_values))
 
     session = Session()
@@ -577,7 +662,7 @@ def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):
     first_account_params = session.get_calls[1][1]
     second_account_params = session.get_calls[3][1]
     assert first_account_params['timestamp'] == 2_000_100
-    assert second_account_params['timestamp'] == 3_000_100
+    assert second_account_params['timestamp'] == 3_000_075
     assert first_account_params['recvWindow'] == 10_000
     assert second_account_params['recvWindow'] == 10_000
 
@@ -607,7 +692,7 @@ def test_signed_get_raises_original_error_when_recvwindow_resync_still_fails(mon
             self.account_calls += 1
             return Response(status_code=400, payload={'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'})
 
-    now_values = iter([1000.0, 1000.1, 1000.15, 1000.2, 1000.3, 1000.35])
+    now_values = itertools.chain([1000.0, 1000.1, 1000.15, 1000.2, 1000.3, 1000.35, 1000.4, 1000.45, 1000.5], itertools.repeat(1000.55))
     monkeypatch.setattr(mod.time, 'time', lambda: next(now_values))
 
     session = Session()

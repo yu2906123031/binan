@@ -213,6 +213,83 @@ def test_fetch_order_book_hits_binance_depth_endpoint_with_limit():
     }]
 
 
+
+def test_scanner_market_data_resolvers_prefer_runtime_cache_and_skip_rest(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    now = mod._isoformat_utc(mod._utc_now())
+    kline = make_kline(100, 101, 99, 100)
+    store.save_json('ticker_24hr_cache', {
+        'updated_at': now,
+        'tickers': [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}],
+    })
+    store.save_json('kline_cache', {
+        'TESTUSDT': {'5m': {'updated_at': now, 'klines': [kline] * 50}},
+    })
+    store.save_json('order_book_cache', {
+        'TESTUSDT': {'updated_at': now, 'bids': [['100', '1']], 'asks': [['101', '2']]},
+    })
+    args = argparse.Namespace(
+        scanner_rest_fallback=False,
+        scanner_ticker_cache_max_age_seconds=10.0,
+        scanner_kline_cache_max_age_seconds=120.0,
+        scanner_order_book_cache_max_age_seconds=3.0,
+    )
+
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda *_a, **_k: pytest.fail('ticker REST fallback should be skipped'))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda *_a, **_k: pytest.fail('kline REST fallback should be skipped'))
+    monkeypatch.setattr(mod, 'fetch_order_book', lambda *_a, **_k: pytest.fail('depth REST fallback should be skipped'))
+
+    assert mod.resolve_scan_tickers(object(), store, args)[0]['symbol'] == 'TESTUSDT'
+    assert len(mod.resolve_scan_klines(object(), store, args, 'TESTUSDT', '5m', 40)) == 40
+    assert mod.resolve_scan_order_book(object(), store, args, 'TESTUSDT', limit=20)['bids'] == [['100', '1']]
+
+
+
+def test_scanner_market_data_resolvers_disable_rest_fallback_on_cache_miss(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(scanner_rest_fallback=False)
+
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda *_a, **_k: pytest.fail('ticker REST fallback should be disabled'))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda *_a, **_k: pytest.fail('kline REST fallback should be disabled'))
+    monkeypatch.setattr(mod, 'fetch_order_book', lambda *_a, **_k: pytest.fail('depth REST fallback should be disabled'))
+
+    assert mod.resolve_scan_tickers(object(), store, args) == []
+    assert mod.resolve_scan_klines(object(), store, args, 'MISSUSDT', '5m', 40) == []
+    assert mod.resolve_scan_order_book(object(), store, args, 'MISSUSDT') == {}
+
+
+
+def test_auto_loop_book_ticker_symbol_provider_uses_cache_first_tickers(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    now = mod._isoformat_utc(mod._utc_now())
+    store.save_json('ticker_24hr_cache', {
+        'updated_at': now,
+        'tickers': [
+            {'symbol': 'TESTUSDT', 'priceChangePercent': '9', 'quoteVolume': '1000000', 'lastPrice': '100'},
+            {'symbol': 'ALTUSDT', 'priceChangePercent': '7', 'quoteVolume': '900000', 'lastPrice': '10'},
+        ],
+    })
+    args = argparse.Namespace(
+        top_gainers=2,
+        top_losers=0,
+        scanner_rest_fallback=False,
+        scanner_ticker_cache_max_age_seconds=10.0,
+    )
+
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {
+        'TESTUSDT': make_meta('TESTUSDT'),
+        'ALTUSDT': make_meta('ALTUSDT'),
+    })
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'load_external_signal_payload', lambda _args: {})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda *_a, **_k: pytest.fail('auto-loop symbol provider should use ticker cache'))
+
+    provider = mod.make_auto_loop_book_ticker_symbol_provider(object(), args, store=store)
+
+    assert provider()[:2] == ['TESTUSDT', 'ALTUSDT']
+
+
+
 def test_collect_book_ticker_samples_prefers_fresh_runtime_cache(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     now = mod._isoformat_utc(mod._utc_now())
@@ -298,8 +375,8 @@ def test_append_book_ticker_cache_sample_keeps_recent_ring_buffer(tmp_path):
     assert first['samples_cached'] == 1
     assert second['samples_cached'] == 2
     assert third['samples_cached'] == 2
-    events = store.read_events(limit=10)
-    assert events[-1]['event_type'] == 'book_ticker_ws_sample_written'
+    events = [row for row in store.read_events(limit=10) if row['event_type'] == 'book_ticker_ws_sample_written']
+    assert len(events) == 1
     assert events[-1]['symbol'] == 'TESTUSDT'
 
 
@@ -326,6 +403,66 @@ def test_process_book_ticker_stream_message_ignores_invalid_payload(tmp_path):
     assert mod.process_book_ticker_stream_message(store, {'stream': 'btcusdt@aggTrade', 'data': {'s': 'BTCUSDT'}}, max_samples=3) is None
     assert mod.process_book_ticker_stream_message(store, {'data': {'a': '1'}}, max_samples=3) is None
     assert store.load_json('book_ticker_cache', {}) == {}
+
+
+def test_run_book_ticker_cache_monitor_cycle_batches_book_ticker_cache_writes(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    save_calls = []
+    original_save_json = store.save_json
+
+    def counting_save_json(name, payload):
+        if name == 'book_ticker_cache':
+            save_calls.append(name)
+        return original_save_json(name, payload)
+
+    monkeypatch.setattr(store, 'save_json', counting_save_json)
+
+    class StubSocket:
+        def __init__(self, messages):
+            self.messages = list(messages)
+            self.timeout_values = []
+
+        def settimeout(self, value):
+            self.timeout_values.append(value)
+
+        def recv(self):
+            if not self.messages:
+                raise AssertionError('recv called after exhaustion')
+            message = self.messages.pop(0)
+            if isinstance(message, Exception):
+                raise message
+            return message
+
+    class TimeoutError(Exception):
+        pass
+
+    class StubWSModule:
+        WebSocketTimeoutException = TimeoutError
+        WebSocketException = RuntimeError
+
+    messages = [
+        {'data': {'e': 'bookTicker', 's': 'BTCUSDT', 'b': str(65000 + idx), 'a': str(65001 + idx), 'B': '12.3', 'A': '7.8'}}
+        for idx in range(50)
+    ]
+    socket = StubSocket(messages + [TimeoutError('timed out')])
+
+    result = mod.run_book_ticker_cache_monitor_cycle(
+        store,
+        socket,
+        ws_module=StubWSModule,
+        max_messages=100,
+        max_samples=4,
+        recv_timeout_seconds=1.5,
+    )
+
+    assert result['status'] == 'healthy'
+    assert result['messages_processed'] == 50
+    assert result['samples_written'] == 50
+    assert len(save_calls) <= 2
+    cache_state = store.load_json('book_ticker_cache', {})
+    assert cache_state['BTCUSDT']['event_count'] == 50
+    assert cache_state['BTCUSDT']['samples'][-1]['bidPrice'] == '65049'
+
 
 
 def test_run_book_ticker_cache_monitor_cycle_processes_socket_messages(tmp_path):
@@ -980,7 +1117,7 @@ def test_run_scan_once_passes_real_orderbook_microstructure_into_build_candidate
     monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
     monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
     monkeypatch.setattr(mod, 'fetch_order_book', lambda _client, _symbol, limit=20: {'bids': [['100.0', '10']], 'asks': [['100.1', '8']]}, raising=False)
-    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, _symbol, sample_count=6, interval_ms=150, store=None, cache_max_age_seconds=3.0: [
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, _symbol, sample_count=6, interval_ms=150, store=None, cache_max_age_seconds=3.0, allow_rest_fallback=True: [
         {'bidPrice': '100.0', 'askPrice': '100.1', 'bidQty': '10', 'askQty': '8'},
         {'bidPrice': '100.0', 'askPrice': '100.2', 'bidQty': '8', 'askQty': '6'},
     ], raising=False)
@@ -1104,7 +1241,7 @@ def test_run_scan_once_skips_non_triggered_setup_candidates_for_execution(monkey
     monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
     monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
     monkeypatch.setattr(mod, 'fetch_order_book', lambda _client, _symbol, limit=20: {'bids': [['100.0', '10']], 'asks': [['100.1', '8']]}, raising=False)
-    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, _symbol, sample_count=6, interval_ms=150, store=None, cache_max_age_seconds=3.0: [], raising=False)
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, _symbol, sample_count=6, interval_ms=150, store=None, cache_max_age_seconds=3.0, allow_rest_fallback=True: [], raising=False)
     monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {'spread_bps': 9.995, 'orderbook_slope': 1.4182, 'cancel_rate': 0.5, 'book_depth_fill_ratio': 1.0})
     monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
     monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: candidate)
