@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import datetime
 import importlib.util
 import sys
@@ -6350,3 +6351,100 @@ def test_rest_high_with_fresh_cache_allows_cache_only_scan(tmp_path, monkeypatch
     assert calls['fetch'] == 0
     assert diag['scanner_cache_only_mode'] is True
     assert diag['scanner_rest_fallback_used'] is False
+
+
+def test_resolve_scan_tickers_reuses_rest_and_refresher_snapshots_once(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = {'rest': 0, 'heartbeat': 0}
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: calls.__setitem__('rest', calls['rest'] + 1) or {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'load_ticker_24hr_cache_refresher_heartbeat', lambda _store: calls.__setitem__('heartbeat', calls['heartbeat'] + 1) or {'active': False, 'last_skipped_reason': ''})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert rows == [{'symbol': 'BTCUSDT'}]
+    assert calls == {'rest': 1, 'heartbeat': 1}
+    assert diag['ticker_24hr_cache_refresher_lock_acquired'] is False
+    assert diag['ticker_24hr_cache_refresher_singleton_scope'] == ''
+    assert diag['scanner_patch_fallback_disabled'] is True
+
+
+def test_start_ticker_24hr_cache_refresher_uses_file_lock_for_singleton_window(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    observed = {'locked_loads': 0, 'locked_saves': 0, 'starts': 0}
+    original_file_lock = store._file_lock
+    lock_depth = {'value': 0}
+
+    @contextlib.contextmanager
+    def recording_file_lock(path):
+        lock_depth['value'] += 1
+        try:
+            with original_file_lock(path):
+                yield
+        finally:
+            lock_depth['value'] -= 1
+
+    def recording_load(_store):
+        if lock_depth['value'] > 0:
+            observed['locked_loads'] += 1
+        return {'active': False}
+
+    def recording_save(_store, **kwargs):
+        if lock_depth['value'] > 0:
+            observed['locked_saves'] += 1
+        return {'active': True}
+
+    class DummyThread:
+        name = 'dummy'
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self):
+            assert lock_depth['value'] > 0
+            observed['starts'] += 1
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(store, '_file_lock', recording_file_lock)
+    monkeypatch.setattr(mod, 'load_ticker_24hr_cache_refresher_heartbeat', recording_load)
+    monkeypatch.setattr(mod, '_save_ticker_24hr_cache_refresher_heartbeat', recording_save)
+    monkeypatch.setattr(mod.threading, 'Thread', DummyThread)
+    monkeypatch.setattr(mod, '_TICKER_24HR_CACHE_REFRESHER_THREAD', None)
+
+    thread = mod.start_ticker_24hr_cache_refresher(object(), _ticker_args(), store)
+
+    assert thread is not None
+    assert observed == {'locked_loads': 1, 'locked_saves': 1, 'starts': 1}
+
+
+def test_run_scan_once_ticker_rest_fallback_called_once_when_patch_missing(tmp_path, monkeypatch):
+    args = _ticker_args(runtime_state_dir=str(tmp_path), max_candidates=2, top_gainers=2, scan_prefilter_multiplier=1, min_quote_volume=0, min_5m_change_pct=0, book_ticker_rest_fallback=False)
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    btc_meta = make_meta()
+    btc_meta.symbol = 'BTCUSDT'
+    eth_meta = make_meta()
+    eth_meta.symbol = 'ETHUSDT'
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda client: {'BTCUSDT': btc_meta, 'ETHUSDT': eth_meta})
+    calls = {'fetch_tickers': 0}
+    def fake_fetch_tickers(client):
+        calls['fetch_tickers'] += 1
+        return [{'symbol': 'BTCUSDT', 'priceChangePercent': '1', 'quoteVolume': '1000000', 'lastPrice': '100'}]
+    monkeypatch.setattr(mod, 'fetch_tickers', fake_fetch_tickers)
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['BTCUSDT', 'ETHUSDT'], {'BTCUSDT': 1}, {'BTCUSDT': 1}))
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'risk_on', 'momentum_flags': {}})
+    monkeypatch.setattr(mod, 'resolve_scan_klines', lambda *args, **kwargs: [make_kline(1, 1, 1, 1) for _ in range(40)])
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, 'resolve_scan_order_book', lambda *args, **kwargs: {'bids': [], 'asks': []})
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {})
+    monkeypatch.setattr(mod, 'build_candidate', lambda *args, **kwargs: None)
+
+    payload, best, meta = mod.run_scan_once(client=object(), args=args)
+
+    assert calls['fetch_tickers'] == 1
+    assert payload['funnel']['scanner_patch_fallback_disabled'] is True
+    assert payload['funnel']['symbols_skipped_due_to_missing_ticker_24hr'] >= 1
