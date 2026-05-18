@@ -6127,3 +6127,127 @@ def test_book_ticker_websocket_supervisor_target_records_error_health_when_start
         'book_ticker_ws_supervisor_crashed',
         {'event_source': 'book_ticker_websocket', 'error': 'ws dns unavailable'},
     )]
+
+
+
+def _ticker_args(**overrides):
+    data = {
+        'scanner_rest_fallback': True,
+        'scanner_rest_fallback_min_interval_seconds': 180.0,
+        'scanner_rest_fallback_max_used_weight_1m': 900,
+        'ticker_24hr_cache_max_age_seconds': 300.0,
+        'scanner_order_book_cache_max_age_seconds': 30.0,
+        'runtime_state_dir': 'unit-test-runtime-state',
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+def test_ticker_24hr_cache_fresh_scanner_skips_rest_fallback(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'source': 'unit_test',
+        'row_count': 1,
+        'rows_by_symbol': {'BTCUSDT': {'symbol': 'BTCUSDT', 'priceChangePercent': '1', 'quoteVolume': '1000000'}},
+        'rest_used_weight_1m': 100,
+    })
+    calls = {'fetch': 0}
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 100})
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert calls['fetch'] == 0
+    assert rows[0]['symbol'] == 'BTCUSDT'
+    assert diag['ticker_24hr_cache_available'] is True
+    assert diag['scanner_rest_fallback_used'] is False
+    assert 'ticker_24hr_cache_row_count' in diag
+
+
+def test_ticker_24hr_cache_missing_high_weight_skips_rest_fallback(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = {'fetch': 0}
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 901})
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert calls['fetch'] == 0
+    assert rows == []
+    assert diag['scanner_rest_fallback_skipped_reason'] == 'rest_used_weight_1m_exceeds_limit'
+    assert diag['rest_used_weight_1m'] == 901
+
+
+def test_ticker_24hr_cache_missing_degraded_rows_from_book_ticker_cache(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('book_ticker_cache', {
+        'BTCUSDT': {
+            'updated_at': mod._isoformat_utc(mod._utc_now()),
+            'samples': [{'bidPrice': '100.0', 'askPrice': '101.0', 'bidQty': '1', 'askQty': '1'}],
+            'event_count': 1,
+        }
+    })
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: pytest.fail('REST fallback should be skipped'))
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 901})
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert rows and rows[0]['symbol'] == 'BTCUSDT'
+    assert rows[0]['degraded_ticker_24hr'] is True
+    assert diag['degraded'] is True
+    assert diag['degraded_reason'] == 'ticker_24hr_cache_missing'
+
+
+def test_scanner_rest_fallback_min_interval_enforced(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}])
+
+    first_rows, first_diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+    second_rows, second_diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert first_rows == [{'symbol': 'BTCUSDT'}]
+    assert first_diag['scanner_rest_fallback_used'] is True
+    assert second_rows == []
+    assert second_diag['scanner_rest_fallback_skipped_reason'] == 'scanner_rest_fallback_min_interval'
+
+
+def test_ticker_24hr_cache_refresher_loop_failure_returns_cleanly(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    attempts = {'count': 0}
+    def boom(_client):
+        attempts['count'] += 1
+        raise RuntimeError('temporary ticker failure')
+    class OneShotSleep:
+        def __init__(self):
+            self.stopped = False
+        def is_set(self):
+            return self.stopped
+        def wait(self, _interval):
+            self.stopped = True
+            return True
+    monkeypatch.setattr(mod, 'fetch_tickers', boom)
+
+    mod.ticker_24hr_cache_refresher_loop(object(), _ticker_args(ticker_24hr_cache_refresh_seconds=1), store, stop_event=OneShotSleep())
+
+    assert attempts['count'] == 1
+    assert store.load_json('ticker_24hr_cache', {}) == {}
+
+
+def test_ticker_24hr_cache_diagnostics_fields_present(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 901})
+
+    _rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    for key in [
+        'ticker_24hr_cache_available',
+        'ticker_24hr_cache_age_seconds',
+        'ticker_24hr_cache_row_count',
+        'scanner_rest_fallback_used',
+        'scanner_rest_fallback_skipped_reason',
+        'rest_used_weight_1m',
+        'symbols_skipped_due_to_missing_ticker_24hr',
+    ]:
+        assert key in diag
