@@ -97,6 +97,23 @@ def test_rest_guard_state_is_persisted_across_process_clients(isolated_guard):
         client2.get('/fapi/v1/time')
 
 
+def test_recovering_guard_does_not_extend_recovery_window_on_each_healthy_response(monkeypatch):
+    now_ms = 1_000_000
+    monkeypatch.setattr(m, '_rest_now_ms', lambda: now_ms)
+    m._set_binance_rest_circuit_state('RECOVERING', reason='rest_weight_recovered')
+    first_until = m._binance_rest_guard_snapshot()['recovering_until_ms']
+
+    monkeypatch.setattr(m, '_rest_now_ms', lambda: now_ms + 60_000)
+    response = FakeResponse(200, {'ok': True}, {'X-MBX-USED-WEIGHT-1M': '5'})
+    m._binance_rest_guard_after_response(response, purpose='scanner', path='/fapi/v1/time')
+    assert m._binance_rest_guard_snapshot()['recovering_until_ms'] == first_until
+
+    monkeypatch.setattr(m, '_rest_now_ms', lambda: first_until + 1)
+    snapshot = m._binance_rest_guard_snapshot()
+    assert snapshot['rest_circuit_state'] == 'CLOSED'
+    assert snapshot['recovering_until_ms'] == 0
+
+
 def test_signed_get_classifies_history_backfill_and_allows_execution_under_core_only_weight():
     session = FakeSession([FakeResponse(200, {'orders': []}, {'X-MBX-USED-WEIGHT-1M': '1801'})])
     client = m.BinanceFuturesClient('https://example.test', api_secret='secret', session=session, max_get_retries=1)

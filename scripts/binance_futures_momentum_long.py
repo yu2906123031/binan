@@ -447,7 +447,8 @@ def _binance_rest_guard_after_response(response: Any, *, purpose: str = '', path
         elif state in {'HALF_OPEN', 'RECOVERING', 'DEGRADED'}:
             guard['rest_circuit_state'] = 'RECOVERING'
             guard['rest_circuit_reason'] = 'rest_weight_recovered'
-            guard['recovering_until_ms'] = now_ms + 180_000
+            if state != 'RECOVERING' or int(guard.get('recovering_until_ms') or 0) <= now_ms:
+                guard['recovering_until_ms'] = now_ms + 180_000
     _with_binance_rest_guard_state(mutate)
     _record_rest_weight_metric(purpose, used_weight_1m)
     _log_binance_rest_request(purpose=purpose, path=path, status_code=status_code, used_weight_1m=used_weight_1m, circuit_state=_binance_rest_guard_snapshot().get('rest_circuit_state', 'CLOSED'), request_latency_ms=request_latency_ms)
