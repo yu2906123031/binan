@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from pathlib import Path
@@ -24,28 +25,35 @@ class FakeSession:
         self.responses = list(responses)
         self.headers = {}
         self.calls = 0
+        self.last_kwargs = None
+        self.last_url = None
 
-    def get(self, *args, **kwargs):
+    def get(self, url, **kwargs):
         self.calls += 1
+        self.last_url = url
+        self.last_kwargs = kwargs
         return self.responses.pop(0)
 
-    def post(self, *args, **kwargs):
+    def post(self, url, **kwargs):
         self.calls += 1
+        self.last_url = url
+        self.last_kwargs = kwargs
         return self.responses.pop(0)
 
 
-def reset_guard():
+@pytest.fixture(autouse=True)
+def isolated_guard(tmp_path):
+    old_path = m._BINANCE_REST_GUARD_STATE_PATH
+    m.configure_binance_rest_guard_store(tmp_path)
+    m._BINANCE_REST_WEIGHT_BY_PURPOSE.clear()
     with m._BINANCE_REST_GUARD_LOCK:
-        m._BINANCE_REST_GUARD_STATE.update({
-            'window_started_at': 0.0,
-            'request_count': 0,
-            'circuit_open_until_ms': 0,
-            'last_used_weight_1m': 0,
-        })
+        m._BINANCE_REST_GUARD_STATE.clear()
+        m._BINANCE_REST_GUARD_STATE.update(m._normalize_rest_guard_state({}))
+    yield tmp_path
+    m.configure_binance_rest_guard_store(old_path.parent)
 
 
 def test_public_get_418_opens_rest_guard_and_stops_retrying():
-    reset_guard()
     session = FakeSession([
         FakeResponse(418, {'code': -1003, 'msg': 'Way too many requests; IP banned until 9999999999999'}),
         FakeResponse(200, {'ok': True}),
@@ -54,25 +62,62 @@ def test_public_get_418_opens_rest_guard_and_stops_retrying():
     with pytest.raises(m.BinanceAPIError):
         client.get('/fapi/v1/ticker/24hr')
     assert session.calls == 1
-    with pytest.raises(m.BinanceAPIError, match='circuit open'):
+    with pytest.raises(m.BinanceAPIError, match='binance_rest_circuit_open'):
         client.get('/fapi/v1/ticker/24hr')
     assert session.calls == 1
 
 
 def test_used_weight_header_blocks_scanner_rest_after_threshold():
-    reset_guard()
     session = FakeSession([FakeResponse(200, {'ok': True}, {'X-MBX-USED-WEIGHT-1M': '1501'})])
     client = m.BinanceFuturesClient('https://example.test', session=session, max_get_retries=1)
     assert client.get('/fapi/v1/time') == {'ok': True}
-    with pytest.raises(m.BinanceAPIError, match='circuit open'):
+    with pytest.raises(m.BinanceAPIError, match='scanner_degraded_wait=true'):
         client.get('/fapi/v1/time')
 
 
-def test_rest_guard_caps_synchronous_client_to_five_requests_per_second():
-    reset_guard()
-    session = FakeSession([FakeResponse(200, {'ok': True}) for _ in range(6)])
+def test_rest_guard_caps_synchronous_client_to_two_requests_per_second():
+    session = FakeSession([FakeResponse(200, {'ok': True}) for _ in range(3)])
     client = m.BinanceFuturesClient('https://example.test', session=session, max_get_retries=1)
     started = time.monotonic()
-    for _ in range(6):
+    for _ in range(3):
         client.get('/fapi/v1/time')
     assert time.monotonic() - started >= 0.8
+
+
+def test_rest_guard_state_is_persisted_across_process_clients(isolated_guard):
+    client = m.BinanceFuturesClient('https://example.test', session=FakeSession([FakeResponse(200, {'ok': True}, {'X-MBX-USED-WEIGHT-1M': '1501'})]), max_get_retries=1)
+    assert client.get('/fapi/v1/time') == {'ok': True}
+    state = json.loads((isolated_guard / 'binance_rest_guard.json').read_text())
+    assert state['rest_circuit_state'] == 'DEGRADED'
+    with m._BINANCE_REST_GUARD_LOCK:
+        m._BINANCE_REST_GUARD_STATE.clear()
+        m._BINANCE_REST_GUARD_STATE.update(m._normalize_rest_guard_state({}))
+    client2 = m.BinanceFuturesClient('https://example.test', session=FakeSession([FakeResponse(200, {'ok': True})]), max_get_retries=1)
+    with pytest.raises(m.BinanceAPIError, match='scanner_degraded_wait=true'):
+        client2.get('/fapi/v1/time')
+
+
+def test_signed_get_classifies_history_backfill_and_allows_execution_under_core_only_weight():
+    session = FakeSession([FakeResponse(200, {'orders': []}, {'X-MBX-USED-WEIGHT-1M': '1801'})])
+    client = m.BinanceFuturesClient('https://example.test', api_secret='secret', session=session, max_get_retries=1)
+    client._server_time_offset_ms = 0
+    assert client.signed_get('/fapi/v1/allOrders', {'symbol': 'BTCUSDT'}) == {'orders': []}
+    assert m._BINANCE_REST_WEIGHT_BY_PURPOSE['watchdog'] == 1801
+    exec_session = FakeSession([FakeResponse(200, {'orderId': 1})])
+    exec_client = m.BinanceFuturesClient('https://example.test', api_secret='secret', session=exec_session, max_get_retries=1)
+    exec_client._server_time_offset_ms = 0
+    assert exec_client.signed_post('/fapi/v1/order', {'symbol': 'BTCUSDT'}) == {'orderId': 1}
+
+
+def test_scanner_proxy_only_applies_to_public_gets():
+    session = FakeSession([FakeResponse(200, {'ok': True}), FakeResponse(200, {'orderId': 1})])
+    client = m.BinanceFuturesClient('https://example.test', api_secret='secret', session=session, max_get_retries=1, scanner_proxy_urls=['127.0.0.1:1080'])
+    client._server_time_offset_ms = 0
+    assert client.get('/fapi/v1/time') == {'ok': True}
+    assert 'proxies' in session.last_kwargs
+    assert client.signed_post('/fapi/v1/order', {'symbol': 'BTCUSDT'}) == {'orderId': 1}
+    assert 'proxies' not in session.last_kwargs
+
+
+def test_binance_ban_until_parser_accepts_cst_date():
+    assert m.extract_binance_ip_ban_until_ms('Way too many requests; IP banned until 2026-05-18 18:30:00 CST.') == 1779100200000

@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 from urllib.parse import quote, urlencode
 
 import requests
+import portalocker
 
 import candidate_builder as candidate_builder_mod
 from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
@@ -139,16 +140,85 @@ def choose_scanner_proxy_url(proxy_urls: Sequence[str]) -> str:
 
 _BINANCE_REST_GUARD_LOCK = threading.Lock()
 _BINANCE_REST_GUARD_STATE: Dict[str, Any] = {
-    'window_started_at': 0.0,
-    'request_count': 0,
+    'window_started_at_ms': 0,
+    'request_count_1s': 0,
     'circuit_open_until_ms': 0,
-    'last_used_weight_1m': 0,
-    'state': 'CLOSED',
-    'reason': '',
-    'next_probe_at_ms': 0,
+    'rest_used_weight_1m': 0,
+    'rest_circuit_state': 'CLOSED',
+    'rest_circuit_reason': '',
+    'next_rest_probe_at_ms': 0,
     'half_open_probe_used': False,
     'recovering_until_ms': 0,
 }
+_BINANCE_REST_GUARD_STATE_PATH = Path(os.getenv('BINANCE_REST_GUARD_STATE_PATH', f'/tmp/binance_rest_guard_{os.getpid()}_{time.monotonic_ns()}.json'))
+_BINANCE_REST_WEIGHT_BY_PURPOSE: Dict[str, int] = {}
+
+
+def configure_binance_rest_guard_store(runtime_state_dir: Any = None) -> Path:
+    global _BINANCE_REST_GUARD_STATE_PATH
+    base = Path(runtime_state_dir or CANONICAL_RUNTIME_STATE_DIR).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    _BINANCE_REST_GUARD_STATE_PATH = base / 'binance_rest_guard.json'
+    return _BINANCE_REST_GUARD_STATE_PATH
+
+
+def _normalize_rest_guard_state(raw: Any) -> Dict[str, Any]:
+    state = dict(_BINANCE_REST_GUARD_STATE)
+    if isinstance(raw, dict):
+        state.update(raw)
+    if 'state' in state and 'rest_circuit_state' not in state:
+        state['rest_circuit_state'] = state.get('state')
+    if 'reason' in state and 'rest_circuit_reason' not in state:
+        state['rest_circuit_reason'] = state.get('reason')
+    if 'last_used_weight_1m' in state and not state.get('rest_used_weight_1m'):
+        state['rest_used_weight_1m'] = state.get('last_used_weight_1m')
+    if 'next_probe_at_ms' in state and not state.get('next_rest_probe_at_ms'):
+        state['next_rest_probe_at_ms'] = state.get('next_probe_at_ms')
+    if 'request_count' in state and not state.get('request_count_1s'):
+        state['request_count_1s'] = state.get('request_count')
+    if 'window_started_at' in state and not state.get('window_started_at_ms'):
+        try:
+            state['window_started_at_ms'] = int(float(state.get('window_started_at') or 0) * 1000)
+        except Exception:
+            state['window_started_at_ms'] = 0
+    state['rest_circuit_state'] = str(state.get('rest_circuit_state') or 'CLOSED').upper()
+    state['rest_circuit_reason'] = str(state.get('rest_circuit_reason') or '')
+    for key in ['rest_used_weight_1m', 'next_rest_probe_at_ms', 'circuit_open_until_ms', 'request_count_1s', 'window_started_at_ms', 'recovering_until_ms']:
+        try:
+            state[key] = int(float(state.get(key) or 0))
+        except Exception:
+            state[key] = 0
+    state['half_open_probe_used'] = bool(state.get('half_open_probe_used'))
+    return state
+
+
+def _write_rest_guard_state_locked(path: Path, state: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def _with_binance_rest_guard_state(mutator: Callable[[Dict[str, Any]], Any]) -> Any:
+    path = _BINANCE_REST_GUARD_STATE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / f'.{path.name}.lock'
+    with _BINANCE_REST_GUARD_LOCK:
+        with lock_path.open('a+', encoding='utf-8') as lock_fh:
+            portalocker.lock(lock_fh, portalocker.LOCK_EX)
+            try:
+                try:
+                    raw = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+                except Exception:
+                    raw = {}
+                state = _normalize_rest_guard_state(raw)
+                result = mutator(state)
+                _BINANCE_REST_GUARD_STATE.clear()
+                _BINANCE_REST_GUARD_STATE.update(_normalize_rest_guard_state(state))
+                _write_rest_guard_state_locked(path, _BINANCE_REST_GUARD_STATE)
+                return result
+            finally:
+                portalocker.unlock(lock_fh)
 
 REST_WEIGHT_SLOWDOWN_THRESHOLD = 1200
 REST_WEIGHT_SCANNER_BLOCK_THRESHOLD = 1500
@@ -165,13 +235,28 @@ def _extract_response_used_weight_1m(response: Any) -> int:
         return 0
 
 
-def _extract_retry_after_ms_from_message(message: Any) -> Optional[int]:
-    match = re.search(r'banned until\s+(\d{10,})', str(message), flags=re.IGNORECASE)
-    if match:
+def _parse_binance_ban_until_text(value: Any) -> Optional[int]:
+    text = str(value or '').strip().strip('.').strip()
+    numeric = re.match(r'^(\d{10}|\d{13})$', text)
+    if numeric:
+        raw = int(numeric.group(1))
+        return raw * 1000 if len(numeric.group(1)) == 10 else raw
+    date_match = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*CST$', text, flags=re.IGNORECASE)
+    if date_match:
         try:
-            return int(match.group(1))
+            dt = datetime.datetime.strptime(date_match.group(1), '%Y-%m-%d %H:%M:%S')
+            dt = dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+            return int(dt.timestamp() * 1000)
         except ValueError:
             return None
+    return None
+
+
+def _extract_retry_after_ms_from_message(message: Any) -> Optional[int]:
+    text = str(message)
+    match = re.search(r'banned until\s+([0-9]{10,13}|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*CST)', text, flags=re.IGNORECASE)
+    if match:
+        return _parse_binance_ban_until_text(match.group(1))
     return None
 
 
@@ -179,133 +264,193 @@ def _rest_now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _rest_scanner_purpose(purpose: str) -> bool:
+    return str(purpose or '').strip() in {'scanner', 'market_data', 'public'}
+
+
+def _rest_core_purpose(purpose: str) -> bool:
+    return str(purpose or '').strip() in {'execution', 'emergency', 'order_status', 'signed', 'account', 'account_reconcile'}
+
+
 def _set_binance_rest_circuit_state(state: str, *, reason: str = '', open_for_seconds: float = 0.0) -> None:
     now_ms = _rest_now_ms()
     open_until_ms = int(now_ms + max(0.0, float(open_for_seconds or 0.0)) * 1000) if open_for_seconds else 0
-    with _BINANCE_REST_GUARD_LOCK:
-        _BINANCE_REST_GUARD_STATE['state'] = state
-        _BINANCE_REST_GUARD_STATE['reason'] = reason
-        _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = open_until_ms
-        _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = open_until_ms
-        _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
-        if state == 'RECOVERING':
-            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = now_ms + 180_000
-        elif state in {'CLOSED', 'OPEN', 'DEGRADED'}:
-            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = 0
+    def mutate(guard: Dict[str, Any]) -> None:
+        guard['rest_circuit_state'] = str(state or 'CLOSED').upper()
+        guard['rest_circuit_reason'] = reason
+        guard['circuit_open_until_ms'] = open_until_ms
+        guard['next_rest_probe_at_ms'] = open_until_ms
+        guard['half_open_probe_used'] = False
+        guard['recovering_until_ms'] = now_ms + 180_000 if guard['rest_circuit_state'] == 'RECOVERING' else 0
+    _with_binance_rest_guard_state(mutate)
+
+
+def _advance_rest_guard_state(guard: Dict[str, Any], now_ms: int) -> None:
+    state = str(guard.get('rest_circuit_state') or 'CLOSED').upper()
+    open_until_ms = int(guard.get('circuit_open_until_ms') or 0)
+    recovering_until_ms = int(guard.get('recovering_until_ms') or 0)
+    used_weight = int(guard.get('rest_used_weight_1m') or 0)
+    if state == 'OPEN' and open_until_ms and now_ms >= open_until_ms:
+        guard['rest_circuit_state'] = 'HALF_OPEN'
+        guard['half_open_probe_used'] = False
+    elif state == 'RECOVERING' and recovering_until_ms and now_ms >= recovering_until_ms and used_weight < REST_WEIGHT_SLOWDOWN_THRESHOLD:
+        guard['rest_circuit_state'] = 'CLOSED'
+        guard['rest_circuit_reason'] = ''
+        guard['recovering_until_ms'] = 0
 
 
 def _binance_rest_guard_snapshot() -> Dict[str, Any]:
     now_ms = _rest_now_ms()
-    with _BINANCE_REST_GUARD_LOCK:
-        state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
-        open_until_ms = int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0)
-        next_probe_at_ms = int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or open_until_ms or 0)
-        used_weight = int(_BINANCE_REST_GUARD_STATE.get('last_used_weight_1m') or 0)
-        recovering_until_ms = int(_BINANCE_REST_GUARD_STATE.get('recovering_until_ms') or 0)
-        if state == 'OPEN' and open_until_ms and now_ms >= open_until_ms:
-            state = 'HALF_OPEN'
-            _BINANCE_REST_GUARD_STATE['state'] = state
-            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
-        elif state == 'RECOVERING' and recovering_until_ms and now_ms >= recovering_until_ms and used_weight < REST_WEIGHT_SLOWDOWN_THRESHOLD:
-            state = 'CLOSED'
-            _BINANCE_REST_GUARD_STATE['state'] = state
-            _BINANCE_REST_GUARD_STATE['reason'] = ''
-            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = 0
-        state = str(_BINANCE_REST_GUARD_STATE.get('state') or state)
+    def mutate(guard: Dict[str, Any]) -> Dict[str, Any]:
+        _advance_rest_guard_state(guard, now_ms)
+        next_probe_at_ms = int(guard.get('next_rest_probe_at_ms') or guard.get('circuit_open_until_ms') or 0)
         return {
-            'state': state,
-            'reason': str(_BINANCE_REST_GUARD_STATE.get('reason') or ''),
-            'rest_used_weight_1m': used_weight,
-            'circuit_open_until_ms': int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0),
-            'next_rest_probe_at_ms': int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0),
-            'next_retry_after_seconds': max(0, int(((int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0) or now_ms) - now_ms) / 1000)),
-            'half_open_probe_used': bool(_BINANCE_REST_GUARD_STATE.get('half_open_probe_used')),
+            'state': str(guard.get('rest_circuit_state') or 'CLOSED'),
+            'reason': str(guard.get('rest_circuit_reason') or ''),
+            'rest_circuit_state': str(guard.get('rest_circuit_state') or 'CLOSED'),
+            'rest_circuit_reason': str(guard.get('rest_circuit_reason') or ''),
+            'rest_used_weight_1m': int(guard.get('rest_used_weight_1m') or 0),
+            'circuit_open_until_ms': int(guard.get('circuit_open_until_ms') or 0),
+            'next_rest_probe_at_ms': next_probe_at_ms,
+            'next_retry_after_seconds': max(0, int((next_probe_at_ms - now_ms) / 1000)) if next_probe_at_ms else 0,
+            'request_count_1s': int(guard.get('request_count_1s') or 0),
+            'window_started_at_ms': int(guard.get('window_started_at_ms') or 0),
+            'half_open_probe_used': bool(guard.get('half_open_probe_used')),
+            'recovering_until_ms': int(guard.get('recovering_until_ms') or 0),
+            **{f'{k}_rest_weight_1m': int(v) for k, v in _BINANCE_REST_WEIGHT_BY_PURPOSE.items()},
         }
+    return _with_binance_rest_guard_state(mutate)
+
+
+def _raise_rest_guard_blocked(reason: str, until_ms: int = 0) -> None:
+    wait = max(0, int(((until_ms or _rest_now_ms()) - _rest_now_ms()) / 1000)) if until_ms else 0
+    suffix = f' next_retry_after_seconds={wait}' if wait else ''
+    raise BinanceAPIError(f'{reason}{suffix}')
 
 
 def _binance_rest_guard_before_request(max_requests_per_second: int = 2, *, purpose: str = 'scanner') -> None:
     purpose = str(purpose or 'scanner')
-    scanner_purpose = purpose in {'scanner', 'market_data', 'public'}
-    core_purpose = purpose in {'execution', 'emergency', 'order_status', 'signed', 'account'}
+    scanner_purpose = _rest_scanner_purpose(purpose)
+    core_purpose = _rest_core_purpose(purpose)
     while True:
-        with _BINANCE_REST_GUARD_LOCK:
-            now = time.monotonic()
+        sleep_for = 0.0
+        def mutate(guard: Dict[str, Any]) -> Optional[float]:
             now_ms = _rest_now_ms()
-            state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
-            open_until_ms = int(_BINANCE_REST_GUARD_STATE.get('circuit_open_until_ms') or 0)
-            used_weight = int(_BINANCE_REST_GUARD_STATE.get('last_used_weight_1m') or 0)
-            if state == 'OPEN' and open_until_ms and now_ms >= open_until_ms:
-                state = 'HALF_OPEN'
-                _BINANCE_REST_GUARD_STATE['state'] = state
-                _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+            _advance_rest_guard_state(guard, now_ms)
+            state = str(guard.get('rest_circuit_state') or 'CLOSED').upper()
+            open_until_ms = int(guard.get('circuit_open_until_ms') or 0)
+            next_probe_at_ms = int(guard.get('next_rest_probe_at_ms') or open_until_ms or 0)
+            used_weight = int(guard.get('rest_used_weight_1m') or 0)
             if state == 'OPEN' and open_until_ms and now_ms < open_until_ms:
                 if scanner_purpose or used_weight >= REST_WEIGHT_CORE_ONLY_THRESHOLD:
-                    raise BinanceAPIError(f'Binance REST circuit open until {open_until_ms}')
+                    _raise_rest_guard_blocked('blocked_reason=binance_rest_circuit_open scanner_degraded_wait=true', open_until_ms)
+            if state == 'DEGRADED' and scanner_purpose and next_probe_at_ms and now_ms < next_probe_at_ms:
+                _raise_rest_guard_blocked('blocked_reason=binance_rest_circuit_open scanner_degraded_wait=true', next_probe_at_ms)
             if state == 'HALF_OPEN':
-                if scanner_purpose and bool(_BINANCE_REST_GUARD_STATE.get('half_open_probe_used')):
-                    raise BinanceAPIError(f'Binance REST circuit half-open probe already used until {open_until_ms}')
+                if scanner_purpose and bool(guard.get('half_open_probe_used')):
+                    _raise_rest_guard_blocked('blocked_reason=binance_rest_circuit_open scanner_degraded_wait=true', next_probe_at_ms or open_until_ms)
                 if scanner_purpose:
-                    _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = True
+                    guard['half_open_probe_used'] = True
             if scanner_purpose and used_weight >= REST_WEIGHT_SCANNER_BLOCK_THRESHOLD:
-                _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
-                _BINANCE_REST_GUARD_STATE['reason'] = f'rest_used_weight_1m:{used_weight}'
-                _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = max(int(_BINANCE_REST_GUARD_STATE.get('next_probe_at_ms') or 0), now_ms + 120_000)
-                raise BinanceAPIError(f'Binance REST circuit open until {_BINANCE_REST_GUARD_STATE["next_probe_at_ms"]}')
+                guard['rest_circuit_state'] = 'DEGRADED'
+                guard['rest_circuit_reason'] = f'rest_used_weight_1m:{used_weight}'
+                guard['next_rest_probe_at_ms'] = max(next_probe_at_ms, now_ms + 120_000)
+                _raise_rest_guard_blocked('blocked_reason=binance_rest_circuit_open scanner_degraded_wait=true', int(guard['next_rest_probe_at_ms']))
             if used_weight >= REST_WEIGHT_CORE_ONLY_THRESHOLD and not core_purpose:
-                _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
-                _BINANCE_REST_GUARD_STATE['reason'] = f'rest_core_only_used_weight_1m:{used_weight}'
-                raise BinanceAPIError(f'Binance REST core-only due to used weight {used_weight}')
-            if now - float(_BINANCE_REST_GUARD_STATE.get('window_started_at') or 0.0) >= 1.0:
-                _BINANCE_REST_GUARD_STATE['window_started_at'] = now
-                _BINANCE_REST_GUARD_STATE['request_count'] = 0
+                guard['rest_circuit_state'] = 'DEGRADED'
+                guard['rest_circuit_reason'] = f'rest_core_only_used_weight_1m:{used_weight}'
+                guard['next_rest_probe_at_ms'] = max(next_probe_at_ms, now_ms + 120_000)
+                _raise_rest_guard_blocked('blocked_reason=binance_rest_circuit_open scanner_degraded_wait=true', int(guard['next_rest_probe_at_ms']))
+            window_started_at_ms = int(guard.get('window_started_at_ms') or 0)
+            if now_ms < window_started_at_ms or now_ms - window_started_at_ms >= 1000:
+                guard['window_started_at_ms'] = now_ms
+                guard['request_count_1s'] = 0
+                window_started_at_ms = now_ms
             effective_rps = max_requests_per_second
-            if used_weight >= REST_WEIGHT_SLOWDOWN_THRESHOLD:
+            if used_weight >= REST_WEIGHT_SLOWDOWN_THRESHOLD or state in {'HALF_OPEN', 'RECOVERING'}:
                 effective_rps = 1
-            if state in {'HALF_OPEN', 'RECOVERING'}:
-                effective_rps = 1
-            if int(_BINANCE_REST_GUARD_STATE.get('request_count') or 0) < effective_rps:
-                _BINANCE_REST_GUARD_STATE['request_count'] = int(_BINANCE_REST_GUARD_STATE.get('request_count') or 0) + 1
-                return
-            sleep_for = max(0.01, 1.0 - (now - float(_BINANCE_REST_GUARD_STATE.get('window_started_at') or now)))
+            if int(guard.get('request_count_1s') or 0) < effective_rps:
+                guard['request_count_1s'] = int(guard.get('request_count_1s') or 0) + 1
+                return None
+            return max(0.01, (1000 - (now_ms - window_started_at_ms)) / 1000.0)
+        sleep_for = _with_binance_rest_guard_state(mutate) or 0.0
+        if sleep_for <= 0:
+            return
         time.sleep(sleep_for)
 
 
-def _binance_rest_guard_after_response(response: Any) -> None:
+def _record_rest_weight_metric(purpose: str, used_weight_1m: int) -> None:
+    bucket = {
+        'scanner': 'scanner',
+        'market_data': 'scanner',
+        'public': 'scanner',
+        'metadata': 'metadata',
+        'execution': 'execution',
+        'order_status': 'reconcile',
+        'account_reconcile': 'reconcile',
+        'history_backfill': 'watchdog',
+        'low_frequency_market_data': 'watchdog',
+    }.get(str(purpose or ''), str(purpose or 'unknown'))
+    if used_weight_1m:
+        _BINANCE_REST_WEIGHT_BY_PURPOSE[bucket] = int(used_weight_1m)
+
+
+def _log_binance_rest_request(*, purpose: str, path: str, status_code: int, used_weight_1m: int, circuit_state: str, request_latency_ms: int) -> None:
+    payload = {
+        'event': 'binance_rest_request',
+        'purpose': purpose,
+        'path': path,
+        'status_code': int(status_code or 0),
+        'used_weight_1m': int(used_weight_1m or 0),
+        'circuit_state': circuit_state,
+        'request_latency_ms': int(request_latency_ms or 0),
+        'process_id': os.getpid(),
+        'thread_name': threading.current_thread().name,
+    }
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+
+
+def _binance_rest_guard_after_response(response: Any, *, purpose: str = '', path: str = '', request_latency_ms: int = 0) -> None:
     used_weight_1m = _extract_response_used_weight_1m(response)
     status_code = int(getattr(response, 'status_code', 0) or 0)
     now_ms = _rest_now_ms()
-    with _BINANCE_REST_GUARD_LOCK:
+    def mutate(guard: Dict[str, Any]) -> None:
         if used_weight_1m:
-            _BINANCE_REST_GUARD_STATE['last_used_weight_1m'] = used_weight_1m
-        state = str(_BINANCE_REST_GUARD_STATE.get('state') or 'CLOSED')
+            guard['rest_used_weight_1m'] = used_weight_1m
+        state = str(guard.get('rest_circuit_state') or 'CLOSED').upper()
         if status_code == 418:
-            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
-            _BINANCE_REST_GUARD_STATE['reason'] = 'http_418_ip_ban'
-            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = now_ms + int(REST_418_COOLDOWN_SECONDS * 1000)
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            guard['rest_circuit_state'] = 'OPEN'
+            guard['rest_circuit_reason'] = 'http_418_ip_ban'
+            guard['circuit_open_until_ms'] = now_ms + int(REST_418_COOLDOWN_SECONDS * 1000)
+            guard['next_rest_probe_at_ms'] = guard['circuit_open_until_ms']
+            guard['half_open_probe_used'] = False
             return
         if status_code == 429:
-            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
-            _BINANCE_REST_GUARD_STATE['reason'] = 'http_429_rate_limit'
-            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = now_ms + int(REST_429_COOLDOWN_SECONDS * 1000)
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
+            guard['rest_circuit_state'] = 'OPEN'
+            guard['rest_circuit_reason'] = 'http_429_rate_limit'
+            guard['circuit_open_until_ms'] = now_ms + int(REST_429_COOLDOWN_SECONDS * 1000)
+            guard['next_rest_probe_at_ms'] = guard['circuit_open_until_ms']
+            guard['half_open_probe_used'] = False
             return
         if used_weight_1m >= REST_WEIGHT_CORE_ONLY_THRESHOLD:
-            _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
-            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_core_only_used_weight_1m:{used_weight_1m}'
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 120_000
+            guard['rest_circuit_state'] = 'DEGRADED'
+            guard['rest_circuit_reason'] = f'rest_core_only_used_weight_1m:{used_weight_1m}'
+            guard['next_rest_probe_at_ms'] = now_ms + 120_000
         elif used_weight_1m >= REST_WEIGHT_SCANNER_BLOCK_THRESHOLD:
-            _BINANCE_REST_GUARD_STATE['state'] = 'DEGRADED'
-            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_scanner_block_used_weight_1m:{used_weight_1m}'
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 120_000
+            guard['rest_circuit_state'] = 'DEGRADED'
+            guard['rest_circuit_reason'] = f'rest_scanner_block_used_weight_1m:{used_weight_1m}'
+            guard['next_rest_probe_at_ms'] = now_ms + 120_000
         elif used_weight_1m >= REST_WEIGHT_SLOWDOWN_THRESHOLD:
-            _BINANCE_REST_GUARD_STATE['state'] = 'RECOVERING' if state in {'OPEN', 'HALF_OPEN'} else 'DEGRADED'
-            _BINANCE_REST_GUARD_STATE['reason'] = f'rest_slowdown_used_weight_1m:{used_weight_1m}'
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = now_ms + 60_000
+            guard['rest_circuit_state'] = 'RECOVERING' if state in {'OPEN', 'HALF_OPEN'} else 'DEGRADED'
+            guard['rest_circuit_reason'] = f'rest_slowdown_used_weight_1m:{used_weight_1m}'
+            guard['next_rest_probe_at_ms'] = now_ms + 60_000
         elif state in {'HALF_OPEN', 'RECOVERING', 'DEGRADED'}:
-            _BINANCE_REST_GUARD_STATE['state'] = 'RECOVERING'
-            _BINANCE_REST_GUARD_STATE['reason'] = 'rest_weight_recovered'
-            _BINANCE_REST_GUARD_STATE['recovering_until_ms'] = now_ms + 180_000
+            guard['rest_circuit_state'] = 'RECOVERING'
+            guard['rest_circuit_reason'] = 'rest_weight_recovered'
+            guard['recovering_until_ms'] = now_ms + 180_000
+    _with_binance_rest_guard_state(mutate)
+    _record_rest_weight_metric(purpose, used_weight_1m)
+    _log_binance_rest_request(purpose=purpose, path=path, status_code=status_code, used_weight_1m=used_weight_1m, circuit_state=_binance_rest_guard_snapshot().get('rest_circuit_state', 'CLOSED'), request_latency_ms=request_latency_ms)
 
 
 def _binance_rest_guard_after_error(error: Any, fallback_cooldown_seconds: float = 900.0) -> None:
@@ -313,20 +458,21 @@ def _binance_rest_guard_after_error(error: Any, fallback_cooldown_seconds: float
     lowered = message.lower()
     retry_after_ms = _extract_retry_after_ms_from_message(message)
     if 'binance api error 418' in lowered or 'ip banned' in lowered:
-        with _BINANCE_REST_GUARD_LOCK:
-            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
-            _BINANCE_REST_GUARD_STATE['reason'] = 'binance_418_ip_ban'
-            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_418_COOLDOWN_SECONDS) * 1000)
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
-            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
+        def mutate(guard: Dict[str, Any]) -> None:
+            guard['rest_circuit_state'] = 'OPEN'
+            guard['rest_circuit_reason'] = 'binance_418_ip_ban'
+            guard['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_418_COOLDOWN_SECONDS) * 1000)
+            guard['next_rest_probe_at_ms'] = guard['circuit_open_until_ms']
+            guard['half_open_probe_used'] = False
+        _with_binance_rest_guard_state(mutate)
     elif 'binance api error 429' in lowered or 'too many requests' in lowered:
-        with _BINANCE_REST_GUARD_LOCK:
-            _BINANCE_REST_GUARD_STATE['state'] = 'OPEN'
-            _BINANCE_REST_GUARD_STATE['reason'] = 'binance_429_rate_limit'
-            _BINANCE_REST_GUARD_STATE['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_429_COOLDOWN_SECONDS) * 1000)
-            _BINANCE_REST_GUARD_STATE['next_probe_at_ms'] = _BINANCE_REST_GUARD_STATE['circuit_open_until_ms']
-            _BINANCE_REST_GUARD_STATE['half_open_probe_used'] = False
-
+        def mutate(guard: Dict[str, Any]) -> None:
+            guard['rest_circuit_state'] = 'OPEN'
+            guard['rest_circuit_reason'] = 'binance_429_rate_limit'
+            guard['circuit_open_until_ms'] = retry_after_ms or int((time.time() + REST_429_COOLDOWN_SECONDS) * 1000)
+            guard['next_rest_probe_at_ms'] = guard['circuit_open_until_ms']
+            guard['half_open_probe_used'] = False
+        _with_binance_rest_guard_state(mutate)
 
 class BinanceFuturesClient:
     RECV_WINDOW_MS = 10_000
@@ -365,9 +511,10 @@ class BinanceFuturesClient:
                 request_kwargs = {'params': params or {}, 'timeout': timeout}
                 if proxy_url:
                     request_kwargs['proxies'] = {'http': proxy_url, 'https': proxy_url}
+                request_started = time.monotonic()
                 _binance_rest_guard_before_request(purpose='scanner')
                 response = self.session.get(url, **request_kwargs)
-                _binance_rest_guard_after_response(response)
+                _binance_rest_guard_after_response(response, purpose='scanner', path=path, request_latency_ms=int((time.monotonic() - request_started) * 1000))
                 self._raise_for_status(response)
                 return response.json()
             except BinanceAPIError as exc:
@@ -417,7 +564,8 @@ class BinanceFuturesClient:
         signature = hmac.new(self.api_secret.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
         payload['signature'] = signature
         url = f'{self.base_url}{path}'
-        signed_purpose = 'execution' if method in {'POST', 'PUT', 'DELETE'} else 'order_status'
+        signed_purpose = self._signed_request_purpose(method, path)
+        request_started = time.monotonic()
         _binance_rest_guard_before_request(purpose=signed_purpose)
         if method == 'GET':
             response = self.session.get(url, params=payload, timeout=timeout)
@@ -429,7 +577,7 @@ class BinanceFuturesClient:
             response = self.session.delete(url, params=payload, timeout=timeout)
         else:
             raise ValueError(f'unsupported signed method: {method}')
-        _binance_rest_guard_after_response(response)
+        _binance_rest_guard_after_response(response, purpose=signed_purpose, path=path, request_latency_ms=int((time.monotonic() - request_started) * 1000))
         try:
             self._raise_for_status(response)
         except BinanceAPIError as exc:
@@ -456,6 +604,17 @@ class BinanceFuturesClient:
         except Exception:
             self._server_time_offset_ms = 0
         return int(self._server_time_offset_ms or 0)
+
+    @staticmethod
+    def _signed_request_purpose(method: str, path: str) -> str:
+        if method in {'POST', 'PUT', 'DELETE'}:
+            return 'execution'
+        normalized = str(path or '')
+        if normalized.endswith('/account') or normalized.endswith('/balance') or normalized.endswith('/positionRisk'):
+            return 'account_reconcile'
+        if normalized.endswith('/allOrders') or normalized.endswith('/userTrades') or normalized.endswith('/income') or normalized.endswith('/openOrders'):
+            return 'history_backfill'
+        return 'order_status'
 
     @staticmethod
     def _is_recvwindow_error(exc: BinanceAPIError) -> bool:
@@ -491,14 +650,7 @@ def is_binance_ip_ban_error(error: Any) -> bool:
 
 
 def extract_binance_ip_ban_until_ms(error: Any) -> Optional[int]:
-    message = str(error)
-    match = re.search(r'banned until\s+(\d{10,})', message, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
+    return _extract_retry_after_ms_from_message(error)
 
 
 def current_time_ms() -> int:
@@ -9528,6 +9680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
+    configure_binance_rest_guard_store(getattr(args, 'runtime_state_dir', CANONICAL_RUNTIME_STATE_DIR))
     if is_binance_simulated_trading(args) and 'base_url' not in set(getattr(args, '_explicit_cli_dests', set()) or set()):
         args.base_url = 'https://testnet.binancefuture.com'
     binance_api_key, binance_api_secret = resolve_binance_api_credentials(args)
