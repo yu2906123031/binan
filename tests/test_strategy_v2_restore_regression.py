@@ -6251,3 +6251,102 @@ def test_ticker_24hr_cache_diagnostics_fields_present(tmp_path, monkeypatch):
         'symbols_skipped_due_to_missing_ticker_24hr',
     ]:
         assert key in diag
+
+
+def test_load_scan_ticker_cache_state_called_once(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = {'count': 0}
+    def fake_state(_store, max_age_seconds=300.0):
+        calls['count'] += 1
+        return {'fresh': True, 'rows': [{'symbol': 'BTCUSDT'}]}
+    monkeypatch.setattr(mod, 'load_scan_ticker_cache_state', fake_state)
+
+    rows = mod.load_scan_ticker_cache(store, max_age_seconds=300.0)
+
+    assert rows == [{'symbol': 'BTCUSDT'}]
+    assert calls['count'] == 1
+
+
+def test_refresher_skips_fetch_when_rest_weight_high(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    calls = {'fetch': 0}
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 900})
+
+    payload = mod.refresh_ticker_24hr_cache_once(object(), store, args=_ticker_args())
+
+    assert calls['fetch'] == 0
+    assert payload['skipped'] is True
+    assert payload['reason'] == 'rest_used_weight_1m_exceeds_limit'
+
+
+def test_refresher_skips_fetch_when_cache_fresh(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'rows_by_symbol': {'BTCUSDT': {'symbol': 'BTCUSDT'}},
+        'row_count': 1,
+    })
+    calls = {'fetch': 0}
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+
+    payload = mod.refresh_ticker_24hr_cache_once(object(), store, args=_ticker_args())
+
+    assert calls['fetch'] == 0
+    assert payload['reason'] == 'cache_fresh'
+
+
+def test_fallback_cursor_uses_epoch_ms(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod.time, 'time', lambda: 1_700_000_000.123)
+
+    mod._save_scanner_ticker_rest_fallback_cursor(store)
+
+    cursor = store.load_json('scanner_rest_fallback_cursor', {})
+    assert cursor['last_ticker_24hr_at_ms'] == 1_700_000_000_123
+    assert 'last_ticker_24hr_at_monotonic' not in cursor
+
+
+def test_refresher_start_is_singleton_with_active_heartbeat(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache_refresher_heartbeat', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'active': True,
+        'pid': 123,
+    })
+    started = {'count': 0}
+    class DummyThread:
+        name = 'dummy'
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self):
+            started['count'] += 1
+        def is_alive(self):
+            return True
+    monkeypatch.setattr(mod.threading, 'Thread', DummyThread)
+    monkeypatch.setattr(mod, '_TICKER_24HR_CACHE_REFRESHER_THREAD', None)
+
+    thread = mod.start_ticker_24hr_cache_refresher(object(), _ticker_args(), store)
+
+    assert thread is None
+    assert started['count'] == 0
+
+
+def test_rest_high_with_fresh_cache_allows_cache_only_scan(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'rows_by_symbol': {'BTCUSDT': {'symbol': 'BTCUSDT'}},
+        'row_count': 1,
+    })
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 1300})
+    calls = {'fetch': 0}
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert rows == [{'symbol': 'BTCUSDT'}]
+    assert calls['fetch'] == 0
+    assert diag['scanner_cache_only_mode'] is True
+    assert diag['scanner_rest_fallback_used'] is False

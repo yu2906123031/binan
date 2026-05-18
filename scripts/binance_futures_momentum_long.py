@@ -5208,7 +5208,8 @@ def load_scan_ticker_cache_state(store: Optional[RuntimeStateStore], max_age_sec
 
 
 def load_scan_ticker_cache(store: Optional[RuntimeStateStore], max_age_seconds: float = 300.0) -> List[Dict[str, Any]]:
-    return list(load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds).get('rows') or []) if load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds).get('fresh') else []
+    state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds)
+    return list(state.get('rows') or []) if state.get('fresh') else []
 
 
 def _scanner_rest_fallback_cursor(store: Optional[RuntimeStateStore]) -> Dict[str, Any]:
@@ -5240,9 +5241,10 @@ def scanner_ticker_rest_fallback_decision(store: Optional[RuntimeStateStore], ar
     if used_weight >= max_used_weight:
         return {'allowed': False, 'reason': 'rest_used_weight_1m_exceeds_limit', 'rest_used_weight_1m': used_weight, 'max_used_weight_1m': max_used_weight}
     cursor = _scanner_rest_fallback_cursor(store)
-    last_at = float(cursor.get('last_ticker_24hr_at_monotonic') or 0.0)
+    last_at_ms = int(cursor.get('last_ticker_24hr_at_ms') or 0)
     min_interval = float(getattr(args, 'scanner_rest_fallback_min_interval_seconds', 0.0) or 0.0)
-    elapsed = time.monotonic() - last_at if last_at > 0 else None
+    now_ms = int(time.time() * 1000)
+    elapsed = (now_ms - last_at_ms) / 1000.0 if last_at_ms > 0 else None
     if min_interval > 0 and elapsed is not None and elapsed < min_interval:
         return {'allowed': False, 'reason': 'scanner_rest_fallback_min_interval', 'seconds_until_allowed': round(min_interval - elapsed, 3), 'rest_used_weight_1m': used_weight}
     return {'allowed': True, 'reason': 'cache_missing_or_expired', 'rest_used_weight_1m': used_weight}
@@ -5251,7 +5253,7 @@ def scanner_ticker_rest_fallback_decision(store: Optional[RuntimeStateStore], ar
 def _save_scanner_ticker_rest_fallback_cursor(store: Optional[RuntimeStateStore]) -> None:
     if store is None:
         return
-    store.save_json('scanner_rest_fallback_cursor', {'last_ticker_24hr_at_monotonic': time.monotonic(), 'updated_at': _isoformat_utc(_utc_now())})
+    store.save_json('scanner_rest_fallback_cursor', {'last_ticker_24hr_at_ms': int(time.time() * 1000), 'updated_at': _isoformat_utc(_utc_now())})
 
 
 def build_degraded_ticker_rows_from_book_ticker_cache(store: Optional[RuntimeStateStore], symbols: Sequence[str], max_age_seconds: float = 30.0) -> List[Dict[str, Any]]:
@@ -5285,13 +5287,22 @@ def resolve_scan_tickers(client: BinanceFuturesClient, store: Optional[RuntimeSt
         'ticker_24hr_cache_row_count': int(cache_state.get('row_count') or 0),
         'scanner_rest_fallback_used': False,
         'scanner_rest_fallback_skipped_reason': '',
-        'rest_used_weight_1m': int((_runtime_store_rest_guard_snapshot(store) if hasattr(args, 'runtime_state_dir') else {'rest_used_weight_1m': 0}).get('rest_used_weight_1m') or 0),
+        'rest_used_weight_1m': int(_runtime_store_rest_guard_snapshot(store).get('rest_used_weight_1m') or 0),
+        'rest_circuit_state': str(_runtime_store_rest_guard_snapshot(store).get('rest_circuit_state') or _runtime_store_rest_guard_snapshot(store).get('state') or 'CLOSED').upper(),
+        'scanner_cache_only_mode': bool(cache_state.get('fresh')),
+        'scanner_patch_fallback_skipped_reason': '',
+        'scanner_rest_fallback_allowed': False,
+        'scanner_rest_fallback_blocked_by_weight': False,
+        'ticker_24hr_cache_refresher_active': bool(load_ticker_24hr_cache_refresher_heartbeat(store).get('active')),
+        'ticker_24hr_cache_refresher_skipped_reason': str(load_ticker_24hr_cache_refresher_heartbeat(store).get('last_skipped_reason') or ''),
         'symbols_skipped_due_to_missing_ticker_24hr': 0,
     }
     if bool(cache_state.get('fresh')):
         rows = cache_state.get('rows', [])
         return (rows, diagnostics) if return_diagnostics else rows
     decision = scanner_ticker_rest_fallback_decision(store, args, cache_state)
+    diagnostics['scanner_rest_fallback_allowed'] = bool(decision.get('allowed'))
+    diagnostics['scanner_rest_fallback_blocked_by_weight'] = str(decision.get('reason') or '') == 'rest_used_weight_1m_exceeds_limit'
     if decision.get('allowed'):
         rows = fetch_tickers(client)
         _save_scanner_ticker_rest_fallback_cursor(store)
@@ -5311,7 +5322,65 @@ def resolve_scan_tickers(client: BinanceFuturesClient, store: Optional[RuntimeSt
     return ([], diagnostics) if return_diagnostics else []
 
 
-def refresh_ticker_24hr_cache_once(client: BinanceFuturesClient, store: RuntimeStateStore, *, source: str = 'ticker_24hr_cache_refresher') -> Dict[str, Any]:
+_TICKER_24HR_CACHE_REFRESHER_LOCK = threading.Lock()
+_TICKER_24HR_CACHE_REFRESHER_THREAD: Optional[threading.Thread] = None
+
+
+def load_ticker_24hr_cache_refresher_heartbeat(store: Optional[RuntimeStateStore]) -> Dict[str, Any]:
+    if store is None:
+        return {'active': False}
+    payload = store.load_json('ticker_24hr_cache_refresher_heartbeat', {})
+    if not isinstance(payload, dict):
+        return {'active': False}
+    age_seconds = _payload_age_seconds_from_updated_at_ms(payload)
+    active = bool(payload.get('active')) and age_seconds is not None and age_seconds < 180.0
+    result = dict(payload)
+    result['active'] = active
+    result['age_seconds'] = age_seconds
+    return result
+
+
+def _save_ticker_24hr_cache_refresher_heartbeat(store: RuntimeStateStore, *, active: bool = True, last_skipped_reason: str = '') -> Dict[str, Any]:
+    payload = {
+        'updated_at_ms': int(time.time() * 1000),
+        'updated_at': _isoformat_utc(_utc_now()),
+        'active': bool(active),
+        'pid': os.getpid(),
+        'thread_name': threading.current_thread().name,
+        'last_skipped_reason': str(last_skipped_reason or ''),
+    }
+    store.save_json('ticker_24hr_cache_refresher_heartbeat', payload)
+    return payload
+
+
+def _ticker_24hr_cache_refresher_skip(store: RuntimeStateStore, reason: str, rest_snapshot: Optional[Dict[str, Any]] = None, cache_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    rest_snapshot = rest_snapshot or _runtime_store_rest_guard_snapshot(store)
+    cache_state = cache_state or load_scan_ticker_cache_state(store, max_age_seconds=300.0)
+    payload = {
+        'skipped': True,
+        'reason': str(reason or 'unknown'),
+        'rest_used_weight_1m': int(rest_snapshot.get('rest_used_weight_1m') or 0),
+        'rest_circuit_state': str(rest_snapshot.get('rest_circuit_state') or rest_snapshot.get('state') or 'CLOSED').upper(),
+        'cache_age_seconds': cache_state.get('age_seconds'),
+    }
+    _save_ticker_24hr_cache_refresher_heartbeat(store, active=True, last_skipped_reason=payload['reason'])
+    append_rate_limited_runtime_event(store, 'ticker_24hr_cache_refresher_skipped', payload, key='ticker_24hr_cache_refresher_skipped', min_interval_seconds=30.0)
+    return payload
+
+
+def refresh_ticker_24hr_cache_once(client: BinanceFuturesClient, store: RuntimeStateStore, *, source: str = 'ticker_24hr_cache_refresher', args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
+    max_age_seconds = float(getattr(args, 'ticker_24hr_cache_max_age_seconds', getattr(args, 'scanner_ticker_cache_max_age_seconds', 300.0)) or 300.0) if args is not None else 300.0
+    max_used_weight = int(getattr(args, 'scanner_rest_fallback_max_used_weight_1m', 900) or 900) if args is not None else 900
+    cache_state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds)
+    rest_snapshot = _runtime_store_rest_guard_snapshot(store)
+    rest_state = str(rest_snapshot.get('rest_circuit_state') or rest_snapshot.get('state') or 'CLOSED').upper()
+    used_weight = int(rest_snapshot.get('rest_used_weight_1m') or 0)
+    if rest_state != 'CLOSED':
+        return _ticker_24hr_cache_refresher_skip(store, 'rest_circuit_not_closed', rest_snapshot, cache_state)
+    if used_weight >= max_used_weight:
+        return _ticker_24hr_cache_refresher_skip(store, 'rest_used_weight_1m_exceeds_limit', rest_snapshot, cache_state)
+    if bool(cache_state.get('fresh')):
+        return _ticker_24hr_cache_refresher_skip(store, 'cache_fresh', rest_snapshot, cache_state)
     rows = fetch_tickers(client)
     rows = [dict(row) for row in rows if isinstance(row, dict) and normalize_symbol(row.get('symbol'))]
     rows_by_symbol = {normalize_symbol(row.get('symbol')): row for row in rows}
@@ -5324,6 +5393,7 @@ def refresh_ticker_24hr_cache_once(client: BinanceFuturesClient, store: RuntimeS
         'rest_used_weight_1m': int(rest_snapshot.get('rest_used_weight_1m') or 0),
     }
     store.save_json('ticker_24hr_cache', payload)
+    _save_ticker_24hr_cache_refresher_heartbeat(store, active=True, last_skipped_reason='')
     append_rate_limited_runtime_event(store, 'ticker_24hr_cache_refreshed', {'row_count': payload['row_count'], 'rest_used_weight_1m': payload['rest_used_weight_1m'], 'source': source}, key='ticker_24hr_cache_refresher', min_interval_seconds=60.0)
     return payload
 
@@ -5332,7 +5402,8 @@ def ticker_24hr_cache_refresher_loop(client: BinanceFuturesClient, args: argpars
     interval = max(1.0, float(getattr(args, 'ticker_24hr_cache_refresh_seconds', 120.0) or 120.0))
     while stop_event is None or not stop_event.is_set():
         try:
-            refresh_ticker_24hr_cache_once(client, store, source='ticker_24hr_cache_refresher')
+            _save_ticker_24hr_cache_refresher_heartbeat(store, active=True)
+            refresh_ticker_24hr_cache_once(client, store, source='ticker_24hr_cache_refresher', args=args)
         except Exception as exc:
             append_rate_limited_runtime_event(
                 store,
@@ -5348,9 +5419,20 @@ def ticker_24hr_cache_refresher_loop(client: BinanceFuturesClient, args: argpars
             threading.Event().wait(interval)
 
 
-def start_ticker_24hr_cache_refresher(client: BinanceFuturesClient, args: argparse.Namespace, store: RuntimeStateStore) -> threading.Thread:
-    thread = threading.Thread(target=ticker_24hr_cache_refresher_loop, name='ticker_24hr_cache_refresher', args=(client, args, store), daemon=True)
-    thread.start()
+def start_ticker_24hr_cache_refresher(client: BinanceFuturesClient, args: argparse.Namespace, store: RuntimeStateStore) -> Optional[threading.Thread]:
+    global _TICKER_24HR_CACHE_REFRESHER_THREAD
+    with _TICKER_24HR_CACHE_REFRESHER_LOCK:
+        if _TICKER_24HR_CACHE_REFRESHER_THREAD is not None and _TICKER_24HR_CACHE_REFRESHER_THREAD.is_alive():
+            append_runtime_event(store, 'ticker_24hr_cache_refresher_already_running', {'scope': 'process', 'thread_name': _TICKER_24HR_CACHE_REFRESHER_THREAD.name})
+            return _TICKER_24HR_CACHE_REFRESHER_THREAD
+        heartbeat = load_ticker_24hr_cache_refresher_heartbeat(store)
+        if bool(heartbeat.get('active')):
+            append_runtime_event(store, 'ticker_24hr_cache_refresher_already_running', {'scope': 'runtime_state', 'age_seconds': heartbeat.get('age_seconds'), 'pid': heartbeat.get('pid')})
+            return None
+        _save_ticker_24hr_cache_refresher_heartbeat(store, active=True)
+        thread = threading.Thread(target=ticker_24hr_cache_refresher_loop, name='ticker_24hr_cache_refresher', args=(client, args, store), daemon=True)
+        thread.start()
+        _TICKER_24HR_CACHE_REFRESHER_THREAD = thread
     append_runtime_event(store, 'ticker_24hr_cache_refresher_started', {'thread_name': thread.name, 'refresh_seconds': float(getattr(args, 'ticker_24hr_cache_refresh_seconds', 120.0) or 120.0)})
     return thread
 
@@ -6483,20 +6565,26 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     ticker_map = {row['symbol']: row for row in tickers if isinstance(row, dict) and row.get('symbol')}
     missing_ticker_symbols = [symbol for symbol in merged_symbols if symbol not in ticker_map]
     if missing_ticker_symbols and scanner_rest_fallback_enabled(args):
-        patch_decision = scanner_ticker_rest_fallback_decision(store, args, ticker_cache_diagnostics)
-        if patch_decision.get('allowed'):
-            fetched_patch_rows = fetch_tickers(client)
-            _save_scanner_ticker_rest_fallback_cursor(store)
-            ticker_cache_diagnostics['scanner_rest_fallback_used'] = True
-            patch_by_symbol = {str(row.get('symbol') or '').upper(): row for row in fetched_patch_rows if isinstance(row, dict) and row.get('symbol')}
-            for symbol in missing_ticker_symbols:
-                row = patch_by_symbol.get(str(symbol).upper())
-                if row:
-                    ticker_map[str(symbol).upper()] = row
-            ticker_cache_diagnostics['ticker_24hr_cache_row_count'] = max(int(ticker_cache_diagnostics.get('ticker_24hr_cache_row_count') or 0), len(ticker_map))
+        if bool(ticker_cache_diagnostics.get('scanner_rest_fallback_used')):
+            ticker_cache_diagnostics['scanner_patch_fallback_skipped_reason'] = 'scanner_rest_fallback_already_used'
         else:
-            ticker_cache_diagnostics['scanner_rest_fallback_skipped_reason'] = str(patch_decision.get('reason') or 'fallback_not_allowed')
-            ticker_cache_diagnostics['rest_used_weight_1m'] = int(patch_decision.get('rest_used_weight_1m') or ticker_cache_diagnostics.get('rest_used_weight_1m') or 0)
+            patch_decision = scanner_ticker_rest_fallback_decision(store, args, ticker_cache_diagnostics)
+            ticker_cache_diagnostics['scanner_rest_fallback_allowed'] = bool(patch_decision.get('allowed'))
+            ticker_cache_diagnostics['scanner_rest_fallback_blocked_by_weight'] = str(patch_decision.get('reason') or '') == 'rest_used_weight_1m_exceeds_limit'
+            if patch_decision.get('allowed'):
+                fetched_patch_rows = fetch_tickers(client)
+                _save_scanner_ticker_rest_fallback_cursor(store)
+                ticker_cache_diagnostics['scanner_rest_fallback_used'] = True
+                patch_by_symbol = {str(row.get('symbol') or '').upper(): row for row in fetched_patch_rows if isinstance(row, dict) and row.get('symbol')}
+                for symbol in missing_ticker_symbols:
+                    row = patch_by_symbol.get(str(symbol).upper())
+                    if row:
+                        ticker_map[str(symbol).upper()] = row
+                ticker_cache_diagnostics['ticker_24hr_cache_row_count'] = max(int(ticker_cache_diagnostics.get('ticker_24hr_cache_row_count') or 0), len(ticker_map))
+            else:
+                ticker_cache_diagnostics['scanner_patch_fallback_skipped_reason'] = str(patch_decision.get('reason') or 'fallback_not_allowed')
+                ticker_cache_diagnostics['scanner_rest_fallback_skipped_reason'] = str(patch_decision.get('reason') or 'fallback_not_allowed')
+                ticker_cache_diagnostics['rest_used_weight_1m'] = int(patch_decision.get('rest_used_weight_1m') or ticker_cache_diagnostics.get('rest_used_weight_1m') or 0)
 
     regime_payload = compute_market_regime_filter(
         btc_klines=resolve_scan_klines(client, store, args, 'BTCUSDT', '15m', 30) if client else None,
@@ -6730,6 +6818,13 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'scanner_rest_fallback_used': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_used')),
         'scanner_rest_fallback_skipped_reason': str(ticker_cache_diagnostics.get('scanner_rest_fallback_skipped_reason') or ''),
         'rest_used_weight_1m': int(ticker_cache_diagnostics.get('rest_used_weight_1m') or 0),
+        'rest_circuit_state': str(ticker_cache_diagnostics.get('rest_circuit_state') or 'CLOSED'),
+        'ticker_24hr_cache_refresher_active': bool(ticker_cache_diagnostics.get('ticker_24hr_cache_refresher_active')),
+        'ticker_24hr_cache_refresher_skipped_reason': str(ticker_cache_diagnostics.get('ticker_24hr_cache_refresher_skipped_reason') or ''),
+        'scanner_cache_only_mode': bool(ticker_cache_diagnostics.get('scanner_cache_only_mode')),
+        'scanner_patch_fallback_skipped_reason': str(ticker_cache_diagnostics.get('scanner_patch_fallback_skipped_reason') or ''),
+        'scanner_rest_fallback_allowed': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_allowed')),
+        'scanner_rest_fallback_blocked_by_weight': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_blocked_by_weight')),
         'symbols_skipped_due_to_missing_ticker_24hr': int(ticker_cache_diagnostics.get('symbols_skipped_due_to_missing_ticker_24hr') or 0),
         'okx_available_inst_count': okx_available_inst_count,
         'okx_unavailable_symbol_count': len(okx_unavailable_symbols),
@@ -6765,6 +6860,13 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'scanner_rest_fallback_used': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_used')),
         'scanner_rest_fallback_skipped_reason': str(ticker_cache_diagnostics.get('scanner_rest_fallback_skipped_reason') or ''),
         'rest_used_weight_1m': int(ticker_cache_diagnostics.get('rest_used_weight_1m') or 0),
+        'rest_circuit_state': str(ticker_cache_diagnostics.get('rest_circuit_state') or 'CLOSED'),
+        'ticker_24hr_cache_refresher_active': bool(ticker_cache_diagnostics.get('ticker_24hr_cache_refresher_active')),
+        'ticker_24hr_cache_refresher_skipped_reason': str(ticker_cache_diagnostics.get('ticker_24hr_cache_refresher_skipped_reason') or ''),
+        'scanner_cache_only_mode': bool(ticker_cache_diagnostics.get('scanner_cache_only_mode')),
+        'scanner_patch_fallback_skipped_reason': str(ticker_cache_diagnostics.get('scanner_patch_fallback_skipped_reason') or ''),
+        'scanner_rest_fallback_allowed': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_allowed')),
+        'scanner_rest_fallback_blocked_by_weight': bool(ticker_cache_diagnostics.get('scanner_rest_fallback_blocked_by_weight')),
         'symbols_skipped_due_to_missing_ticker_24hr': int(ticker_cache_diagnostics.get('symbols_skipped_due_to_missing_ticker_24hr') or 0),
         'candidate_count': len(candidates),
         'candidates': candidate_alerts,
