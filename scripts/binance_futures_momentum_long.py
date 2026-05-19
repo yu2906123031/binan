@@ -1707,17 +1707,20 @@ def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, 
     subscription_count = int(health.get('symbol_count', health.get('subscription_count', health.get('subscriptions', 0))) or 0)
     ages = [age for age in (health_age, message_age, sample_age) if age is not None]
     flow_age = min(ages) if ages else None
-    if require_messages and messages <= 0 and samples <= 0:
-        state, mode, reason = 'dead', 'blocked', 'no_websocket_messages'
-    elif status in {'dead', 'failed', 'unavailable'}:
+    hard_stale_seconds = max(float(max_age_seconds or 30.0), 30.0) * 3.0
+    if status in {'dead', 'failed', 'unavailable'}:
         state, mode, reason = 'dead', 'blocked', f'websocket_{status}'
+    elif require_messages and messages <= 0 and samples <= 0:
+        state, mode, reason = 'dead', 'blocked', 'no_websocket_messages'
     elif flow_age is None:
         state, mode, reason = 'dead', 'blocked', 'unknown_websocket_health_without_updated_at'
+    elif status in {'reconnecting', 'connecting', 'restarting'} and flow_age < hard_stale_seconds:
+        state, mode, reason = 'reconnecting', 'maker_only', f'websocket_{status}'
     elif flow_age < 3.0:
         state, mode, reason = 'healthy', 'none', 'fresh'
     elif flow_age < 10.0:
         state, mode, reason = 'slightly_stale', 'reduced_aggression', 'short_websocket_jitter'
-    elif flow_age < 30.0:
+    elif flow_age < hard_stale_seconds:
         state, mode, reason = 'reconnecting', 'maker_only', 'websocket_reconnecting_or_event_loop_lag'
     else:
         state, mode, reason = 'dead', 'blocked', 'stale_websocket_health'
@@ -1736,7 +1739,9 @@ def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, 
         'messages_processed': messages,
         'samples_written': samples,
         'subscription_count': subscription_count,
-        'stale_guard_decision_reason': reason,
+        'stale_guard_decision_reason': 'stale_hard_veto_dead' if state == 'dead' else ('stale_degraded_to_maker' if mode == 'maker_only' else reason),
+        'websocket_gate_action': 'veto' if state == 'dead' else ('maker_confirm' if mode == 'maker_only' else ('watch' if mode == 'reduced_aggression' else 'execute')),
+        'websocket_degradation_applied': mode in {'reduced_aggression', 'maker_only'},
     }
 
 
@@ -9151,16 +9156,22 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         )
         cycle['book_ticker_websocket_freshness'] = websocket_freshness
         cycle['execution_degradation_mode'] = websocket_freshness.get('execution_degradation_mode', 'none')
+        cycle['websocket_state'] = websocket_freshness.get('state')
+        cycle['websocket_gate_action'] = websocket_freshness.get('websocket_gate_action')
+        cycle['websocket_degradation_applied'] = bool(websocket_freshness.get('websocket_degradation_applied', False))
         if websocket_freshness.get('state') == 'dead':
             stale_reason = str(websocket_freshness.get('reason') or 'stale_websocket')
-            cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{stale_reason}']
+            cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_hard_veto:{stale_reason}']
+            cycle['final_execution_gate_action'] = 'veto'
+            cycle['final_blocking_reason'] = f'websocket:{stale_reason}'
             append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
             record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason=f'websocket_stale:{stale_reason}', extra=websocket_freshness)
             persist_cycle_snapshot(cycle)
             return result
         if websocket_freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
             best_candidate = build_websocket_degraded_candidate(best_candidate, websocket_freshness)
-            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': websocket_freshness.get('reason'), 'websocket_state': websocket_freshness.get('state')}
+            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': websocket_freshness.get('reason'), 'websocket_state': websocket_freshness.get('state'), 'stale_guard_decision_reason': websocket_freshness.get('stale_guard_decision_reason')}
+            cycle['final_execution_gate_action'] = 'maker_confirm' if websocket_freshness.get('execution_degradation_mode') == 'maker_only' else 'watch'
             record_runtime_heartbeat(store, component='scanner', status='degraded', blocked_reason='', extra=websocket_freshness)
     max_open_positions = int(getattr(args, 'max_open_positions', 1) or 1)
     if len(open_positions) >= max_open_positions:
@@ -9519,8 +9530,28 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''))
     open_positions = fetch_open_positions(client) if getattr(args, 'live', False) and not binance_simulated_trading else []
     portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=open_positions, candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
-    risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard}
+    risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard, 'trigger_confidence': risk_guard.get('trigger_confidence', {'level': 'confirmed', 'score': 1.0, 'factors': []}), 'execution_mode': risk_guard.get('execution_mode', 'taker'), 'execution_size_multiplier': risk_guard.get('execution_size_multiplier', 1.0), 'trigger_state': risk_guard.get('trigger_state', 'confirmed'), 'trigger_gate_action': risk_guard.get('trigger_gate_action', 'execute')}
+    if risk_guard['allowed'] and risk_guard.get('execution_mode') in {'maker_probe', 'maker_confirm'}:
+        size_multiplier = max(min(float(risk_guard.get('execution_size_multiplier') or 1.0), 1.0), 0.0)
+        updates = {
+            'quantity': max(float(getattr(best_candidate, 'quantity', 0.0) or 0.0) * size_multiplier, 0.0),
+            'execution_mode_override': 'maker_only',
+            'execution_liquidity_grade_override': 'D',
+            'execution_degradation_mode': risk_guard.get('execution_mode'),
+            'pretrigger_watch': risk_guard.get('execution_mode') == 'maker_probe',
+            'trigger_relax_mode': True,
+            'reasons': list(getattr(best_candidate, 'reasons', []) or []) + [
+                f"trigger_confidence={risk_guard.get('trigger_confidence', {}).get('level')}",
+                f"execution_mode={risk_guard.get('execution_mode')}",
+                f"execution_size_multiplier={size_multiplier}",
+            ],
+        }
+        best_candidate = replace(best_candidate, **{key: value for key, value in updates.items() if hasattr(best_candidate, key)})
     cycle['risk_guard'] = risk_guard
+    cycle['trigger_state'] = risk_guard.get('trigger_state', 'confirmed')
+    cycle['trigger_gate_action'] = risk_guard.get('trigger_gate_action', 'execute')
+    cycle['final_execution_gate_action'] = 'execute' if risk_guard.get('allowed', True) else 'veto'
+    cycle['final_blocking_reason'] = '' if risk_guard.get('allowed', True) else (risk_guard.get('reasons') or ['risk_guard_blocked'])[0]
     cycle['scan_only'] = bool(getattr(args, 'scan_only', False))
     cycle['live_requested'] = bool(getattr(args, 'live', False))
     cycle['execution_exchange'] = execution_exchange
@@ -9529,19 +9560,25 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         cycle['scan']['funnel']['order_submitted_count'] = 0
     if (not getattr(args, 'live', False)) or getattr(args, 'scan_only', False):
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': choose_auto_loop_state_for_candidate(best_candidate, risk_guard), 'reason': 'scan_only', 'reconcile': reconcile, 'event_updates': event_updates}}
-    if bool(getattr(args, 'require_book_ticker_ws', True)) and websocket_status:
-        health = websocket_status.get('health') if isinstance(websocket_status.get('health'), dict) else websocket_status
+    if bool(getattr(args, 'require_book_ticker_ws', True)) and isinstance(websocket_health, dict) and websocket_health:
+        health = websocket_health.get('health') if isinstance(websocket_health.get('health'), dict) else websocket_health
         freshness = evaluate_websocket_freshness(health, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
         cycle['book_ticker_websocket_freshness'] = freshness
         cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
+        cycle['websocket_state'] = freshness.get('state')
+        cycle['websocket_gate_action'] = freshness.get('websocket_gate_action')
+        cycle['websocket_degradation_applied'] = bool(freshness.get('websocket_degradation_applied', False))
         if freshness.get('state') == 'dead':
             reason = str(freshness.get('reason') or 'stale_websocket')
-            cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{reason}']
+            cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_hard_veto:{reason}']
+            cycle['final_execution_gate_action'] = 'veto'
+            cycle['final_blocking_reason'] = f'websocket:{reason}'
             event_updates.append(append_candidate_rejected_event(None, best_candidate, cycle['live_skipped_due_to_websocket_gate']))
             return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'reconcile': reconcile, 'event_updates': event_updates}}
         if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
             best_candidate = build_websocket_degraded_candidate(best_candidate, freshness)
-            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': freshness.get('reason'), 'websocket_state': freshness.get('state')}
+            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': freshness.get('reason'), 'websocket_state': freshness.get('state'), 'stale_guard_decision_reason': freshness.get('stale_guard_decision_reason')}
+            cycle['final_execution_gate_action'] = 'maker_confirm' if freshness.get('execution_degradation_mode') == 'maker_only' else 'watch'
     if len(open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
         cycle['live_skipped_due_to_existing_positions'] = open_positions
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached', 'reconcile': reconcile, 'event_updates': event_updates}}
@@ -9577,7 +9614,7 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
             cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
             if freshness.get('state') == 'dead':
                 reason = str(freshness.get('reason') or 'stale_websocket')
-                return {'ok': True, 'cycle': dict(cycle, live_skipped_due_to_websocket_gate=[f'book_ticker_websocket_stale:{reason}']), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': f'websocket_stale:{reason}'}}}
+                return {'ok': True, 'cycle': dict(cycle, live_skipped_due_to_websocket_gate=[f'book_ticker_websocket_hard_veto:{reason}'], websocket_state=freshness.get('state'), websocket_gate_action=freshness.get('websocket_gate_action'), websocket_degradation_applied=False, final_execution_gate_action='veto', final_blocking_reason=f'websocket:{reason}'), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': f'websocket_stale:{reason}'}}}
             if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
                 candidate = build_websocket_degraded_candidate(candidate, freshness)
     state_transition = {'state': 'ENTERING', 'candidate_symbol': getattr(candidate, 'symbol', ''), 'reason': 'execution_gate_passed', 'risk_guard': execution_request.get('risk_guard'), 'reconcile': execution_request.get('reconcile')}

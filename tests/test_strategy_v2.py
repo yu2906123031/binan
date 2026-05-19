@@ -4149,7 +4149,7 @@ def test_evaluate_risk_guards_allows_b_tier_execution_with_soft_slippage_penalty
     assert 'candidate_execution_liquidity_poor' not in payload['reasons']
 
 
-def test_evaluate_risk_guards_blocks_fake_breakout_when_price_loses_breakout_or_flow_fails():
+def test_evaluate_risk_guards_grades_fake_breakout_when_price_loses_breakout_or_flow_fails():
     candidate = mod.Candidate(
         symbol='FAKEUSDT', last_price=99.95, price_change_pct_24h=8.0, quote_volume_24h=1_000_000.0,
         hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
@@ -4164,8 +4164,10 @@ def test_evaluate_risk_guards_blocks_fake_breakout_when_price_loses_breakout_or_
 
     payload = mod.evaluate_risk_guards(symbol='FAKEUSDT', risk_state=mod.default_risk_state(), candidate=candidate)
 
-    assert payload['allowed'] is False
-    assert 'candidate_fake_breakout_risk' in payload['reasons']
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+    assert payload['trigger_confidence']['level'] == 'watch_confirm'
+    assert payload['execution_mode'] == 'maker_confirm'
 
 
 def test_run_loop_records_execution_quality_rejection_event_when_risk_guard_blocks_live_trade(monkeypatch, tmp_path):

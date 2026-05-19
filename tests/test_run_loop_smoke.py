@@ -4123,7 +4123,7 @@ def test_dead_websocket_still_blocks_execution_cycle(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
     store = DummyStore()
-    old = mod._utc_now() - datetime.timedelta(seconds=31)
+    old = mod._utc_now() - datetime.timedelta(seconds=91)
     store.save_json('book_ticker_ws_status', {'status': 'healthy', 'updated_at': mod._isoformat_utc(old), 'messages_processed': 100, 'samples_written': 100})
     candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
     req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 12}, 'requested_leverage': 3}
@@ -4132,7 +4132,8 @@ def test_dead_websocket_still_blocks_execution_cycle(monkeypatch):
     result = mod.execution_cycle(DummyClient(), args, req, store=store)
 
     assert result['manager_update']['reason'].startswith('websocket_stale:')
-    assert result['cycle']['live_skipped_due_to_websocket_gate'][0].startswith('book_ticker_websocket_stale:')
+    assert result['cycle']['live_skipped_due_to_websocket_gate'][0].startswith('book_ticker_websocket_hard_veto:')
+    assert result['cycle']['final_execution_gate_action'] == 'veto'
 
 
 def test_execution_cycle_refresh_recovered_websocket_continues_execution(monkeypatch):

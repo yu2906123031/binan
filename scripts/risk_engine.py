@@ -97,6 +97,11 @@ def evaluate_risk_guards(
         return 'LONG'
 
     reasons = []
+    trigger_confidence = {'level': 'confirmed', 'score': 1.0, 'factors': []}
+    execution_mode = 'taker'
+    execution_size_multiplier = 1.0
+    trigger_state = 'not_ready'
+    trigger_gate_action = 'veto'
     ts = int(time_module.time()) if now_ts is None else int(now_ts)
     normalized_symbol = str(symbol or '').strip().upper()
     candidate_side = _normalize_candidate_side(
@@ -154,12 +159,32 @@ def evaluate_risk_guards(
         effective_trigger_fired = bool(must_pass_flags.get('trigger_fired', getattr(candidate, 'trigger_fired', False)))
         effective_probe_entry = bool(must_pass_flags.get('probe_entry', getattr(candidate, 'probe_entry', False)))
         effective_high_vol_alt_mode = bool(must_pass_flags.get('high_vol_alt_mode', getattr(candidate, 'high_vol_alt_mode', False)))
+        trigger_missing = set(getattr(candidate, 'trigger_missing', []) or [])
+        trade_missing = set(getattr(candidate, 'trade_missing', []) or [])
+        candidate_stage = str(getattr(candidate, 'candidate_stage', getattr(candidate, 'stage', '')) or '').strip()
+        pretrigger_watch = bool(getattr(candidate, 'pretrigger_watch', False)) or candidate_stage == 'pre_trigger_watch'
 
         if not effective_setup_ready:
+            trigger_state = 'not_ready'
+            trigger_gate_action = 'veto'
             reasons.append('candidate_setup_not_ready')
-        elif not effective_trigger_fired:
-            if not effective_probe_entry:
-                reasons.append('candidate_trigger_not_fired')
+        elif effective_trigger_fired:
+            trigger_state = 'fired'
+            trigger_gate_action = 'execute'
+        elif effective_probe_entry or pretrigger_watch:
+            trigger_state = 'pre_trigger_watch'
+            trigger_gate_action = 'maker_confirm' if pretrigger_watch else 'watch'
+            trigger_confidence = {
+                'level': 'watch_confirm' if pretrigger_watch else 'probe',
+                'score': 0.55 if pretrigger_watch else 0.4,
+                'factors': sorted(trigger_missing | trade_missing | {'pre_trigger_confirm_required'}),
+            }
+            execution_mode = 'maker_confirm' if pretrigger_watch else 'maker_probe'
+            execution_size_multiplier = 0.35 if pretrigger_watch else 0.25
+        else:
+            trigger_state = 'not_ready'
+            trigger_gate_action = 'veto'
+            reasons.append('candidate_trigger_not_fired')
         trigger_min_confirmations = max(int(_to_float(getattr(candidate, 'trigger_min_confirmations', 0))), 0)
         trigger_confirmation_count = max(int(_to_float(getattr(candidate, 'trigger_confirmation_count', 0))), 0)
         trigger_confirmation_flags = getattr(candidate, 'trigger_confirmation_flags', None)
@@ -246,7 +271,23 @@ def evaluate_risk_guards(
                 reclaimed = last_price <= breakout_level * (1.0 - fake_breakout_buffer_pct)
                 flow_confirmed = (cvd_delta < 0 and oi_change_5m >= 0 and volume_multiple >= 1.0) if has_flow_context else True
             if not reclaimed or not flow_confirmed:
-                reasons.append('candidate_fake_breakout_risk')
+                trigger_confidence = {
+                    'level': 'watch_confirm',
+                    'score': min(trigger_confidence.get('score', 1.0), 0.55),
+                    'factors': sorted(set(trigger_confidence.get('factors', [])) | trigger_missing | trade_missing | {'candidate_fake_breakout_risk'}),
+                }
+                trigger_gate_action = 'maker_confirm'
+                execution_mode = 'maker_confirm' if execution_mode == 'taker' else execution_mode
+                execution_size_multiplier = min(execution_size_multiplier, 0.35)
+        if 'candidate_fake_breakout_risk' in (trigger_missing | trade_missing):
+            trigger_confidence = {
+                'level': 'watch_confirm',
+                'score': min(trigger_confidence.get('score', 1.0), 0.55),
+                'factors': sorted(set(trigger_confidence.get('factors', [])) | trigger_missing | trade_missing | {'candidate_fake_breakout_risk'}),
+            }
+            trigger_gate_action = 'maker_confirm'
+            execution_mode = 'maker_confirm' if execution_mode == 'taker' else execution_mode
+            execution_size_multiplier = min(execution_size_multiplier, 0.35)
         position_size_pct = max(_to_float(getattr(candidate, 'position_size_pct', 0.0)), 0.0)
         portfolio_narrative_bucket = str(kwargs.get('portfolio_narrative_bucket') or getattr(candidate, 'portfolio_narrative_bucket', '') or '').strip()
         portfolio_correlation_group = str(kwargs.get('portfolio_correlation_group') or getattr(candidate, 'portfolio_correlation_group', '') or '').strip()
@@ -283,4 +324,14 @@ def evaluate_risk_guards(
             if current_corr_heat + candidate_heat_r >= same_correlation_heat_cap_r:
                 reasons.append('candidate_same_correlation_heat_overexposure')
 
-    return {'allowed': not reasons, 'reasons': reasons, 'cooldown_until': cooldown_until, 'normalized_risk_state': normalized}
+    return {
+        'allowed': not reasons,
+        'reasons': reasons,
+        'cooldown_until': cooldown_until,
+        'normalized_risk_state': normalized,
+        'trigger_confidence': trigger_confidence,
+        'execution_mode': execution_mode,
+        'execution_size_multiplier': execution_size_multiplier,
+        'trigger_state': 'maker_confirm' if trigger_state == 'fired' and execution_mode == 'maker_confirm' else ('confirmed' if trigger_state == 'fired' and execution_mode == 'taker' else trigger_state),
+        'trigger_gate_action': trigger_gate_action,
+    }

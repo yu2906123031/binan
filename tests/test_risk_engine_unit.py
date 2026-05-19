@@ -267,6 +267,82 @@ def test_evaluate_risk_guards_uses_must_pass_flags_probe_entry_override_for_trig
     assert payload['reasons'] == []
 
 
+def test_evaluate_risk_guards_converts_breakout_and_oi_gaps_to_probing_mode():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=False,
+        probe_entry=True,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': False, 'probe_entry': True},
+        trigger_missing=['waiting_breakout', 'oi_taker_not_confirmed'],
+        trade_missing=['candidate_trigger_not_fired'],
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+    assert payload['trigger_confidence']['level'] == 'probe'
+    assert payload['trigger_confidence']['score'] == 0.4
+    assert payload['execution_mode'] == 'maker_probe'
+    assert payload['execution_size_multiplier'] == 0.25
+
+
+def test_evaluate_risk_guards_converts_fake_breakout_risk_to_reduced_confirmation_mode():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=True,
+        trigger_missing=['candidate_fake_breakout_risk'],
+        trade_missing=['candidate_fake_breakout_risk'],
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+    assert payload['trigger_confidence']['level'] == 'watch_confirm'
+    assert payload['trigger_confidence']['score'] == 0.55
+    assert payload['execution_mode'] == 'maker_confirm'
+    assert payload['execution_size_multiplier'] == 0.35
+
+
+def test_evaluate_risk_guards_trigger_fired_never_reports_trigger_not_fired():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=True,
+        candidate_stage='pre_trigger_watch',
+        trigger_missing=['candidate_trigger_not_fired', 'candidate_fake_breakout_risk'],
+        trade_missing=['candidate_trigger_not_fired', 'candidate_fake_breakout_risk'],
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert 'candidate_trigger_not_fired' not in payload['reasons']
+    assert payload['trigger_state'] == 'maker_confirm'
+    assert payload['trigger_gate_action'] == 'maker_confirm'
+    assert payload['execution_mode'] == 'maker_confirm'
+
+
+def test_evaluate_risk_guards_pre_trigger_watch_maker_confirm_is_allowed():
+    candidate = make_candidate(
+        setup_ready=True,
+        trigger_fired=False,
+        candidate_stage='pre_trigger_watch',
+        trigger_missing=['waiting_breakout'],
+        trade_missing=['candidate_trigger_not_fired'],
+    )
+
+    payload = evaluate_risk_guards(symbol='DOGEUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+    assert payload['trigger_state'] == 'pre_trigger_watch'
+    assert payload['trigger_gate_action'] == 'maker_confirm'
+    assert payload['trigger_confidence']['level'] == 'watch_confirm'
+    assert 'pre_trigger_confirm_required' in payload['trigger_confidence']['factors']
+    assert 'candidate_trigger_not_fired' not in payload['reasons']
+
+
 def test_evaluate_portfolio_risk_guards_blocks_short_count_and_net_exposure_from_fallback_notional():
     candidate = SimpleNamespace(symbol='SUIUSDT', side='SHORT', entry_price=50.0, quantity=2.0)
     open_positions = [

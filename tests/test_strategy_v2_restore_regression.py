@@ -1848,6 +1848,44 @@ def test_run_loop_skips_live_trade_when_book_ticker_ws_unavailable_and_gate_requ
     assert result['cycles'][0]['live_skipped_due_to_websocket_gate'] == ['book_ticker_websocket_unavailable:websocket_client_missing']
 
 
+def test_evaluate_websocket_freshness_reconnecting_degrades_to_maker_confirm():
+    now = mod.datetime.datetime(2026, 1, 1, 12, 0, tzinfo=mod.datetime.timezone.utc)
+    health = {
+        'status': 'reconnecting',
+        'updated_at': (now - mod.datetime.timedelta(seconds=40)).isoformat(),
+        'last_message_at': (now - mod.datetime.timedelta(seconds=40)).isoformat(),
+        'messages_processed': 10,
+        'samples_written': 10,
+    }
+
+    payload = mod.evaluate_websocket_freshness(health, max_age_seconds=30.0, now=now)
+
+    assert payload['state'] == 'reconnecting'
+    assert payload['execution_degradation_mode'] == 'maker_only'
+    assert payload['websocket_gate_action'] == 'maker_confirm'
+    assert payload['websocket_degradation_applied'] is True
+    assert payload['stale_guard_decision_reason'] == 'stale_degraded_to_maker'
+
+
+def test_evaluate_websocket_freshness_dead_hard_veto():
+    now = mod.datetime.datetime(2026, 1, 1, 12, 0, tzinfo=mod.datetime.timezone.utc)
+    health = {
+        'status': 'dead',
+        'updated_at': now.isoformat(),
+        'last_message_at': now.isoformat(),
+        'messages_processed': 10,
+        'samples_written': 10,
+    }
+
+    payload = mod.evaluate_websocket_freshness(health, max_age_seconds=30.0, now=now)
+
+    assert payload['state'] == 'dead'
+    assert payload['execution_degradation_mode'] == 'blocked'
+    assert payload['websocket_gate_action'] == 'veto'
+    assert payload['websocket_degradation_applied'] is False
+    assert payload['stale_guard_decision_reason'] == 'stale_hard_veto_dead'
+
+
 def test_build_auto_loop_user_data_stream_monitor_config_reads_explicit_fields_only():
     args = argparse.Namespace(
         user_stream_refresh_interval_minutes=12.5,
