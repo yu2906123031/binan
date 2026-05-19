@@ -6292,6 +6292,25 @@ def test_ticker_24hr_cache_below_fallback_universe_repairs_via_rest_fallback(tmp
     assert diag['ticker_24hr_cache_row_count'] == 1
 
 
+def test_ticker_24hr_cache_below_fallback_universe_bypasses_recent_rest_cursor(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'source': 'scanner_rest_fallback',
+        'row_count': 1,
+        'rows_by_symbol': {'BTCUSDT': {'symbol': 'BTCUSDT', 'priceChangePercent': '1'}},
+    })
+    store.save_json('scanner_rest_fallback_cursor', {'last_ticker_24hr_at_ms': int(mod.time.time() * 1000)})
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}, {'symbol': 'ETHUSDT'}])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(ticker_24hr_cache_min_rows=1), fallback_symbols=['BTCUSDT', 'ETHUSDT'], return_diagnostics=True)
+
+    assert [row['symbol'] for row in rows] == ['BTCUSDT', 'ETHUSDT']
+    assert diag['scanner_rest_fallback_used'] is True
+    assert diag['scanner_rest_fallback_skipped_reason'] == ''
+
+
 def test_ticker_24hr_cache_missing_high_weight_skips_rest_fallback(tmp_path, monkeypatch):
     store = mod.RuntimeStateStore(str(tmp_path))
     calls = {'fetch': 0}

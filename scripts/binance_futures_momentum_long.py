@@ -5325,7 +5325,7 @@ def scanner_ticker_rest_fallback_decision(store: Optional[RuntimeStateStore], ar
     last_at_ms = int(cursor.get('last_ticker_24hr_at_ms') or 0)
     min_interval = float(getattr(args, 'scanner_rest_fallback_min_interval_seconds', 0.0) or 0.0)
     cache_reason = str(cache_state.get('reason') or '')
-    bypass_min_interval_reasons = {'cache_parse_error', 'cache_invalid'}
+    bypass_min_interval_reasons = {'cache_parse_error', 'cache_invalid', 'cache_row_count_below_minimum'}
     if cache_reason in bypass_min_interval_reasons:
         min_interval = 0.0
     now_ms = int(time.time() * 1000)
