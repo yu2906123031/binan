@@ -170,12 +170,17 @@ def evaluate_risk_guards(
         spread_bps = _to_float(getattr(candidate, 'spread_bps', 0.0))
         orderbook_slope = _to_float(getattr(candidate, 'orderbook_slope', 0.0))
         cancel_rate = _to_float(getattr(candidate, 'cancel_rate', 0.0))
+        top_depth_usdt = _to_float(getattr(candidate, 'top_depth_usdt', 0.0))
+        estimated_impact_pct = _to_float(getattr(candidate, 'estimated_impact_pct', getattr(candidate, 'orderbook_impact_pct', 0.0)))
+        absolute_slippage_bps = max(_to_float(getattr(candidate, 'expected_slippage_pct', 0.0)), 0.0) * 100.0
         execution_liquidity_grade = classify_execution_liquidity_grade(
             getattr(candidate, 'book_depth_fill_ratio', 0.0),
             execution_slippage_r,
             spread_bps=spread_bps,
             orderbook_slope=orderbook_slope,
             cancel_rate=cancel_rate,
+            top_depth_usdt=top_depth_usdt,
+            estimated_impact_pct=estimated_impact_pct,
         )
         if state == 'distribution':
             reasons.append('candidate_distribution_risk')
@@ -186,7 +191,11 @@ def evaluate_risk_guards(
             reasons.append('candidate_oi_reversal')
         risk_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_risk_threshold_r', 0.15), default=0.15), 0.0)
         hard_slippage_r = max(_to_float(getattr(candidate, 'execution_slippage_hard_veto_r', 0.25), default=0.25), risk_slippage_r)
-        if execution_slippage_r > hard_slippage_r:
+        severe_absolute_slippage = absolute_slippage_bps > 25.0
+        severe_book_impact = estimated_impact_pct >= 0.25
+        severe_spread = spread_bps >= 18.0 and absolute_slippage_bps > 25.0
+        severe_depth_gap = top_depth_usdt > 0 and top_depth_usdt < 10.0 and absolute_slippage_bps > 25.0
+        if execution_slippage_r > hard_slippage_r and (severe_absolute_slippage or severe_book_impact or severe_spread or severe_depth_gap):
             reasons.append('candidate_execution_slippage_risk')
         has_explicit_edge_cost_contract = any(
             hasattr(candidate, field_name)
@@ -211,12 +220,14 @@ def evaluate_risk_guards(
             reasons.append('candidate_edge_after_costs_insufficient')
         liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
         explicit_liquidity_grade = str(getattr(candidate, 'liquidity_grade', '') or '').strip().upper()
-        if execution_liquidity_grade == 'D':
+        if execution_liquidity_grade == 'E':
+            reasons.append('candidate_execution_liquidity_poor')
+        elif execution_liquidity_grade == 'D' and explicit_liquidity_grade == 'C':
             reasons.append('candidate_execution_liquidity_poor')
         elif execution_liquidity_grade == 'B' and explicit_liquidity_grade != 'B' and (spread_bps >= 15.0 or cancel_rate >= 0.35):
             reasons.append('candidate_execution_liquidity_poor')
         elif execution_liquidity_grade == 'C' and explicit_liquidity_grade != 'B' and (
-            _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5 or liquidity_penalty_present
+            _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0)) < 0.5 and (spread_bps >= 12.0 or top_depth_usdt < 10.0 or estimated_impact_pct >= 0.25)
         ):
             reasons.append('candidate_execution_liquidity_poor')
         breakout_level = _to_float(getattr(candidate, 'breakout_level', 0.0))

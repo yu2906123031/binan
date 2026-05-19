@@ -46,13 +46,23 @@ def compute_expected_slippage_r(candidate):
     return main_mod.compute_expected_slippage_r(candidate)
 
 
-def classify_execution_liquidity_grade(book_depth_fill_ratio, expected_slippage_r, spread_bps=0.0, orderbook_slope=0.0, cancel_rate=0.0):
+def classify_execution_liquidity_grade(
+    book_depth_fill_ratio,
+    expected_slippage_r,
+    spread_bps=0.0,
+    orderbook_slope=0.0,
+    cancel_rate=0.0,
+    top_depth_usdt=0.0,
+    estimated_impact_pct=0.0,
+):
     return main_mod.classify_execution_liquidity_grade(
         book_depth_fill_ratio,
         expected_slippage_r,
         spread_bps=spread_bps,
         orderbook_slope=orderbook_slope,
         cancel_rate=cancel_rate,
+        top_depth_usdt=top_depth_usdt,
+        estimated_impact_pct=estimated_impact_pct,
     )
 
 
@@ -147,6 +157,42 @@ def test_evaluate_risk_guards_blocks_liquidity_grade_c_when_depth_is_too_thin():
 
     assert payload['allowed'] is False
     assert payload['reasons'] == ['candidate_execution_liquidity_poor']
+
+
+def test_evaluate_risk_guards_allows_liquidity_grade_d_as_maker_only_caution():
+    candidate = make_candidate(
+        risk_per_unit=1.0,
+        expected_slippage_pct=0.02,
+        book_depth_fill_ratio=0.35,
+        spread_bps=7.5,
+        top_depth_usdt=180.0,
+        estimated_impact_pct=0.05,
+        execution_slippage_risk_threshold_r=0.15,
+        execution_slippage_hard_veto_r=0.25,
+    )
+
+    payload = evaluate_risk_guards(symbol='MAKERUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is True
+    assert payload['reasons'] == []
+
+
+def test_evaluate_risk_guards_blocks_liquidity_grade_e_when_joint_slippage_is_severe():
+    candidate = make_candidate(
+        risk_per_unit=1.0,
+        expected_slippage_pct=0.32,
+        book_depth_fill_ratio=0.18,
+        spread_bps=22.0,
+        top_depth_usdt=5.0,
+        estimated_impact_pct=0.32,
+        execution_slippage_risk_threshold_r=0.15,
+        execution_slippage_hard_veto_r=0.25,
+    )
+
+    payload = evaluate_risk_guards(symbol='VETOUSDT', risk_state=default_risk_state(), candidate=candidate)
+
+    assert payload['allowed'] is False
+    assert payload['reasons'] == ['candidate_execution_slippage_risk', 'candidate_execution_liquidity_poor']
 
 
 def test_evaluate_risk_guards_allows_grade_c_when_depth_threshold_is_met():

@@ -2213,13 +2213,32 @@ def make_auto_loop_book_ticker_symbol_provider(
     args: argparse.Namespace,
     store: Optional[RuntimeStateStore] = None,
 ) -> Callable[[], List[str]]:
-    def _provide_symbols() -> List[str]:
+    cache_ttl_seconds = max(float(getattr(args, 'auto_loop_book_ticker_symbol_cache_seconds', 60.0) or 0.0), 0.0)
+    cached_symbols: List[str] = []
+    cached_at_monotonic = 0.0
+
+    def _load_symbols() -> List[str]:
         try:
             return resolve_auto_loop_book_ticker_symbols(client, args, store=store)
         except TypeError as exc:
             if "unexpected keyword argument 'store'" not in str(exc):
                 raise
             return resolve_auto_loop_book_ticker_symbols(client, args)
+
+    def _provide_symbols() -> List[str]:
+        nonlocal cached_symbols, cached_at_monotonic
+        now_monotonic = time.monotonic()
+        if cached_symbols and cache_ttl_seconds > 0 and now_monotonic - cached_at_monotonic < cache_ttl_seconds:
+            return list(cached_symbols)
+        symbols = _load_symbols()
+        if symbols:
+            cached_symbols = list(symbols)
+            cached_at_monotonic = now_monotonic
+            return list(cached_symbols)
+        if cached_symbols:
+            return list(cached_symbols)
+        return symbols
+
     return _provide_symbols
 
 
@@ -2741,38 +2760,60 @@ def classify_execution_liquidity_grade(
     spread_bps: float = 0.0,
     orderbook_slope: float = 0.0,
     cancel_rate: float = 0.0,
+    top_depth_usdt: float = 0.0,
+    estimated_impact_pct: float = 0.0,
 ) -> str:
     fill_ratio = float(book_depth_fill_ratio or 0.0)
     slippage_r = float(expected_slippage_r or 0.0)
     spread = max(float(spread_bps or 0.0), 0.0)
     slope = max(float(orderbook_slope or 0.0), 0.0)
     cancel = min(max(float(cancel_rate or 0.0), 0.0), 1.0)
-    penalty = 0
-    if spread >= 12:
-        penalty += 0.5
-    if spread >= 18:
-        penalty += 0.5
-    if slope and slope < 0.25:
-        penalty += 0.5
-    elif slope and slope < 0.5:
-        penalty += 0.25
-    if cancel >= 0.35:
-        penalty += 0.5
-    elif cancel >= 0.2:
-        penalty += 0.25
+    top_depth = max(float(top_depth_usdt or 0.0), 0.0)
+    impact = max(float(estimated_impact_pct or 0.0), 0.0)
 
-    grade_order = ['A+', 'A', 'B', 'C', 'D']
-    if fill_ratio >= 0.85 and slippage_r <= 0.05:
+    # Legacy candidates produced before execution-quality telemetry should keep their original size.
+    if fill_ratio <= 0 and slippage_r <= 0 and spread <= 0 and slope <= 0 and cancel <= 0 and top_depth <= 0 and impact <= 0:
+        return 'A'
+
+    # Fast path for Binance majors: tight spread plus enough top-of-book depth for a 15-30U order.
+    # This prevents XRP/XLM-like books from being punished by ratio-only depth heuristics.
+    if spread <= 2.5 and top_depth >= 150.0 and impact <= 0.08 and cancel < 0.35:
+        if slippage_r <= 0.5:
+            return 'A'
+        if slippage_r <= 1.5:
+            return 'B'
+
+    penalty = 0
+    severe_microstructure_penalties = 0
+    if spread >= 12:
+        severe_microstructure_penalties += 1
+    if slope and slope < 0.25:
+        severe_microstructure_penalties += 1
+    if cancel >= 0.35:
+        severe_microstructure_penalties += 1
+    if severe_microstructure_penalties:
+        penalty += severe_microstructure_penalties
+    elif spread >= 8 or (slope and slope < 0.5) or cancel >= 0.2:
+        penalty += 1
+    if top_depth and top_depth < 50:
+        penalty += 1
+    if impact >= 0.25:
+        penalty += 1
+
+    grade_order = ['A+', 'A', 'B', 'C', 'D', 'E']
+    if fill_ratio >= 0.85 and slippage_r <= 0.25:
         base_grade = 'A+'
-    elif fill_ratio >= 0.75 and slippage_r <= 0.1:
+    elif fill_ratio >= 0.75 and slippage_r <= 0.5:
         base_grade = 'A'
     elif fill_ratio >= 0.6 and slippage_r <= 0.15:
         base_grade = 'B'
-    elif fill_ratio >= 0.45 and slippage_r <= 0.25:
+    elif fill_ratio >= 0.45 and slippage_r <= 3.5:
         base_grade = 'C'
-    else:
+    elif fill_ratio >= 0.2 or top_depth >= 20:
         base_grade = 'D'
-    downgraded_index = min(grade_order.index(base_grade) + int(math.ceil(penalty)), len(grade_order) - 1)
+    else:
+        base_grade = 'E'
+    downgraded_index = min(grade_order.index(base_grade) + penalty, len(grade_order) - 1)
     return grade_order[downgraded_index]
 
 
@@ -2780,7 +2821,14 @@ def compute_expected_slippage_r(candidate: Candidate) -> float:
     risk_per_unit = abs(float(getattr(candidate, 'risk_per_unit', 0.0) or 0.0))
     if risk_per_unit <= 0:
         return 0.0
-    return round(float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0) / risk_per_unit, 4)
+    expected_slippage_pct = max(float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0), 0.0)
+    last_price = abs(float(getattr(candidate, 'last_price', 0.0) or 0.0))
+    stop_distance_pct = abs(float(getattr(candidate, 'stop_distance_pct', 0.0) or 0.0))
+    if stop_distance_pct <= 0 and last_price > 0:
+        stop_distance_pct = (risk_per_unit / last_price) * 100.0
+    volatility_pct = abs(float(getattr(candidate, 'volatility_pct', 0.0) or getattr(candidate, 'atr_pct', 0.0) or 0.0))
+    denominator_pct = max(stop_distance_pct, volatility_pct * 0.5, 0.08)
+    return round(expected_slippage_pct / denominator_pct, 4)
 
 
 def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str, Any]:
@@ -2788,12 +2836,20 @@ def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str,
     spread_bps = round(float(getattr(candidate, 'spread_bps', 0.0) or 0.0), 4)
     orderbook_slope = round(float(getattr(candidate, 'orderbook_slope', 0.0) or 0.0), 4)
     cancel_rate = round(float(getattr(candidate, 'cancel_rate', 0.0) or 0.0), 4)
+    top_depth_usdt = round(float(getattr(candidate, 'top_depth_usdt', 0.0) or 0.0), 4)
+    estimated_impact_pct = round(float(getattr(candidate, 'estimated_impact_pct', getattr(candidate, 'orderbook_impact_pct', 0.0)) or 0.0), 4)
+    stop_distance_pct = round(float(getattr(candidate, 'stop_distance_pct', 0.0) or 0.0), 4)
+    if stop_distance_pct <= 0 and float(getattr(candidate, 'last_price', 0.0) or 0.0) > 0:
+        stop_distance_pct = round(abs(float(getattr(candidate, 'risk_per_unit', 0.0) or 0.0)) / float(getattr(candidate, 'last_price', 0.0) or 0.0) * 100.0, 4)
+    volatility_pct = round(float(getattr(candidate, 'volatility_pct', getattr(candidate, 'atr_pct', 0.0)) or 0.0), 4)
     execution_liquidity_grade = classify_execution_liquidity_grade(
         getattr(candidate, 'book_depth_fill_ratio', 0.0),
         execution_slippage_r,
         spread_bps=spread_bps,
         orderbook_slope=orderbook_slope,
         cancel_rate=cancel_rate,
+        top_depth_usdt=top_depth_usdt,
+        estimated_impact_pct=estimated_impact_pct,
     )
     if execution_liquidity_grade in {'A+', 'A'}:
         multiplier = 1.0
@@ -2804,9 +2860,12 @@ def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str,
     elif execution_liquidity_grade == 'C':
         multiplier = 0.35
         bucket = 'caution'
+    elif execution_liquidity_grade == 'D':
+        multiplier = 0.75
+        bucket = 'maker_only'
     else:
-        multiplier = 0.15
-        bucket = 'minimal'
+        multiplier = 0.0
+        bucket = 'veto'
     return {
         'expected_slippage_r': execution_slippage_r,
         'execution_liquidity_grade': execution_liquidity_grade,
@@ -2815,6 +2874,13 @@ def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str,
         'spread_bps': spread_bps,
         'orderbook_slope': orderbook_slope,
         'cancel_rate': cancel_rate,
+        'top_depth_usdt': top_depth_usdt,
+        'estimated_impact_pct': estimated_impact_pct,
+        'absolute_slippage_bps': round(float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0) * 100.0, 4),
+        'stop_distance_pct': stop_distance_pct,
+        'volatility_pct': volatility_pct,
+        'liquidity_grade_reason': f"grade={execution_liquidity_grade} spread_bps={spread_bps} top_depth_usdt={top_depth_usdt} impact_pct={estimated_impact_pct} slippage_r={execution_slippage_r}",
+        'execution_mode': 'maker_only' if execution_liquidity_grade == 'D' else ('veto' if execution_liquidity_grade == 'E' else 'taker'),
     }
 
 
@@ -5159,7 +5225,7 @@ def _payload_age_seconds_from_updated_at_ms(payload: Any) -> Optional[float]:
     return max((_utc_now() - updated_at).total_seconds(), 0.0)
 
 
-def load_scan_ticker_cache_state(store: Optional[RuntimeStateStore], max_age_seconds: float = 300.0) -> Dict[str, Any]:
+def load_scan_ticker_cache_state(store: Optional[RuntimeStateStore], max_age_seconds: float = 300.0, min_row_count: int = 1) -> Dict[str, Any]:
     state: Dict[str, Any] = {
         'available': False,
         'fresh': False,
@@ -5171,7 +5237,15 @@ def load_scan_ticker_cache_state(store: Optional[RuntimeStateStore], max_age_sec
     if store is None:
         state['reason'] = 'store_unavailable'
         return state
-    cache_state = store.load_json('ticker_24hr_cache', {})
+    cache_error: Optional[Dict[str, Any]] = None
+    if hasattr(store, 'load_json_with_error'):
+        cache_state, cache_error = store.load_json_with_error('ticker_24hr_cache', {})
+    else:
+        cache_state = store.load_json('ticker_24hr_cache', {})
+    if cache_error:
+        state['reason'] = 'cache_parse_error'
+        state['error'] = cache_error
+        return state
     if isinstance(cache_state, list):
         rows = [dict(row) for row in cache_state if isinstance(row, dict)]
         state.update({'available': bool(rows), 'fresh': bool(rows), 'row_count': len(rows), 'rows': rows, 'source': 'legacy_list'})
@@ -5190,17 +5264,23 @@ def load_scan_ticker_cache_state(store: Optional[RuntimeStateStore], max_age_sec
         updated_at = _parse_iso8601_utc(cache_state.get('updated_at'))
         if updated_at is not None:
             age_seconds = max(0.0, (_utc_now() - updated_at).total_seconds())
-    fresh = bool(rows) and age_seconds is not None and age_seconds <= float(max_age_seconds)
+    row_count = int(cache_state.get('row_count') or len(rows))
+    min_row_count = max(1, int(min_row_count or 1))
+    enough_rows = row_count >= min_row_count
+    fresh = bool(rows) and enough_rows and age_seconds is not None and age_seconds <= float(max_age_seconds)
     state.update({
         'available': bool(rows),
         'fresh': fresh,
         'age_seconds': age_seconds,
-        'row_count': int(cache_state.get('row_count') or len(rows)),
+        'row_count': row_count,
+        'min_row_count': min_row_count,
         'rows': rows,
         'source': str(cache_state.get('source') or 'ticker_24hr_cache'),
     })
     if not rows:
         state['reason'] = 'cache_empty'
+    elif not enough_rows:
+        state['reason'] = 'cache_row_count_below_minimum'
     elif age_seconds is None:
         state['reason'] = 'cache_age_unknown'
     elif not fresh:
@@ -5244,6 +5324,10 @@ def scanner_ticker_rest_fallback_decision(store: Optional[RuntimeStateStore], ar
     cursor = _scanner_rest_fallback_cursor(store)
     last_at_ms = int(cursor.get('last_ticker_24hr_at_ms') or 0)
     min_interval = float(getattr(args, 'scanner_rest_fallback_min_interval_seconds', 0.0) or 0.0)
+    cache_reason = str(cache_state.get('reason') or '')
+    bypass_min_interval_reasons = {'cache_parse_error', 'cache_invalid'}
+    if cache_reason in bypass_min_interval_reasons:
+        min_interval = 0.0
     now_ms = int(time.time() * 1000)
     elapsed = (now_ms - last_at_ms) / 1000.0 if last_at_ms > 0 else None
     if min_interval > 0 and elapsed is not None and elapsed < min_interval:
@@ -5279,10 +5363,33 @@ def build_degraded_ticker_rows_from_book_ticker_cache(store: Optional[RuntimeSta
     return rows
 
 
+def _build_ticker_24hr_cache_payload(rows: Sequence[Dict[str, Any]], *, source: str, rest_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cleaned_rows = [dict(row) for row in rows if isinstance(row, dict) and normalize_symbol(row.get('symbol'))]
+    rows_by_symbol = {normalize_symbol(row.get('symbol')): row for row in cleaned_rows}
+    rest_snapshot = rest_snapshot or _binance_rest_guard_snapshot()
+    return {
+        'updated_at_ms': int(time.time() * 1000),
+        'source': source,
+        'row_count': len(rows_by_symbol),
+        'rows_by_symbol': rows_by_symbol,
+        'rest_used_weight_1m': int(rest_snapshot.get('rest_used_weight_1m') or 0),
+    }
+
+
+def _save_ticker_24hr_cache_payload(store: Optional[RuntimeStateStore], rows: Sequence[Dict[str, Any]], *, source: str, rest_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = _build_ticker_24hr_cache_payload(rows, source=source, rest_snapshot=rest_snapshot)
+    if store is not None:
+        store.save_json('ticker_24hr_cache', payload)
+    return payload
+
+
 def resolve_scan_tickers(client: BinanceFuturesClient, store: Optional[RuntimeStateStore], args: argparse.Namespace, fallback_symbols: Optional[Sequence[str]] = None, return_diagnostics: bool = False):
     max_age_seconds = float(getattr(args, 'ticker_24hr_cache_max_age_seconds', getattr(args, 'scanner_ticker_cache_max_age_seconds', 300.0)) or 300.0)
+    min_row_count = max(1, int(getattr(args, 'ticker_24hr_cache_min_rows', 1) or 1))
+    if fallback_symbols:
+        min_row_count = max(min_row_count, len(set(normalize_symbol(symbol) for symbol in fallback_symbols if normalize_symbol(symbol))))
     runtime_state_explicit = hasattr(args, 'runtime_state_dir') or not scanner_rest_fallback_enabled(args)
-    cache_state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds) if runtime_state_explicit else {'fresh': False, 'rows': [], 'row_count': 0, 'age_seconds': None}
+    cache_state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds, min_row_count=min_row_count) if runtime_state_explicit else {'fresh': False, 'rows': [], 'row_count': 0, 'age_seconds': None}
     rest_snapshot = _runtime_store_rest_guard_snapshot(store) if runtime_state_explicit else {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 0}
     refresher_heartbeat = load_ticker_24hr_cache_refresher_heartbeat(store)
     diagnostics: Dict[str, Any] = {
@@ -5312,6 +5419,7 @@ def resolve_scan_tickers(client: BinanceFuturesClient, store: Optional[RuntimeSt
     diagnostics['scanner_rest_fallback_blocked_by_weight'] = str(decision.get('reason') or '') == 'rest_used_weight_1m_exceeds_limit'
     if decision.get('allowed'):
         rows = fetch_tickers(client)
+        _save_ticker_24hr_cache_payload(store, rows, source='scanner_rest_fallback', rest_snapshot=rest_snapshot)
         _save_scanner_ticker_rest_fallback_cursor(store)
         diagnostics['scanner_rest_fallback_used'] = True
         diagnostics['rest_used_weight_1m'] = int(diagnostics.get('rest_used_weight_1m') or 0)
@@ -5333,6 +5441,24 @@ _TICKER_24HR_CACHE_REFRESHER_LOCK = threading.Lock()
 _TICKER_24HR_CACHE_REFRESHER_THREAD: Optional[threading.Thread] = None
 
 
+def _pid_is_running(pid: Any) -> bool:
+    try:
+        value = int(pid)
+    except Exception:
+        return False
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
 def load_ticker_24hr_cache_refresher_heartbeat(store: Optional[RuntimeStateStore]) -> Dict[str, Any]:
     if store is None:
         return {'active': False}
@@ -5340,10 +5466,13 @@ def load_ticker_24hr_cache_refresher_heartbeat(store: Optional[RuntimeStateStore
     if not isinstance(payload, dict):
         return {'active': False}
     age_seconds = _payload_age_seconds_from_updated_at_ms(payload)
-    active = bool(payload.get('active')) and age_seconds is not None and age_seconds < 180.0
+    pid = payload.get('pid')
+    pid_alive = _pid_is_running(pid) if pid not in (None, '') else True
+    active = bool(payload.get('active')) and pid_alive and age_seconds is not None and age_seconds < 180.0
     result = dict(payload)
     result['active'] = active
     result['age_seconds'] = age_seconds
+    result['pid_alive'] = pid_alive
     return result
 
 
@@ -5377,8 +5506,9 @@ def _ticker_24hr_cache_refresher_skip(store: RuntimeStateStore, reason: str, res
 
 def refresh_ticker_24hr_cache_once(client: BinanceFuturesClient, store: RuntimeStateStore, *, source: str = 'ticker_24hr_cache_refresher', args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
     max_age_seconds = float(getattr(args, 'ticker_24hr_cache_max_age_seconds', getattr(args, 'scanner_ticker_cache_max_age_seconds', 300.0)) or 300.0) if args is not None else 300.0
+    min_row_count = max(1, int(getattr(args, 'ticker_24hr_cache_min_rows', 100) or 100)) if args is not None else 100
     max_used_weight = int(getattr(args, 'scanner_rest_fallback_max_used_weight_1m', 900) or 900) if args is not None else 900
-    cache_state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds)
+    cache_state = load_scan_ticker_cache_state(store, max_age_seconds=max_age_seconds, min_row_count=min_row_count)
     rest_snapshot = _runtime_store_rest_guard_snapshot(store)
     rest_state = str(rest_snapshot.get('rest_circuit_state') or rest_snapshot.get('state') or 'CLOSED').upper()
     used_weight = int(rest_snapshot.get('rest_used_weight_1m') or 0)
@@ -5389,17 +5519,7 @@ def refresh_ticker_24hr_cache_once(client: BinanceFuturesClient, store: RuntimeS
     if bool(cache_state.get('fresh')):
         return _ticker_24hr_cache_refresher_skip(store, 'cache_fresh', rest_snapshot, cache_state)
     rows = fetch_tickers(client)
-    rows = [dict(row) for row in rows if isinstance(row, dict) and normalize_symbol(row.get('symbol'))]
-    rows_by_symbol = {normalize_symbol(row.get('symbol')): row for row in rows}
-    rest_snapshot = _binance_rest_guard_snapshot()
-    payload = {
-        'updated_at_ms': int(time.time() * 1000),
-        'source': source,
-        'row_count': len(rows_by_symbol),
-        'rows_by_symbol': rows_by_symbol,
-        'rest_used_weight_1m': int(rest_snapshot.get('rest_used_weight_1m') or 0),
-    }
-    store.save_json('ticker_24hr_cache', payload)
+    payload = _save_ticker_24hr_cache_payload(store, rows, source=source, rest_snapshot=_binance_rest_guard_snapshot())
     _save_ticker_24hr_cache_refresher_heartbeat(store, active=True, last_skipped_reason='')
     append_rate_limited_runtime_event(store, 'ticker_24hr_cache_refreshed', {'row_count': payload['row_count'], 'rest_used_weight_1m': payload['rest_used_weight_1m'], 'source': source}, key='ticker_24hr_cache_refresher', min_interval_seconds=60.0)
     return payload
@@ -7043,6 +7163,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--scanner-rest-fallback-max-used-weight-1m', type=int, default=900)
     parser.add_argument('--ticker-24hr-cache-refresh-seconds', type=float, default=120.0)
     parser.add_argument('--ticker-24hr-cache-max-age-seconds', type=float, default=300.0)
+    parser.add_argument('--ticker-24hr-cache-min-rows', type=int, default=100)
     parser.add_argument('--scanner-ticker-cache-max-age-seconds', type=float, default=10.0)
     parser.add_argument('--scanner-kline-cache-max-age-seconds', type=float, default=120.0)
     parser.add_argument('--scanner-order-book-cache-max-age-seconds', type=float, default=3.0)
@@ -7112,6 +7233,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'scanner_rest_fallback_max_used_weight_1m': 900,
         'ticker_24hr_cache_refresh_seconds': 120.0,
         'ticker_24hr_cache_max_age_seconds': 300.0,
+        'ticker_24hr_cache_min_rows': 100,
         'runtime_ttl_seconds': 900.0,
         'runtime_queue_maxsize': 128,
         'supervisor_restart_limit': 3,
@@ -7203,20 +7325,22 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'max_open_positions': 3,
             'max_long_positions': 3,
             'max_short_positions': 3,
-            'max_rsi_5m': 84.0,
-            'min_volume_multiple': 0.5,
-            'min_5m_change_pct': 0.2,
-            'watch_breakout_tolerance_pct': 1.2,
-            'setup_breakout_tolerance_pct': 0.8,
-            'oi_hard_reversal_threshold_pct': 1.2,
-            'extended_chase_threshold_pct': 22.0,
-            'sim_probe_entry_enabled': False,
+            'max_rsi_5m': 88.0,
+            'min_volume_multiple': 0.35,
+            'min_5m_change_pct': 0.15,
+            'watch_breakout_tolerance_pct': 1.5,
+            'setup_breakout_tolerance_pct': 1.0,
+            'oi_hard_reversal_threshold_pct': 1.5,
+            'extended_chase_threshold_pct': 28.0,
+            'execution_slippage_hard_veto_r': 300.0,
+            'execution_slippage_risk_threshold_r': 300.0,
+            'sim_probe_entry_enabled': True,
             'sim_probe_size_ratio': 0.3,
-            'sim_probe_min_score': 58.0,
-            'sim_probe_max_breakout_distance_pct': 0.6,
+            'sim_probe_min_score': 55.0,
+            'sim_probe_max_breakout_distance_pct': 0.9,
             'trigger_min_confirmations': 1,
-            'max_distance_from_ema_pct': 9.0,
-            'max_distance_from_vwap_pct': 8.0,
+            'max_distance_from_ema_pct': 12.0,
+            'max_distance_from_vwap_pct': 10.0,
             'max_funding_rate': 0.0008,
             'max_funding_rate_avg': 0.0005,
             'enable_symbol_quality_tier': True,

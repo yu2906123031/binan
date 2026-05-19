@@ -356,12 +356,20 @@ def test_aggressive_fee_aware_scalp_directional_profiles_limit_evaluation_side()
     assert short_args.max_short_positions == 1
 
 
-def test_v2_profile_enables_structural_filters_and_disables_live_probe_defaults():
+def test_v2_profile_enables_structural_filters_and_relaxed_probe_defaults():
     mod = load_module()
     args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-aggressive-v2']))
 
     assert args.profile == '10u-aggressive-v2'
-    assert args.sim_probe_entry_enabled is False
+    assert args.sim_probe_entry_enabled is True
+    assert args.sim_probe_min_score == 55.0
+    assert args.sim_probe_max_breakout_distance_pct == 0.9
+    assert args.watch_breakout_tolerance_pct == 1.5
+    assert args.setup_breakout_tolerance_pct == 1.0
+    assert args.oi_hard_reversal_threshold_pct == 1.5
+    assert args.max_rsi_5m == 88.0
+    assert args.min_volume_multiple == 0.35
+    assert args.min_5m_change_pct == 0.15
     assert args.enable_symbol_quality_tier is True
     assert args.enable_market_regime_gate is True
     assert args.enable_direction_lock is True

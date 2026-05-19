@@ -4412,6 +4412,38 @@ def test_merged_candidate_symbols_filters_square_and_ticker_inputs_to_exchange_u
     assert loser_rank_map == {'XRPUSDT': 1, '1000PEPEUSDT': 2}
 
 
+def test_auto_loop_book_ticker_symbol_provider_caches_symbols_between_supervisor_polls(monkeypatch):
+    args = mod.parse_args([])
+    args.top_gainers = 2
+    args.top_losers = 0
+    args.auto_loop_book_ticker_symbol_cache_seconds = 60.0
+    calls = {'exchange_meta': 0, 'tickers': 0}
+
+    def fake_fetch_exchange_meta(_client):
+        calls['exchange_meta'] += 1
+        return {
+            'DOGEUSDT': mod.SymbolMeta(symbol='DOGEUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+            'XRPUSDT': mod.SymbolMeta(symbol='XRPUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0, min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'),
+        }
+
+    def fake_fetch_tickers(_client):
+        calls['tickers'] += 1
+        return [
+            {'symbol': 'DOGEUSDT', 'priceChangePercent': '5.0'},
+            {'symbol': 'XRPUSDT', 'priceChangePercent': '4.0'},
+        ]
+
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', fake_fetch_exchange_meta)
+    monkeypatch.setattr(mod, 'fetch_tickers', fake_fetch_tickers)
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: 100.0)
+
+    provider = mod.make_auto_loop_book_ticker_symbol_provider(client=object(), args=args)
+
+    assert provider() == ['DOGEUSDT', 'XRPUSDT']
+    assert provider() == ['DOGEUSDT', 'XRPUSDT']
+    assert calls == {'exchange_meta': 1, 'tickers': 1}
+
+
 def test_resolve_auto_loop_book_ticker_symbols_filters_to_exchange_universe(monkeypatch):
     args = mod.parse_args([])
     args.top_gainers = 2

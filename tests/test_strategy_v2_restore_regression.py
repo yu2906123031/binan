@@ -4832,6 +4832,114 @@ def test_sync_tracked_positions_with_exchange_persists_realtime_exchange_fields(
     assert tracked['leverage'] == 5
 
 
+def test_place_live_trade_uses_gtx_limit_for_liquidity_grade_d_and_records_fill_metrics(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=18.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0003,
+        funding_rate_avg=0.0002,
+        recent_5m_change_pct=2.4,
+        acceleration_ratio_5m_vs_15m=1.6,
+        breakout_level=128.0,
+        recent_swing_low=124.0,
+        stop_price=126.0,
+        quantity=1.25,
+        risk_per_unit=6.0,
+        recommended_leverage=3,
+        rsi_5m=74.0,
+        volume_multiple=2.1,
+        distance_from_ema20_5m_pct=5.2,
+        distance_from_vwap_15m_pct=4.4,
+        higher_tf_summary={'1h': 'up', '4h': 'up'},
+        score=90.0,
+        reasons=['test'],
+        side='LONG',
+        state='launch',
+        state_reasons=['launch_short_squeeze'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        smart_money_veto=False,
+        atr_stop_distance=6.0,
+        expected_slippage_pct=0.0022,
+        book_depth_fill_ratio=0.35,
+        spread_bps=7.5,
+    )
+    candidate.top_depth_usdt = 180.0
+    candidate.estimated_impact_pct = 0.05
+    candidate.best_bid_price = 131.9
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+        profile='test',
+        maker_only_timeout_seconds=1.0,
+        maker_only_max_retries=0,
+    )
+    meta = make_meta()
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                assert params['type'] == 'LIMIT'
+                assert params['timeInForce'] == 'GTX'
+                assert params['price'] == '131.9000'
+                return {
+                    'orderId': 12345,
+                    'clientOrderId': 'entry-1',
+                    'status': 'NEW',
+                    'avgPrice': '0',
+                    'executedQty': '0',
+                    'cumQuote': '0',
+                    'updateTime': 1710000000123,
+                }
+            raise AssertionError(path)
+
+    client = FakeClient()
+
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 999, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 1001, 'clientOrderId': 'tp-1'})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 999})
+    monkeypatch.setattr(mod, 'query_order', lambda client, symbol, order_id=None, client_order_id=None: {
+        'orderId': 12345,
+        'clientOrderId': client_order_id or 'entry-1',
+        'status': 'FILLED',
+        'avgPrice': '131.9',
+        'executedQty': '0.937',
+        'cumQuote': '123.5903',
+        'updateTime': 1710000000123,
+        'symbol': symbol,
+        'positionSide': 'LONG',
+    })
+
+    result = mod.place_live_trade(client, candidate, leverage=3, meta=meta, args=args)
+
+    entry_order_calls = [params for path, params in client.calls if path == '/fapi/v1/order' and params.get('type') == 'LIMIT']
+    assert entry_order_calls
+    assert result['entry_order_feedback']['execution_mode'] == 'maker_only'
+    assert result['entry_order_feedback']['maker_or_taker'] == 'maker'
+    assert result['entry_order_feedback']['predicted_slippage_bps'] == 0.22
+    assert result['entry_order_feedback']['actual_fill_slippage_bps'] > 0
+    assert result['entry_order_feedback']['fill_ratio'] == 1.0
+    assert result['entry_order_feedback']['liquidity_grade_at_entry'] == 'D'
+    assert 'grade=D' in result['entry_order_feedback']['liquidity_grade_reason']
+
+
 def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unknown(monkeypatch):
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -6166,6 +6274,24 @@ def test_ticker_24hr_cache_fresh_scanner_skips_rest_fallback(tmp_path, monkeypat
     assert 'ticker_24hr_cache_row_count' in diag
 
 
+def test_ticker_24hr_cache_below_fallback_universe_repairs_via_rest_fallback(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'source': 'scanner_rest_fallback',
+        'row_count': 1,
+        'rows_by_symbol': {'TESTUSDT': {'symbol': 'TESTUSDT', 'priceChangePercent': '1'}},
+    })
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}, {'symbol': 'ETHUSDT'}])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(ticker_24hr_cache_min_rows=1), fallback_symbols=['BTCUSDT', 'ETHUSDT'], return_diagnostics=True)
+
+    assert [row['symbol'] for row in rows] == ['BTCUSDT', 'ETHUSDT']
+    assert diag['scanner_rest_fallback_used'] is True
+    assert diag['ticker_24hr_cache_row_count'] == 1
+
+
 def test_ticker_24hr_cache_missing_high_weight_skips_rest_fallback(tmp_path, monkeypatch):
     store = mod.RuntimeStateStore(str(tmp_path))
     calls = {'fetch': 0}
@@ -6200,15 +6326,15 @@ def test_ticker_24hr_cache_missing_degraded_rows_from_book_ticker_cache(tmp_path
     assert diag['degraded_reason'] == 'ticker_24hr_cache_missing'
 
 
-def test_scanner_rest_fallback_min_interval_enforced(tmp_path, monkeypatch):
+def test_scanner_rest_fallback_min_interval_enforced_when_cache_still_missing(tmp_path, monkeypatch):
     store = mod.RuntimeStateStore(str(tmp_path))
     monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_used_weight_1m': 100})
-    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}])
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [])
 
     first_rows, first_diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
     second_rows, second_diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
 
-    assert first_rows == [{'symbol': 'BTCUSDT'}]
+    assert first_rows == []
     assert first_diag['scanner_rest_fallback_used'] is True
     assert second_rows == []
     assert second_diag['scanner_rest_fallback_skipped_reason'] == 'scanner_rest_fallback_min_interval'
@@ -6292,10 +6418,29 @@ def test_refresher_skips_fetch_when_cache_fresh(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, 'fetch_tickers', lambda client: calls.__setitem__('fetch', calls['fetch'] + 1) or [])
     monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
 
-    payload = mod.refresh_ticker_24hr_cache_once(object(), store, args=_ticker_args())
+    payload = mod.refresh_ticker_24hr_cache_once(object(), store, args=_ticker_args(ticker_24hr_cache_min_rows=1))
 
     assert calls['fetch'] == 0
     assert payload['reason'] == 'cache_fresh'
+
+
+def test_refresher_repairs_fresh_but_too_small_ticker_cache(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'source': 'scanner_rest_fallback',
+        'rows_by_symbol': {'TESTUSDT': {'symbol': 'TESTUSDT'}},
+        'row_count': 1,
+    })
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, '_binance_rest_guard_snapshot', lambda: {'rest_used_weight_1m': 101})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT'}, {'symbol': 'ETHUSDT'}])
+
+    payload = mod.refresh_ticker_24hr_cache_once(object(), store, args=_ticker_args(ticker_24hr_cache_min_rows=2))
+
+    assert payload['row_count'] == 2
+    assert payload['rows_by_symbol']['BTCUSDT']['symbol'] == 'BTCUSDT'
+    assert payload['source'] == 'ticker_24hr_cache_refresher'
 
 
 def test_fallback_cursor_uses_epoch_ms(tmp_path, monkeypatch):
@@ -6307,6 +6452,77 @@ def test_fallback_cursor_uses_epoch_ms(tmp_path, monkeypatch):
     cursor = store.load_json('scanner_rest_fallback_cursor', {})
     assert cursor['last_ticker_24hr_at_ms'] == 1_700_000_000_123
     assert 'last_ticker_24hr_at_monotonic' not in cursor
+
+
+def test_scanner_rest_fallback_persists_repaired_ticker_cache(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, '_binance_rest_guard_snapshot', lambda: {'rest_used_weight_1m': 101})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'BTCUSDT', 'quoteVolume': '1000'}])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['BTCUSDT'], return_diagnostics=True)
+
+    assert rows == [{'symbol': 'BTCUSDT', 'quoteVolume': '1000'}]
+    assert diag['scanner_rest_fallback_used'] is True
+    cache = store.load_json('ticker_24hr_cache', {})
+    assert cache['source'] == 'scanner_rest_fallback'
+    assert cache['row_count'] == 1
+    assert cache['rows_by_symbol']['BTCUSDT']['quoteVolume'] == '1000'
+
+
+def test_scanner_rest_fallback_bypasses_min_interval_when_cache_parse_error(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('scanner_rest_fallback_cursor', {'last_ticker_24hr_at_ms': int(mod.time.time() * 1000)})
+    (tmp_path / 'ticker_24hr_cache.json').write_text('{broken', encoding='utf-8')
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [{'symbol': 'ETHUSDT'}])
+
+    rows, diag = mod.resolve_scan_tickers(object(), store, _ticker_args(), fallback_symbols=['ETHUSDT'], return_diagnostics=True)
+
+    assert rows == [{'symbol': 'ETHUSDT'}]
+    assert diag['scanner_rest_fallback_used'] is True
+    assert diag['scanner_rest_fallback_skipped_reason'] == ''
+
+
+def test_refresher_heartbeat_with_dead_pid_is_inactive(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache_refresher_heartbeat', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'active': True,
+        'pid': 99999999,
+    })
+    monkeypatch.setattr(mod, '_pid_is_running', lambda pid: False)
+
+    heartbeat = mod.load_ticker_24hr_cache_refresher_heartbeat(store)
+
+    assert heartbeat['active'] is False
+    assert heartbeat['pid_alive'] is False
+
+
+def test_refresher_start_ignores_fresh_heartbeat_from_dead_pid(tmp_path, monkeypatch):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('ticker_24hr_cache_refresher_heartbeat', {
+        'updated_at_ms': int(mod.time.time() * 1000),
+        'active': True,
+        'pid': 99999999,
+    })
+    started = {'count': 0}
+    class DummyThread:
+        name = 'dummy'
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self):
+            started['count'] += 1
+        def is_alive(self):
+            return True
+    monkeypatch.setattr(mod, '_pid_is_running', lambda pid: False)
+    monkeypatch.setattr(mod.threading, 'Thread', DummyThread)
+    monkeypatch.setattr(mod, '_TICKER_24HR_CACHE_REFRESHER_THREAD', None)
+
+    thread = mod.start_ticker_24hr_cache_refresher(object(), _ticker_args(), store)
+
+    assert thread is not None
+    assert started['count'] == 1
 
 
 def test_refresher_start_is_singleton_with_active_heartbeat(tmp_path, monkeypatch):
@@ -6325,6 +6541,7 @@ def test_refresher_start_is_singleton_with_active_heartbeat(tmp_path, monkeypatc
             started['count'] += 1
         def is_alive(self):
             return True
+    monkeypatch.setattr(mod, '_pid_is_running', lambda pid: True)
     monkeypatch.setattr(mod.threading, 'Thread', DummyThread)
     monkeypatch.setattr(mod, '_TICKER_24HR_CACHE_REFRESHER_THREAD', None)
 

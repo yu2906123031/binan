@@ -433,17 +433,67 @@ def place_live_trade(
         raise binance_api_error(error_payload['message'])
     entry_order_error: Optional[Exception] = None
     entry_position_mode = 'HEDGE' if should_send_position_side(client) else 'ONE_WAY'
+    execution_mode = str(execution_quality.get('execution_mode') or ('maker_only' if execution_quality.get('execution_liquidity_grade') == 'D' else 'taker')).lower()
+    entry_side = 'SELL' if position_side != position_side_long else 'BUY'
     entry_params = {
         'symbol': candidate.symbol,
-        'side': 'SELL' if position_side != position_side_long else 'BUY',
+        'side': entry_side,
         'type': 'MARKET',
         'quantity': format_decimal(quantity, quantity_precision),
         'newOrderRespType': 'RESULT',
     }
+    if execution_mode == 'maker_only':
+        tick_size = float(getattr(meta, 'tick_size', 0.0) or 0.0)
+        price_precision = int(getattr(meta, 'price_precision', 4) or 4)
+        if entry_side == 'BUY':
+            maker_price = _to_float(getattr(candidate, 'best_bid_price', 0.0) or getattr(candidate, 'bid_price', 0.0) or getattr(candidate, 'best_bid', 0.0) or getattr(candidate, 'last_price', 0.0))
+            if tick_size > 0 and maker_price <= 0:
+                maker_price = max(float(candidate.last_price) - tick_size, tick_size)
+        else:
+            maker_price = _to_float(getattr(candidate, 'best_ask_price', 0.0) or getattr(candidate, 'ask_price', 0.0) or getattr(candidate, 'best_ask', 0.0) or getattr(candidate, 'last_price', 0.0))
+            if tick_size > 0 and maker_price <= 0:
+                maker_price = float(candidate.last_price) + tick_size
+        maker_price = round_step(maker_price, tick_size, price_precision) if tick_size > 0 else round(maker_price, price_precision)
+        entry_params.update({'type': 'LIMIT', 'timeInForce': 'GTX', 'price': format_decimal(maker_price, price_precision)})
     if should_send_position_side(client):
         entry_params['positionSide'] = position_side
     try:
         entry_order = client.signed_post('/fapi/v1/order', entry_params)
+        if execution_mode == 'maker_only':
+            order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else None
+            client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None
+            timeout_seconds = max(float(getattr(args, 'maker_only_timeout_seconds', 10.0) or 10.0), 0.0)
+            retry_count = max(int(getattr(args, 'maker_only_max_retries', 2) or 2), 0)
+            started_at = time_module.time()
+            confirmed = entry_order
+            for attempt in range(retry_count + 1):
+                while time_module.time() - started_at <= timeout_seconds:
+                    confirmed = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id)
+                    status = str(confirmed.get('status') or '').upper()
+                    if _to_float(confirmed.get('executedQty'), default=0.0) > 0 or status in {'FILLED', 'PARTIALLY_FILLED'}:
+                        entry_order = confirmed
+                        break
+                    time_module.sleep(0.5)
+                if _to_float(entry_order.get('executedQty'), default=0.0) > 0:
+                    break
+                try:
+                    cancel_params = {'symbol': candidate.symbol}
+                    if order_id is not None:
+                        cancel_params['orderId'] = order_id
+                    elif client_order_id:
+                        cancel_params['origClientOrderId'] = client_order_id
+                    if hasattr(client, 'signed_delete'):
+                        client.signed_delete('/fapi/v1/order', params=cancel_params)
+                    elif hasattr(client, 'signed_post'):
+                        client.signed_post('/fapi/v1/order/cancel', cancel_params)
+                except Exception:
+                    pass
+                if attempt >= retry_count:
+                    break
+                started_at = time_module.time()
+                entry_order = client.signed_post('/fapi/v1/order', entry_params)
+                order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else order_id
+                client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else client_order_id
     except Exception as exc:
         entry_order_error = exc
         error_message = str(exc)
@@ -502,7 +552,14 @@ def place_live_trade(
         'cum_quote': _to_float(entry_order.get('cumQuote')),
         'update_time': entry_order.get('updateTime'),
         'position_mode': entry_position_mode,
-        'recovered_from_unknown_timeout': bool(entry_order_error is not None and '-1007' in str(entry_order_error)),
+        'execution_mode': execution_mode,
+        'maker_or_taker': 'maker' if execution_mode == 'maker_only' else 'taker',
+        'predicted_slippage_bps': round(float(execution_quality.get('absolute_slippage_bps', 0.0) or 0.0), 4),
+        'actual_fill_slippage_bps': round(abs((entry_price - float(candidate.last_price)) / float(candidate.last_price)) * 10000.0, 4) if float(candidate.last_price) > 0 else 0.0,
+        'fill_latency_ms': int(max((time_module.time() - started_at) * 1000.0, 0.0)) if execution_mode == 'maker_only' else 0,
+        'fill_ratio': round(filled_quantity / quantity, 6) if quantity > 0 else 0.0,
+        'liquidity_grade_at_entry': execution_quality.get('execution_liquidity_grade'),
+        'liquidity_grade_reason': execution_quality.get('liquidity_grade_reason'),
     }
     plan = build_trade_management_plan(
         entry_price=entry_price,
