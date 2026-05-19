@@ -4741,3 +4741,52 @@ def test_build_candidate_short_records_loser_rank_and_directional_intersection()
     assert candidate.loser_rank == 1
     assert 'loser_rank=1' in candidate.reasons
     assert 'hot_directional_mover_intersection' in candidate.reasons
+
+
+def test_trigger_relax_promotes_high_score_setup_to_pretrigger_maker_watch():
+    candidate = mod.Candidate(
+        symbol='CGPTUSDT', last_price=1.0, price_change_pct_24h=8.0, quote_volume_24h=2_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=0.9, acceleration_ratio_5m_vs_15m=1.1, breakout_level=1.002,
+        recent_swing_low=0.97, stop_price=0.98, quantity=100.0, risk_per_unit=0.02,
+        recommended_leverage=10, rsi_5m=66.0, volume_multiple=1.8,
+        distance_from_ema20_5m_pct=0.4, distance_from_vwap_15m_pct=0.3,
+        higher_tf_summary='aligned', score=76.0, reasons=['setup_candidate'], state='launch',
+        liquidity_grade='B', expected_slippage_pct=0.08, book_depth_fill_ratio=0.9,
+        setup_ready=True, trigger_fired=False, candidate_stage='setup_candidate',
+        trigger_missing=['waiting_breakout', 'oi_taker_not_confirmed'],
+        trigger_confirmation_flags={'breakout_close_confirmed': False, 'oi_taker_alignment_confirmed': False},
+        entry_distance_from_breakout_pct=-0.2, oi_change_pct_5m=0.1, cvd_delta=12.0, taker_buy_ratio=0.53,
+    )
+    args = argparse.Namespace(trigger_relax_mode=True, trigger_relax_min_score=70.0, trigger_relax_min_points=3)
+
+    assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'neutral'}) is True
+    relaxed = mod.build_trigger_relax_candidate(candidate, args)
+    alert = mod.build_standardized_alert(relaxed, {'label': 'neutral', 'score_multiplier': 1.0, 'reasons': []})
+
+    assert relaxed.pretrigger_watch is True
+    assert relaxed.trigger_relax_mode is True
+    assert relaxed.trigger_fired is True
+    assert relaxed.candidate_stage == 'pre_trigger_watch'
+    assert 'waiting_breakout' not in relaxed.trigger_missing
+    assert 'oi_taker_not_confirmed' not in relaxed.trigger_missing
+    assert alert['execution_mode'] == 'maker_only'
+    assert alert['execution_quality_size_bucket'] == 'pretrigger_maker_watch'
+
+
+def test_trigger_relax_keeps_btc_risk_off_long_blocked():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT', last_price=1.0, price_change_pct_24h=8.0, quote_volume_24h=2_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=1.0, acceleration_ratio_5m_vs_15m=1.1, breakout_level=1.002,
+        recent_swing_low=0.97, stop_price=0.98, quantity=100.0, risk_per_unit=0.02,
+        recommended_leverage=10, rsi_5m=66.0, volume_multiple=1.9,
+        distance_from_ema20_5m_pct=0.4, distance_from_vwap_15m_pct=0.3,
+        higher_tf_summary='aligned', score=80.0, reasons=['setup_candidate'], state='launch',
+        liquidity_grade='B', expected_slippage_pct=0.08, book_depth_fill_ratio=0.9,
+        setup_ready=True, trigger_fired=False, side='LONG', entry_distance_from_breakout_pct=-0.1,
+        oi_change_pct_5m=0.2, cvd_delta=12.0, taker_buy_ratio=0.55,
+    )
+    args = argparse.Namespace(trigger_relax_mode=True, trigger_relax_min_score=70.0, trigger_relax_min_points=3)
+
+    assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'risk_off'}) is False

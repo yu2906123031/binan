@@ -868,6 +868,38 @@ def test_resident_scanner_execution_do_not_write_runtime_state_directly(monkeypa
     assert result['manager_update']['kind'] == 'cycle'
 
 
+def test_execution_cycle_refreshes_book_ticker_websocket_status_before_live_trade(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
+    store = DummyStore()
+    fresh_status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now()), 'messages_processed': 10}
+    store.save_json('book_ticker_ws_status', fresh_status)
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3)
+    req = {
+        'candidate': candidate,
+        'meta': {'symbol': 'DOGEUSDT', 'book_ticker_websocket': {'status': 'stale', 'updated_at': '2000-01-01T00:00:00Z'}},
+        'risk_guard': {'allowed': True},
+        'reconcile': {'ok': True},
+        'cycle': {'cycle_no': 11},
+        'requested_leverage': 3,
+    }
+    seen = {}
+
+    def fake_place_live_trade(client, picked_candidate, requested_leverage, meta, passed_args):
+        seen['meta'] = meta
+        return {'symbol': picked_candidate.symbol, 'quantity': 1}
+
+    monkeypatch.setattr(mod, 'place_live_trade', fake_place_live_trade)
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    assert result['ok'] is True
+    assert seen['meta']['book_ticker_websocket']['status'] == 'healthy'
+    assert seen['meta']['book_ticker_websocket']['messages_processed'] == 10
+
+
+
 def test_execution_cycle_emits_position_manager_message_without_starting_monitor(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=False)
@@ -4059,3 +4091,89 @@ def test_resident_marks_running_after_initial_runtime_tasks_start(monkeypatch):
     assert resident['blocked_reason'] == ''
     assert resident['tasks_started'] is True
 
+
+def test_websocket_jitter_degrades_execution_without_veto():
+    mod = load_module()
+    now = mod._utc_now()
+    status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(now - datetime.timedelta(seconds=4)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+
+    freshness = mod.evaluate_websocket_freshness(status, now=now)
+
+    assert freshness['state'] == 'slightly_stale'
+    assert freshness['execution_degradation_mode'] == 'reduced_aggression'
+    assert freshness['stale_guard_decision_reason'] == 'short_websocket_jitter'
+
+
+def test_reconnecting_websocket_allows_maker_only_degradation():
+    mod = load_module()
+    now = mod._utc_now()
+    status = {'status': 'reconnecting', 'updated_at': mod._isoformat_utc(now - datetime.timedelta(seconds=12)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    candidate = SimpleNamespace(symbol='DOGEUSDT', quantity=10.0, position_size_pct=1.0, reasons=[])
+
+    freshness = mod.evaluate_websocket_freshness(status, now=now)
+    degraded = mod.build_websocket_degraded_candidate(candidate, freshness)
+
+    assert freshness['state'] == 'reconnecting'
+    assert freshness['execution_degradation_mode'] == 'maker_only'
+    assert degraded.execution_mode_override == 'maker_only'
+    assert degraded.quantity == 5.0
+
+
+def test_dead_websocket_still_blocks_execution_cycle(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
+    store = DummyStore()
+    old = mod._utc_now() - datetime.timedelta(seconds=31)
+    store.save_json('book_ticker_ws_status', {'status': 'healthy', 'updated_at': mod._isoformat_utc(old), 'messages_processed': 100, 'samples_written': 100})
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
+    req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 12}, 'requested_leverage': 3}
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: (_ for _ in ()).throw(AssertionError('dead websocket must block execution')))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    assert result['manager_update']['reason'].startswith('websocket_stale:')
+    assert result['cycle']['live_skipped_due_to_websocket_gate'][0].startswith('book_ticker_websocket_stale:')
+
+
+def test_execution_cycle_refresh_recovered_websocket_continues_execution(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
+    store = DummyStore()
+    fresh = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now()), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    store.save_json('book_ticker_ws_status', fresh)
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
+    req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT', 'book_ticker_websocket': {'status': 'dead'}}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 13}, 'requested_leverage': 3}
+    seen = {}
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, cand, lev, meta, passed_args: seen.setdefault('meta', meta) or {'symbol': cand.symbol, 'quantity': cand.quantity})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    assert result['ok'] is True
+    assert result['live_execution']['symbol'] == 'DOGEUSDT'
+    assert seen['meta']['websocket_execution_guard']['state'] == 'healthy'
+
+
+def test_stale_guard_metrics_written_in_meta_and_cycle(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
+    store = DummyStore()
+    status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now() - datetime.timedelta(seconds=5)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    store.save_json('book_ticker_ws_status', status)
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
+    req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 14}, 'requested_leverage': 3}
+    seen = {}
+    def fake_place(client, cand, lev, meta, passed_args):
+        seen['candidate'] = cand
+        seen['meta'] = meta
+        return {'symbol': cand.symbol, 'quantity': cand.quantity}
+    monkeypatch.setattr(mod, 'place_live_trade', fake_place)
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    guard = seen['meta']['websocket_execution_guard']
+    assert guard['websocket_message_age_seconds'] >= 3
+    assert guard['websocket_sample_age_seconds'] >= 3
+    assert result['cycle']['execution_degradation_mode'] == 'reduced_aggression'
+    assert seen['candidate'].execution_mode_override == 'maker_only'

@@ -1262,6 +1262,11 @@ class Candidate:
     portfolio_correlation_group: str = ''
     high_vol_alt_mode: bool = False
     probe_entry: bool = False
+    pretrigger_watch: bool = False
+    trigger_relax_mode: bool = False
+    execution_mode_override: str = ''
+    execution_liquidity_grade_override: str = ''
+    execution_degradation_mode: str = 'none'
     tradeability_score: float = 0.0
     expected_edge: float = 0.0
     expected_total_fee_pct: float = 0.0
@@ -1681,21 +1686,80 @@ def cleanup_symbol_runtime_state_ttl(
     return result
 
 
+def _websocket_age_seconds(value: Any, now_dt: datetime.datetime) -> Optional[float]:
+    parsed = _parse_iso8601_utc(value)
+    if parsed is None:
+        return None
+    return max((now_dt - parsed).total_seconds(), 0.0)
+
+
 def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, require_messages: bool = True, now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
     if not isinstance(health, dict):
-        return {'fresh': False, 'reason': 'missing_health'}
+        return {'fresh': False, 'state': 'dead', 'execution_degradation_mode': 'blocked', 'reason': 'missing_health'}
     now_dt = now.astimezone(datetime.timezone.utc) if isinstance(now, datetime.datetime) and now.tzinfo else (now.replace(tzinfo=datetime.timezone.utc) if isinstance(now, datetime.datetime) else _utc_now())
-    updated_at = _parse_iso8601_utc(health.get('updated_at'))
-    if updated_at is None:
-        return {'fresh': False, 'reason': 'unknown_websocket_health_without_updated_at'}
-    age_seconds = (now_dt - updated_at).total_seconds()
-    if age_seconds > float(max_age_seconds or 0.0):
-        return {'fresh': False, 'reason': 'stale_websocket_health', 'age_seconds': round(age_seconds, 3)}
+    status = str(health.get('status') or health.get('connected_state') or '').lower()
+    health_age = _websocket_age_seconds(health.get('updated_at'), now_dt)
+    message_age = _websocket_age_seconds(health.get('last_message_at') or health.get('last_event_at') or health.get('last_received_at') or health.get('updated_at'), now_dt)
+    sample_age = _websocket_age_seconds(health.get('last_sample_at') or health.get('last_sample_write_at') or health.get('last_written_at') or health.get('updated_at'), now_dt)
+    reconnect_age = _websocket_age_seconds(health.get('last_reconnect_at') or health.get('reconnected_at') or health.get('last_connect_at'), now_dt)
     messages = int(health.get('messages_processed', 0) or 0)
     samples = int(health.get('samples_written', 0) or 0)
+    subscription_count = int(health.get('symbol_count', health.get('subscription_count', health.get('subscriptions', 0))) or 0)
+    ages = [age for age in (health_age, message_age, sample_age) if age is not None]
+    flow_age = min(ages) if ages else None
     if require_messages and messages <= 0 and samples <= 0:
-        return {'fresh': False, 'reason': 'no_websocket_messages', 'age_seconds': round(age_seconds, 3)}
-    return {'fresh': True, 'reason': 'fresh', 'age_seconds': round(age_seconds, 3), 'messages_processed': messages, 'samples_written': samples}
+        state, mode, reason = 'dead', 'blocked', 'no_websocket_messages'
+    elif status in {'dead', 'failed', 'unavailable'}:
+        state, mode, reason = 'dead', 'blocked', f'websocket_{status}'
+    elif flow_age is None:
+        state, mode, reason = 'dead', 'blocked', 'unknown_websocket_health_without_updated_at'
+    elif flow_age < 3.0:
+        state, mode, reason = 'healthy', 'none', 'fresh'
+    elif flow_age < 10.0:
+        state, mode, reason = 'slightly_stale', 'reduced_aggression', 'short_websocket_jitter'
+    elif flow_age < 30.0:
+        state, mode, reason = 'reconnecting', 'maker_only', 'websocket_reconnecting_or_event_loop_lag'
+    else:
+        state, mode, reason = 'dead', 'blocked', 'stale_websocket_health'
+    if status in {'reconnecting', 'connecting'} and state in {'healthy', 'slightly_stale'}:
+        state, mode, reason = 'reconnecting', 'maker_only', f'websocket_{status}'
+    return {
+        'fresh': state == 'healthy',
+        'state': state,
+        'reason': reason,
+        'execution_degradation_mode': mode,
+        'age_seconds': round(flow_age, 3) if flow_age is not None else None,
+        'websocket_message_age_seconds': round(message_age, 3) if message_age is not None else None,
+        'websocket_sample_age_seconds': round(sample_age, 3) if sample_age is not None else None,
+        'websocket_last_health_update_age_seconds': round(health_age, 3) if health_age is not None else None,
+        'websocket_last_reconnect_age_seconds': round(reconnect_age, 3) if reconnect_age is not None else None,
+        'messages_processed': messages,
+        'samples_written': samples,
+        'subscription_count': subscription_count,
+        'stale_guard_decision_reason': reason,
+    }
+
+
+def build_websocket_degraded_candidate(candidate: Any, freshness: Dict[str, Any]) -> Any:
+    mode = str(freshness.get('execution_degradation_mode') or 'none')
+    if mode not in {'reduced_aggression', 'maker_only'}:
+        return candidate
+    ratio = 0.7 if mode == 'reduced_aggression' else 0.5
+    quantity = max(float(getattr(candidate, 'quantity', 0.0) or 0.0) * ratio, 0.0)
+    position_size_pct = round(float(getattr(candidate, 'position_size_pct', 0.0) or 0.0) * ratio, 4)
+    reasons = list(getattr(candidate, 'reasons', []) or []) + [f'websocket_degradation={mode}', f"websocket_state={freshness.get('state')}"]
+    updates = {'quantity': quantity, 'position_size_pct': position_size_pct, 'reasons': reasons}
+    if mode in {'reduced_aggression', 'maker_only'}:
+        updates.update({'execution_mode_override': 'maker_only', 'execution_liquidity_grade_override': 'D', 'execution_degradation_mode': mode})
+    try:
+        return replace(candidate, **{k: v for k, v in updates.items() if hasattr(candidate, k)})
+    except TypeError:
+        for key, value in updates.items():
+            try:
+                setattr(candidate, key, value)
+            except Exception:
+                pass
+        return candidate
 
 
 def build_runtime_task_queues(maxsize: int = 128) -> Dict[str, asyncio.Queue]:
@@ -2866,6 +2930,20 @@ def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str,
     else:
         multiplier = 0.0
         bucket = 'veto'
+    execution_mode = 'maker_only' if execution_liquidity_grade == 'D' else ('veto' if execution_liquidity_grade == 'E' else 'taker')
+    grade_override = str(getattr(candidate, 'execution_liquidity_grade_override', '') or '').upper()
+    mode_override = str(getattr(candidate, 'execution_mode_override', '') or '').lower()
+    degradation_mode = str(getattr(candidate, 'execution_degradation_mode', '') or '').lower()
+    if grade_override in {'A+', 'A', 'B', 'C', 'D', 'E'}:
+        execution_liquidity_grade = grade_override
+    if mode_override == 'maker_only' or degradation_mode in {'reduced_aggression', 'maker_only'}:
+        execution_mode = 'maker_only'
+        multiplier = min(multiplier, 0.5 if degradation_mode == 'maker_only' else 0.7) if multiplier > 0 else (0.5 if degradation_mode == 'maker_only' else 0.7)
+        bucket = 'websocket_degraded_maker_only'
+    if bool(getattr(candidate, 'pretrigger_watch', False)):
+        execution_mode = 'maker_only'
+        multiplier = min(multiplier, 0.35) if multiplier > 0 else 0.35
+        bucket = 'pretrigger_maker_watch'
     return {
         'expected_slippage_r': execution_slippage_r,
         'execution_liquidity_grade': execution_liquidity_grade,
@@ -2880,7 +2958,7 @@ def compute_execution_quality_size_adjustment(candidate: Candidate) -> Dict[str,
         'stop_distance_pct': stop_distance_pct,
         'volatility_pct': volatility_pct,
         'liquidity_grade_reason': f"grade={execution_liquidity_grade} spread_bps={spread_bps} top_depth_usdt={top_depth_usdt} impact_pct={estimated_impact_pct} slippage_r={execution_slippage_r}",
-        'execution_mode': 'maker_only' if execution_liquidity_grade == 'D' else ('veto' if execution_liquidity_grade == 'E' else 'taker'),
+        'execution_mode': execution_mode,
     }
 
 
@@ -6562,6 +6640,9 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
         'expected_slippage_r': execution_quality['expected_slippage_r'],
         'book_depth_fill_ratio': round(candidate.book_depth_fill_ratio, 4),
         'execution_liquidity_grade': execution_quality['execution_liquidity_grade'],
+        'execution_mode': execution_quality['execution_mode'],
+        'pretrigger_watch': bool(getattr(candidate, 'pretrigger_watch', False)),
+        'trigger_relax_mode': bool(getattr(candidate, 'trigger_relax_mode', False)),
         'spread_bps': execution_quality['spread_bps'],
         'orderbook_slope': execution_quality['orderbook_slope'],
         'cancel_rate': execution_quality['cancel_rate'],
@@ -6657,6 +6738,66 @@ def apply_candidate_diagnostics(candidate: Candidate) -> Candidate:
     candidate.trigger_missing = diagnostics['trigger_missing']
     candidate.trade_missing = diagnostics['trade_missing']
     return candidate
+
+
+def candidate_trigger_relax_score(candidate: Candidate) -> Dict[str, Any]:
+    flags = dict(getattr(candidate, 'trigger_confirmation_flags', {}) or {})
+    points = 0
+    reasons: List[str] = []
+    if flags.get('breakout_close_confirmed') or abs(float(getattr(candidate, 'entry_distance_from_breakout_pct', 999.0) or 999.0)) <= 0.35:
+        points += 2
+        reasons.append('aggressive_breakout_near_level')
+    if abs(float(getattr(candidate, 'recent_5m_change_pct', 0.0) or 0.0)) >= 0.6:
+        points += 1
+        reasons.append('momentum_5m_confirmed')
+    if float(getattr(candidate, 'volume_multiple', 0.0) or 0.0) >= 1.5 or float(getattr(candidate, 'volume_zscore_5m', 0.0) or 0.0) >= 1.0:
+        points += 1
+        reasons.append('volume_expansion_confirmed')
+    if flags.get('oi_taker_alignment_confirmed') or float(getattr(candidate, 'oi_change_pct_5m', 0.0) or 0.0) > 0:
+        points += 1
+        reasons.append('oi_confirmed')
+    if flags.get('cvd_alignment_confirmed') or float(getattr(candidate, 'cvd_delta', 0.0) or 0.0) > 0 or float(getattr(candidate, 'cvd_zscore', 0.0) or 0.0) > 0:
+        points += 1
+        reasons.append('cvd_confirmed')
+    if flags.get('taker_buy_confirmed') or (getattr(candidate, 'taker_buy_ratio', None) is not None and float(getattr(candidate, 'taker_buy_ratio') or 0.0) >= 0.52):
+        points += 1
+        reasons.append('taker_confirmed')
+    return {'points': points, 'reasons': reasons}
+
+
+def build_trigger_relax_candidate(candidate: Candidate, args: argparse.Namespace) -> Candidate:
+    relax = candidate_trigger_relax_score(candidate)
+    clone = replace(candidate)
+    clone.pretrigger_watch = True
+    clone.trigger_relax_mode = True
+    clone.trigger_fired = True
+    clone.candidate_stage = 'pre_trigger_watch'
+    clone.trade_missing = []
+    clone.trigger_missing = [reason for reason in list(getattr(candidate, 'trigger_missing', []) or []) if reason not in {'oi_taker_not_confirmed', 'cvd_not_confirmed', 'confirmation_count_below_minimum', 'waiting_breakout'}]
+    clone.reasons = list(getattr(candidate, 'reasons', []) or []) + [
+        'trigger_relax_mode=enabled',
+        f"trigger_relax_points={relax['points']}",
+        'execution_mode=pretrigger_maker_watch',
+        *[f'trigger_relax_{reason}' for reason in relax['reasons']],
+    ]
+    return clone
+
+
+def is_trigger_relax_eligible(candidate: Candidate, args: argparse.Namespace, regime_payload: Optional[Dict[str, Any]] = None) -> bool:
+    if not bool(getattr(args, 'trigger_relax_mode', False)):
+        return False
+    if not bool(getattr(candidate, 'setup_ready', False)) or bool(getattr(candidate, 'trigger_fired', False)):
+        return False
+    if float(getattr(candidate, 'score', 0.0) or 0.0) < float(getattr(args, 'trigger_relax_min_score', 70.0) or 70.0):
+        return False
+    if bool(getattr(candidate, 'overextension_flag', False)):
+        return False
+    if str(getattr(candidate, 'liquidity_grade', 'B') or 'B') in {'D', 'E'}:
+        return False
+    if normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG)) == POSITION_SIDE_LONG and str((regime_payload or {}).get('label') or '').lower() == 'risk_off':
+        return False
+    relax = candidate_trigger_relax_score(candidate)
+    return int(relax.get('points', 0) or 0) >= int(getattr(args, 'trigger_relax_min_points', 3) or 3)
 
 
 def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespace, explicit_square_symbols: Optional[Sequence[str]] = None):
@@ -6879,9 +7020,13 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     candidates.sort(key=lambda item: item.score, reverse=True)
     candidate_alerts = [build_standardized_alert(item, regime_payload) for item in candidates]
     execution_candidates = [item for item in candidates if bool(getattr(item, 'trigger_fired', False))]
+    relaxed_candidates = [build_trigger_relax_candidate(item, args) for item in candidates if is_trigger_relax_eligible(item, args, regime_payload)]
     execution_priority = sorted(
-        execution_candidates,
-        key=lambda item: float(getattr(item, 'score', 0.0) or 0.0),
+        [*execution_candidates, *relaxed_candidates],
+        key=lambda item: (
+            1 if bool(getattr(item, 'trigger_fired', False)) and not bool(getattr(item, 'pretrigger_watch', False)) else 0,
+            float(getattr(item, 'score', 0.0) or 0.0),
+        ),
         reverse=True,
     )
     best = execution_priority[0] if execution_priority else None
@@ -6962,6 +7107,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'candidate_pool_count': len(candidates),
         'setup_ready_count': sum(1 for item in built_candidates if bool(item.setup_ready)),
         'trigger_fired_count': sum(1 for item in built_candidates if bool(item.trigger_fired)),
+        'trigger_relax_eligible_count': len(relaxed_candidates),
         'hard_rejected_count': len(rejected_events),
         'stage_counts': stage_counts,
         'top_setup_missing': dict(sorted(setup_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
@@ -6976,6 +7122,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'early_filter_passed_count': funnel['early_filter_passed_count'],
         'setup_ready_count': funnel['setup_ready_count'],
         'trigger_fired_count': funnel['trigger_fired_count'],
+        'trigger_relax_eligible_count': funnel.get('trigger_relax_eligible_count', 0),
         'candidate_pool_count': funnel['candidate_pool_count'],
         'hard_rejected_count': funnel['hard_rejected_count'],
     }
@@ -7108,6 +7255,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--oi-hard-reversal-threshold-pct', type=float, default=0.8, help='Directional 5m OI reversal threshold that remains a hard veto.')
     parser.add_argument('--extended-chase-threshold-pct', type=float, default=15.0, help='24h change threshold above which chase/momentum_extension/overheated states are vetoed.')
     parser.add_argument('--sim-probe-entry-enabled', action='store_true', help='Allow OKX simulated trading to submit a small probe when setup is ready but full trigger has not fired.')
+    parser.add_argument('--trigger-relax-mode', action='store_true', help='Allow high-score setup candidates into pre-trigger maker watch when breakout/OI/taker/CVD score is strong.')
+    parser.add_argument('--trigger-relax-min-score', type=float, default=70.0)
+    parser.add_argument('--trigger-relax-min-points', type=int, default=3)
     parser.add_argument('--sim-probe-size-ratio', type=float, default=0.2)
     parser.add_argument('--sim-probe-min-score', type=float, default=62.0)
     parser.add_argument('--sim-probe-max-breakout-distance-pct', type=float, default=0.35)
@@ -9000,13 +9150,18 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)),
         )
         cycle['book_ticker_websocket_freshness'] = websocket_freshness
-        if not websocket_freshness.get('fresh'):
+        cycle['execution_degradation_mode'] = websocket_freshness.get('execution_degradation_mode', 'none')
+        if websocket_freshness.get('state') == 'dead':
             stale_reason = str(websocket_freshness.get('reason') or 'stale_websocket')
             cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{stale_reason}']
             append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
-            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason=f'websocket_stale:{stale_reason}')
+            record_runtime_heartbeat(store, component='scanner', status='blocked', blocked_reason=f'websocket_stale:{stale_reason}', extra=websocket_freshness)
             persist_cycle_snapshot(cycle)
             return result
+        if websocket_freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
+            best_candidate = build_websocket_degraded_candidate(best_candidate, websocket_freshness)
+            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': websocket_freshness.get('reason'), 'websocket_state': websocket_freshness.get('state')}
+            record_runtime_heartbeat(store, component='scanner', status='degraded', blocked_reason='', extra=websocket_freshness)
     max_open_positions = int(getattr(args, 'max_open_positions', 1) or 1)
     if len(open_positions) >= max_open_positions:
         cycle['live_skipped_due_to_existing_positions'] = open_positions
@@ -9378,11 +9533,15 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         health = websocket_status.get('health') if isinstance(websocket_status.get('health'), dict) else websocket_status
         freshness = evaluate_websocket_freshness(health, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
         cycle['book_ticker_websocket_freshness'] = freshness
-        if not freshness.get('fresh'):
+        cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
+        if freshness.get('state') == 'dead':
             reason = str(freshness.get('reason') or 'stale_websocket')
             cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_stale:{reason}']
             event_updates.append(append_candidate_rejected_event(None, best_candidate, cycle['live_skipped_due_to_websocket_gate']))
             return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'reconcile': reconcile, 'event_updates': event_updates}}
+        if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
+            best_candidate = build_websocket_degraded_candidate(best_candidate, freshness)
+            cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': freshness.get('reason'), 'websocket_state': freshness.get('state')}
     if len(open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
         cycle['live_skipped_due_to_existing_positions'] = open_positions
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached', 'reconcile': reconcile, 'event_updates': event_updates}}
@@ -9407,6 +9566,20 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
     meta = execution_request['meta']
     cycle = dict(execution_request.get('cycle') or {})
     execution_timeout_seconds = float(getattr(args, 'execution_timeout_seconds', 30.0) or 30.0)
+    if getattr(args, 'require_book_ticker_ws', False):
+        fresh_websocket_status = store.load_json('book_ticker_ws_status', {})
+        if isinstance(fresh_websocket_status, dict) and fresh_websocket_status:
+            meta = dict(meta)
+            meta['book_ticker_websocket'] = fresh_websocket_status
+            freshness = evaluate_websocket_freshness(fresh_websocket_status, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
+            meta['websocket_execution_guard'] = freshness
+            cycle['book_ticker_websocket_freshness'] = freshness
+            cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
+            if freshness.get('state') == 'dead':
+                reason = str(freshness.get('reason') or 'stale_websocket')
+                return {'ok': True, 'cycle': dict(cycle, live_skipped_due_to_websocket_gate=[f'book_ticker_websocket_stale:{reason}']), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': f'websocket_stale:{reason}'}}}
+            if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
+                candidate = build_websocket_degraded_candidate(candidate, freshness)
     state_transition = {'state': 'ENTERING', 'candidate_symbol': getattr(candidate, 'symbol', ''), 'reason': 'execution_gate_passed', 'risk_guard': execution_request.get('risk_guard'), 'reconcile': execution_request.get('reconcile')}
     try:
         live_execution = run_with_deadman_timeout(place_live_trade, client, candidate, int(execution_request.get('requested_leverage') or 1), meta, args, timeout_seconds=execution_timeout_seconds, store=None, component='execution', operation='place_live_trade')
