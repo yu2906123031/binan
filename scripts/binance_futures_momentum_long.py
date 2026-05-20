@@ -1693,6 +1693,24 @@ def _websocket_age_seconds(value: Any, now_dt: datetime.datetime) -> Optional[fl
     return max((now_dt - parsed).total_seconds(), 0.0)
 
 
+def choose_latest_websocket_health(primary: Any, stored: Any) -> Any:
+    """Return the newest websocket health payload by timestamp, preferring stored runtime health on ties."""
+    if not isinstance(stored, dict) or not stored:
+        return primary
+    if not isinstance(primary, dict) or not primary:
+        return stored
+    primary_updated_at = _parse_iso8601_utc(primary.get('updated_at') or primary.get('last_message_at') or primary.get('last_sample_at'))
+    stored_updated_at = _parse_iso8601_utc(stored.get('updated_at') or stored.get('last_message_at') or stored.get('last_sample_at'))
+    if stored_updated_at is None:
+        return primary
+    if primary_updated_at is None or stored_updated_at >= primary_updated_at:
+        merged = dict(primary)
+        merged.update(stored)
+        merged['health_source'] = 'runtime_store_latest'
+        return merged
+    return primary
+
+
 def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, require_messages: bool = True, now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
     if not isinstance(health, dict):
         return {'fresh': False, 'state': 'dead', 'execution_degradation_mode': 'blocked', 'reason': 'missing_health'}
@@ -7987,6 +8005,64 @@ def repair_missing_protection(client: Any, symbol: str, tracked: Optional[Dict[s
     )
 
 
+def build_exchange_reconciled_position_record(row: Dict[str, Any], args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
+    symbol = str(row.get('symbol') or '').upper()
+    side = position_side_from_exchange_position(row)
+    entry_price = _to_float(row.get('entryPrice'))
+    mark_price = _to_float(row.get('markPrice'))
+    if side == POSITION_SIDE_LONG:
+        positive_prices = [price for price in (entry_price, mark_price) if price > 0]
+        reference_price = min(positive_prices) if positive_prices else 0.0
+    else:
+        positive_prices = [price for price in (entry_price, mark_price) if price > 0]
+        reference_price = max(positive_prices) if positive_prices else 0.0
+    stop_pct = abs(_to_float(getattr(args, 'exchange_reconcile_stop_pct', 0.02) if args is not None else 0.02, default=0.02))
+    if stop_pct > 1.0:
+        stop_pct = stop_pct / 100.0
+    if stop_pct <= 0:
+        stop_pct = 0.02
+    stop_price = 0.0
+    if reference_price > 0:
+        stop_price = reference_price * (1.0 - stop_pct) if side == POSITION_SIDE_LONG else reference_price * (1.0 + stop_pct)
+    fields = exchange_position_runtime_fields(row)
+    record = {
+        'symbol': symbol,
+        'side': side,
+        'position_side': side,
+        'position_key': build_position_key(symbol, side),
+        'status': 'reconciled',
+        'monitor_mode': 'trade_management',
+        'exchange_reconciled_at': _isoformat_utc(_utc_now()),
+        'exchange_reconcile_reason': 'exchange_position_present_runtime_missing',
+        **fields,
+    }
+    if stop_price > 0:
+        record['stop_price'] = stop_price
+        record['current_stop_price'] = stop_price
+        record['emergency_reconcile_stop_pct'] = stop_pct
+        quantity = _to_float(record.get('quantity'))
+        if reference_price > 0 and quantity > 0:
+            plan = build_trade_management_plan(
+                entry_price=reference_price,
+                stop_price=stop_price,
+                quantity=quantity,
+                tp1_r=float(getattr(args, 'tp1_r', 1.5) if args is not None else 1.5),
+                tp1_close_pct=float(getattr(args, 'tp1_close_pct', 0.3) if args is not None else 0.3),
+                tp1_profit_usdt=float(getattr(args, 'tp1_profit_usdt', 0.0) if args is not None else 0.0),
+                tp2_r=float(getattr(args, 'tp2_r', 2.0) if args is not None else 2.0),
+                tp2_close_pct=float(getattr(args, 'tp2_close_pct', 0.4) if args is not None else 0.4),
+                breakeven_r=float(getattr(args, 'breakeven_r', 1.0) if args is not None else 1.0),
+                atr_stop_distance=abs(reference_price - stop_price),
+                side=position_side_to_trade_side(side),
+                breakeven_confirmation_mode=str(getattr(args, 'breakeven_confirmation_mode', 'ema_support') if args is not None else 'ema_support'),
+                breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) if args is not None else 0.001),
+                micro_scalp_time_stop_sec=int(getattr(args, 'micro_scalp_time_stop_sec', 0) if args is not None else 0),
+                micro_scalp_min_profit_r=float(getattr(args, 'micro_scalp_min_profit_r', 0.0) if args is not None else 0.0),
+            )
+            record['trade_management_plan'] = asdict(plan)
+    return record
+
+
 def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_positions: Sequence[Dict[str, Any]], protected_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     raw_positions_state = store.load_json('positions', {})
     if not isinstance(raw_positions_state, dict):
@@ -8124,8 +8200,24 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
             protected_symbols.append(position_key)
         if tracked is None:
             orphan_positions.append(symbol)
-            positions_state, _ = upsert_position_record(positions_state, {'symbol': symbol, 'side': side, 'status': 'orphan'}, key=position_key)
+            tracked = build_exchange_reconciled_position_record(row, args)
         elif protection.get('status') != 'protected':
+            recovery_record = build_exchange_reconciled_position_record(row, args)
+            for field in (
+                'stop_price',
+                'current_stop_price',
+                'emergency_reconcile_stop_pct',
+                'trade_management_plan',
+                'recovery_incomplete',
+                'recovery_reason',
+                'recovery_detail',
+            ):
+                if field in recovery_record:
+                    tracked[field] = recovery_record[field]
+            if tracked.get('trade_management_plan'):
+                tracked['status'] = 'reconciled'
+                tracked['protected_recovery_pending'] = False
+        if protection.get('status') != 'protected':
             repair_result = None
             if repair_missing_protection_enabled:
                 repair_result = repair_missing_protection(
@@ -8138,8 +8230,10 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
             if repair_result and repair_result.get('ok') and repair_result.get('status') == 'protected':
                 protected_symbols.append(position_key)
                 tracked['protection_status'] = 'protected'
-                tracked['stop_order_id'] = repair_result.get('stop_order', {}).get('orderId')
-                tracked['status'] = tracked.get('status') or 'monitoring'
+                stop_order = repair_result.get('stop_order', {}) if isinstance(repair_result.get('stop_order'), dict) else {}
+                tracked['stop_order_id'] = stop_order.get('orderId') or stop_order.get('algoId') or stop_order.get('clientAlgoId')
+                tracked['active_stop_order'] = stop_order
+                tracked['status'] = 'monitoring'
                 positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
             else:
                 positions_missing_protection.append(symbol if side == POSITION_SIDE_LONG else position_key)
@@ -9149,8 +9243,13 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         persist_cycle_snapshot(cycle)
         return result
     if websocket_gate_required and book_ticker_gate:
+        gate_health = book_ticker_gate.get('health') if isinstance(book_ticker_gate.get('health'), dict) else book_ticker_gate
+        stored_gate_health = store.load_json('book_ticker_ws_status', {})
+        gate_health = choose_latest_websocket_health(gate_health, stored_gate_health)
+        if isinstance(gate_health, dict) and gate_health is not book_ticker_gate:
+            cycle['book_ticker_websocket'] = dict(book_ticker_gate, health=gate_health)
         websocket_freshness = evaluate_websocket_freshness(
-            book_ticker_gate.get('health') if isinstance(book_ticker_gate.get('health'), dict) else book_ticker_gate,
+            gate_health,
             max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0),
             require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)),
         )
@@ -9558,10 +9657,14 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     if isinstance(cycle.get('scan'), dict) and isinstance(cycle['scan'].get('funnel'), dict):
         cycle['scan']['funnel']['selected_risk_allowed_count'] = 1 if risk_guard['allowed'] else 0
         cycle['scan']['funnel']['order_submitted_count'] = 0
+    websocket_health = cycle.get('book_ticker_websocket', {})
     if (not getattr(args, 'live', False)) or getattr(args, 'scan_only', False):
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': choose_auto_loop_state_for_candidate(best_candidate, risk_guard), 'reason': 'scan_only', 'reconcile': reconcile, 'event_updates': event_updates}}
     if bool(getattr(args, 'require_book_ticker_ws', True)) and isinstance(websocket_health, dict) and websocket_health:
         health = websocket_health.get('health') if isinstance(websocket_health.get('health'), dict) else websocket_health
+        stored_websocket_health = store.load_json('book_ticker_ws_status', {})
+        health = choose_latest_websocket_health(health, stored_websocket_health)
+        cycle['book_ticker_websocket'] = dict(websocket_health, health=health) if isinstance(websocket_health.get('health'), dict) else health
         freshness = evaluate_websocket_freshness(health, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))
         cycle['book_ticker_websocket_freshness'] = freshness
         cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
@@ -9606,6 +9709,7 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
     if getattr(args, 'require_book_ticker_ws', False):
         fresh_websocket_status = store.load_json('book_ticker_ws_status', {})
         if isinstance(fresh_websocket_status, dict) and fresh_websocket_status:
+            fresh_websocket_status = choose_latest_websocket_health(meta.get('book_ticker_websocket') if isinstance(meta, dict) else {}, fresh_websocket_status)
             meta = dict(meta)
             meta['book_ticker_websocket'] = fresh_websocket_status
             freshness = evaluate_websocket_freshness(fresh_websocket_status, max_age_seconds=float(getattr(args, 'book_ticker_ws_stale_seconds', 30.0) or 30.0), require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)))

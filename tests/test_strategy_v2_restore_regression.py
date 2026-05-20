@@ -6722,3 +6722,89 @@ def test_run_scan_once_ticker_rest_fallback_called_once_when_patch_missing(tmp_p
     assert calls['fetch_tickers'] == 1
     assert payload['funnel']['scanner_patch_fallback_disabled'] is True
     assert payload['funnel']['symbols_skipped_due_to_missing_ticker_24hr'] >= 1
+
+
+def test_reconcile_runtime_state_materializes_exchange_position_and_repairs_missing_protection(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    client = SimpleNamespace()
+    exchange_position = {
+        'symbol': 'LITUSDT',
+        'positionAmt': '-28',
+        'positionSide': 'BOTH',
+        'entryPrice': '1.0813',
+        'markPrice': '1.1187',
+        'notional': '-31.3236',
+        'leverage': '10',
+        'unRealizedProfit': '-1.0485',
+    }
+    placed = []
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda _client: [exchange_position])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda _client, _symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda _client, _symbol: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'LITUSDT': mod.SymbolMeta(
+        symbol='LITUSDT', price_precision=4, quantity_precision=0, tick_size=0.0001, step_size=1.0,
+        min_qty=1.0, quote_asset='USDT', status='TRADING', contract_type='PERPETUAL'
+    )})
+
+    def fake_place_stop(_client, symbol, stop_price, quantity, meta, side=mod.POSITION_SIDE_LONG, runtime_trade_id=None):
+        placed.append({'symbol': symbol, 'stop_price': stop_price, 'quantity': quantity, 'side': side})
+        return {'algoId': 456, 'clientAlgoId': 'x-LIT-stop', 'triggerPrice': str(stop_price), 'quantity': str(quantity)}
+
+    monkeypatch.setattr(mod, 'place_stop_market_order', fake_place_stop)
+
+    result = mod.reconcile_runtime_state(
+        client,
+        store,
+        halt_on_orphan_position=False,
+        repair_missing_protection_enabled=True,
+        args=argparse.Namespace(exchange_reconcile_stop_pct=0.02),
+    )
+
+    positions = store.load_json('positions', {})
+    tracked = positions['LITUSDT:SHORT']
+    assert result['orphan_positions'] == ['LITUSDT']
+    assert result['positions_missing_protection'] == []
+    assert placed == [{'symbol': 'LITUSDT', 'stop_price': pytest.approx(1.141074), 'quantity': 28.0, 'side': mod.POSITION_SIDE_SHORT}]
+    assert tracked['status'] == 'monitoring'
+    assert tracked['position_side'] == mod.POSITION_SIDE_SHORT
+    assert tracked['side'] == mod.TRADE_SIDE_SHORT
+    assert tracked['quantity'] == 28.0
+    assert tracked['entry_price'] == 1.0813
+    assert tracked['stop_price'] == pytest.approx(1.141074)
+    assert tracked['protection_status'] == 'protected'
+    assert tracked['active_stop_order']['algoId'] == 456
+
+
+def test_reconcile_runtime_state_materializes_exchange_position_when_repair_disabled(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    client = SimpleNamespace()
+    exchange_position = {
+        'symbol': 'LITUSDT',
+        'positionAmt': '-28',
+        'positionSide': 'BOTH',
+        'entryPrice': '1.0813',
+        'markPrice': '1.1187',
+        'notional': '-31.3236',
+        'leverage': '10',
+    }
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda _client: [exchange_position])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda _client, _symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda _client, _symbol: [])
+
+    result = mod.reconcile_runtime_state(
+        client,
+        store,
+        halt_on_orphan_position=False,
+        repair_missing_protection_enabled=False,
+        args=argparse.Namespace(exchange_reconcile_stop_pct=2.0),
+    )
+
+    tracked = store.load_json('positions', {})['LITUSDT:SHORT']
+    assert result['orphan_positions'] == ['LITUSDT']
+    assert result['positions_missing_protection'] == ['LITUSDT:SHORT']
+    assert tracked['status'] == 'reconciled'
+    assert tracked['protection_status'] == 'missing'
+    assert tracked['stop_price'] == pytest.approx(1.141074)
+    assert tracked['exchange_reconcile_reason'] == 'exchange_position_present_runtime_missing'

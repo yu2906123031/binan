@@ -122,6 +122,15 @@ def test_main_blocks_when_runtime_state_cannot_recover_account_position(monkeypa
     assert '"reason": "account_not_flat"' in captured.out
 
 
+def test_build_command_uses_live_entry_relaxation_thresholds(monkeypatch, isolated_supervisor_files):
+    cmd = supervisor.build_command()
+
+    assert cmd[cmd.index('--trigger-relax-min-score') + 1] == '64'
+    assert cmd[cmd.index('--trigger-relax-min-points') + 1] == '2'
+    assert cmd[cmd.index('--execution-slippage-hard-veto-r') + 1] == '450'
+    assert cmd[cmd.index('--execution-slippage-risk-threshold-r') + 1] == '450'
+
+
 def test_classify_child_exit_treats_sigterm_as_clean_stop(monkeypatch):
     monkeypatch.setattr(supervisor, 'SHUTDOWN_REQUESTED', False, raising=False)
 
