@@ -1,0 +1,1 @@
+/root/.hermes/scripts/binance_momentum_supervisor.py

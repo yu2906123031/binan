@@ -131,6 +131,20 @@ def test_build_command_uses_live_entry_relaxation_thresholds(monkeypatch, isolat
     assert cmd[cmd.index('--execution-slippage-risk-threshold-r') + 1] == '450'
 
 
+def test_build_command_gives_live_execution_enough_deadman_budget(monkeypatch, isolated_supervisor_files):
+    cmd = supervisor.build_command()
+
+    assert float(cmd[cmd.index('--execution-timeout-seconds') + 1]) >= 90.0
+
+
+def test_build_command_enables_kline_rest_fallback_when_scanner_rest_fallback_is_enabled(monkeypatch, isolated_supervisor_files):
+    cmd = supervisor.build_command({'scanner_rest_fallback': True})
+
+    assert '--scanner-rest-fallback' in cmd
+    assert '--scanner-kline-rest-fallback' in cmd
+    assert cmd[cmd.index('--scanner-kline-rest-fallback-min-interval-seconds') + 1] == '0'
+
+
 def test_classify_child_exit_treats_sigterm_as_clean_stop(monkeypatch):
     monkeypatch.setattr(supervisor, 'SHUTDOWN_REQUESTED', False, raising=False)
 

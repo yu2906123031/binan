@@ -268,6 +268,28 @@ def test_active_profile_relaxes_small_account_entry_thresholds():
     assert args.execution_slippage_risk_threshold_r == 0.25
 
 
+def test_diagnostic_live_profile_enables_probe_diagnostics_without_live_rest_flood():
+    mod = load_module()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-diagnostic-live']))
+    assert args.profile == '10u-diagnostic-live'
+    assert args.diagnostic_trading_mode is True
+    assert args.risk_usdt == 1.0
+    assert args.max_notional_usdt == 80.0
+    assert args.leverage == 3
+    assert args.max_open_positions == 1
+    assert args.max_candidates == 12
+    assert args.allowed_trade_sides == 'long,short'
+    assert args.enable_symbol_quality_tier is True
+    assert args.enable_market_regime_gate is True
+    assert args.enable_direction_lock is True
+    assert args.enable_fee_aware_edge_filter is True
+    assert args.scanner_ticker_rest_fallback is True
+    assert args.scanner_kline_rest_fallback is False
+    assert args.scanner_depth_rest_fallback is False
+    assert args.sim_probe_entry_enabled is True
+    assert args.sim_probe_min_score == 55.0
+
+
 def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     mod = load_module()
     args = mod.apply_runtime_profile(mod.parse_args(['--profile', '10u-aggressive']))
@@ -670,7 +692,7 @@ def test_signed_get_resyncs_server_time_after_recvwindow_error(monkeypatch):
     first_account_params = session.get_calls[1][1]
     second_account_params = session.get_calls[3][1]
     assert first_account_params['timestamp'] == 2_000_100
-    assert second_account_params['timestamp'] == 3_000_075
+    assert second_account_params['timestamp'] == 3_000_100
     assert first_account_params['recvWindow'] == 10_000
     assert second_account_params['recvWindow'] == 10_000
 

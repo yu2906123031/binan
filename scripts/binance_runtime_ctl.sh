@@ -1,0 +1,1 @@
+/root/.hermes/scripts/binance_runtime_ctl.sh

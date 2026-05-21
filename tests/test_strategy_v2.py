@@ -362,6 +362,7 @@ def test_append_book_ticker_cache_sample_keeps_recent_ring_buffer(tmp_path):
         max_samples=2,
     )
 
+    mod.flush_book_ticker_cache_state(store, force=True)
     cache_state = store.load_json('book_ticker_cache', {})
     symbol_state = cache_state['TESTUSDT']
     assert symbol_state['source'] == 'websocket'
@@ -376,8 +377,7 @@ def test_append_book_ticker_cache_sample_keeps_recent_ring_buffer(tmp_path):
     assert second['samples_cached'] == 2
     assert third['samples_cached'] == 2
     events = [row for row in store.read_events(limit=10) if row['event_type'] == 'book_ticker_ws_sample_written']
-    assert len(events) == 1
-    assert events[-1]['symbol'] == 'TESTUSDT'
+    assert events == []
 
 
 def test_process_book_ticker_stream_message_updates_runtime_cache(tmp_path):
@@ -895,6 +895,7 @@ def test_collect_book_ticker_samples_rate_limits_repeated_cache_miss_events(tmp_
     miss_events = [row for row in events if row.get('event_type') == 'book_ticker_cache_miss']
     assert len(miss_events) == 1
     assert len(calls) == 2
+    mod.flush_event_rate_limit_state(store, force=True)
     state = store.load_json('event_rate_limit_state', {})
     assert state['book_ticker_cache_miss']['TESTUSDT']['suppressed_since_last'] == 1
 
@@ -919,6 +920,7 @@ def test_collect_book_ticker_samples_rate_limits_cache_miss_per_symbol_distinct_
     assert [row['symbol'] for row in miss_events] == ['TESTUSDT', 'ALTUSDT']
     assert len(calls) == 3
 
+    mod.flush_event_rate_limit_state(store, force=True)
     state = store.load_json('event_rate_limit_state', {})
     assert state['book_ticker_cache_miss']['TESTUSDT']['suppressed_since_last'] == 1
     assert state['book_ticker_cache_miss']['ALTUSDT']['suppressed_since_last'] == 0
@@ -2698,7 +2700,7 @@ def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_pa
         distance_from_vwap_15m_pct=0.5,
         higher_tf_summary='aligned',
         score=74.0,
-        reasons=['seed_rejected'],
+        reasons=['candidate_execution_slippage_risk', 'seed_rejected'],
         state='launch',
         state_reasons=['trigger_ready'],
         alert_tier='high',
@@ -2708,9 +2710,14 @@ def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_pa
         candidate_stage='trade_candidate',
         expected_slippage_pct=3.0,
         book_depth_fill_ratio=0.2,
+        expected_edge=0.08,
+        expected_total_fee_pct=0.12,
+        execution_slippage_buffer_pct=0.03,
+        min_profit_buffer_pct=0.02,
         trigger_confirmation_count=2,
         trigger_min_confirmations=2,
     )
+    rejected_candidate.trade_missing = ['fee_trap', 'expected_edge_below_cost_floor']
     built = [watch_candidate, rejected_candidate]
 
     monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
@@ -2734,6 +2741,176 @@ def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_pa
     assert payload['funnel']['evaluated_side_count'] == 2
     assert payload['funnel']['candidate_pool_count'] == 1
     assert payload['funnel']['setup_ready_count'] == 2
+    assert payload['funnel']['trigger_fired_count'] == 1
+    assert payload['funnel']['hard_rejected_count'] == 1
+    assert payload['funnel']['stage_counts']['setup_candidate'] == 1
+    assert payload['funnel']['stage_counts']['trade_candidate'] == 1
+    assert payload['funnel']['top_trade_missing']['fee_trap'] == 1
+    assert payload['funnel']['top_trade_missing']['expected_edge_below_cost_floor'] == 1
+    assert payload['summary_counters']['selected_count'] == 0
+    assert payload['summary_counters']['diagnostic_trading_mode'] is False
+    assert payload['summary_counters']['rejected_total'] == 1
+    assert payload['rejected_stats']['by_reason']['execution_slippage_veto'] == 1
+    assert payload['rejected_stats']['by_reject_label']['execution_slippage'] == 1
+    top_rejected = payload['rejected_stats']['top_rejected']
+    assert top_rejected == [
+        {
+            'symbol': 'TESTUSDT',
+            'side': 'long',
+            'score': 74.0,
+            'candidate_stage': 'trade_candidate',
+            'reject_reason': 'execution_slippage_veto',
+            'reject_reason_label': 'execution_slippage',
+            'setup_ready': True,
+            'trigger_fired': True,
+            'setup_missing': [],
+            'trigger_missing': [],
+            'trade_missing': ['fee_trap', 'expected_edge_below_cost_floor'],
+            'expected_edge': 0.08,
+            'expected_total_fee_pct': 0.12,
+            'execution_slippage_buffer_pct': 0.03,
+            'min_profit_buffer_pct': 0.02,
+        }
+    ]
+
+
+def test_run_scan_once_reports_diagnostic_trading_mode_in_summary(monkeypatch, tmp_path):
+    args = argparse.Namespace(
+        symbol='',
+        square_symbols='',
+        square_symbols_file='',
+        use_square_page=False,
+        top_gainers=5,
+        top_losers=5,
+        max_candidates=5,
+        lookback_bars=12,
+        swing_bars=6,
+        risk_usdt=10.0,
+        max_notional_usdt=0.0,
+        min_5m_change_pct=0.0,
+        min_quote_volume=0.0,
+        stop_buffer_pct=0.01,
+        max_rsi_5m=100.0,
+        min_volume_multiple=0.0,
+        max_distance_from_ema_pct=100.0,
+        max_distance_from_vwap_pct=100.0,
+        leverage=5,
+        max_funding_rate=1.0,
+        max_funding_rate_avg=1.0,
+        okx_sentiment_inline='',
+        okx_sentiment_file='',
+        okx_sentiment_command='',
+        okx_auto=False,
+        okx_mcp_command='',
+        okx_sentiment_timeout=5,
+        external_signal_json='',
+        smart_money_inline='',
+        smart_money_file='',
+        runtime_state_dir=str(tmp_path),
+        diagnostic_trading_mode=True,
+        profile='10u-diagnostic-live',
+    )
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: ([], {}, {}))
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert best is None
+    assert payload['summary_counters']['diagnostic_trading_mode'] is True
+    assert payload['summary_counters']['profile'] == '10u-diagnostic-live'
+    assert payload['funnel']['diagnostic_trading_mode'] is True
+    assert payload['funnel']['profile'] == '10u-diagnostic-live'
+
+
+def test_run_scan_once_surfaces_early_filter_diagnostics_and_nearest_misses(monkeypatch, tmp_path):
+    args = argparse.Namespace(
+        symbol='', square_symbols='', square_symbols_file='', use_square_page=False,
+        top_gainers=5, top_losers=5, max_candidates=5, lookback_bars=12, swing_bars=6,
+        risk_usdt=10.0, max_notional_usdt=0.0, min_5m_change_pct=0.0, min_quote_volume=0.0,
+        stop_buffer_pct=0.01, max_rsi_5m=100.0, min_volume_multiple=0.0,
+        max_distance_from_ema_pct=100.0, max_distance_from_vwap_pct=100.0, leverage=5,
+        max_funding_rate=1.0, max_funding_rate_avg=1.0, okx_sentiment_inline='',
+        okx_sentiment_file='', okx_sentiment_command='', okx_auto=False, okx_mcp_command='',
+        okx_sentiment_timeout=5, external_signal_json='', smart_money_inline='', smart_money_file='',
+        runtime_state_dir=str(tmp_path), diagnostic_trading_mode=True, profile='10u-diagnostic-live',
+    )
+    meta = make_meta(symbol='TESTUSDT')
+
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda _client: {'TESTUSDT': meta})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda _client: [{'symbol': 'TESTUSDT', 'quoteVolume': '1000000', 'lastPrice': '100'}])
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (['TESTUSDT'], {'TESTUSDT': 1}, {'TESTUSDT': 1}))
+    monkeypatch.setattr(mod, 'fetch_klines', lambda _client, symbol, interval, limit: [make_kline(100, 101, 99, 100, volume=1000, quote_volume=100000)] * max(limit, 30))
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, _symbol, limit=3: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, _symbol, period='5m', limit=30: [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, _symbol, period='5m', limit=10: [])
+    monkeypatch.setattr(mod, 'derive_microstructure_inputs', lambda **kwargs: {})
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'neutral'})
+
+    def fake_build_candidate(**kwargs):
+        stats = kwargs['early_reject_stats']
+        stats['total'] = int(stats.get('total', 0) or 0) + 1
+        stats.setdefault('by_reason', {})['recent_5m_change_below_threshold'] = 1
+        stats.setdefault('by_side', {}).setdefault(kwargs['side'], {})['recent_5m_change_below_threshold'] = 1
+        stats.setdefault('samples', []).append({
+            'symbol': kwargs['symbol'], 'side': kwargs['side'], 'reject_reason': 'recent_5m_change_below_threshold',
+            'reject_reason_label': 'entry_filter', 'score': 0.0, 'recent_5m_change_pct': 0.42,
+            'threshold': 0.5, 'distance_to_pass': 0.08, 'candidate_stage': 'early_filter',
+        })
+        return None
+
+    monkeypatch.setattr(mod, 'build_candidate', fake_build_candidate)
+
+    payload, best, _meta = mod.run_scan_once(client=object(), args=args)
+
+    assert best is None
+    assert payload['summary_counters']['early_rejected_total'] == 2
+    assert payload['rejected_stats']['by_reason']['recent_5m_change_below_threshold'] == 2
+    assert payload['rejected_stats']['by_reject_label']['entry_filter'] == 2
+    assert payload['rejected_stats']['nearest_misses'][0] == {
+        'symbol': 'TESTUSDT', 'side': 'long', 'score': 0.0,
+        'candidate_stage': 'early_filter',
+        'reject_reason': 'recent_5m_change_below_threshold',
+        'reject_reason_label': 'entry_filter',
+        'recent_5m_change_pct': 0.42, 'threshold': 0.5, 'distance_to_pass': 0.08,
+    }
+
+
+def test_apply_runtime_profile_diagnostic_live_softens_filters_and_enables_adaptive_read_only():
+    args = argparse.Namespace(
+        profile='10u-diagnostic-live', min_5m_change_pct=0.75, min_volume_multiple=1.4,
+        min_score=70.0, execution_slippage_hard_veto_r=0.25, adaptive_read_only=False,
+        enable_trade_memory=True, disable_adaptive_risk_upscale=False,
+    )
+
+    mod.apply_runtime_profile(args)
+
+    assert args.diagnostic_trading_mode is True
+    assert args.adaptive_read_only is True
+    assert args.disable_adaptive_risk_upscale is True
+    assert args.min_5m_change_pct <= 0.25
+    assert args.min_volume_multiple <= 1.05
+    assert args.min_score <= 55.0
+    assert args.execution_slippage_hard_veto_r >= 0.6
+
+
+def test_apply_adaptive_trade_memory_profile_read_only_records_adjustment_without_mutating_risk():
+    args = argparse.Namespace(
+        enable_trade_memory=True, profile='default', risk_usdt=10.0, min_score=60.0,
+        adaptive_read_only=True, disable_adaptive_risk_upscale=True,
+    )
+    memory = {'buckets': {'profile=default|symbol=TESTUSDT|side=LONG|trigger=breakout|decile=score_decile_80': {'closed_trades': 3, 'wins': 3, 'avg_realized_r': 1.1}}}
+
+    mod.apply_adaptive_trade_memory_profile(args, memory)
+
+    assert args.risk_usdt == 10.0
+    assert args.min_score == 60.0
+    assert args.trade_memory_risk_multiplier == 1.0
+    assert args.trade_memory_adjustments == ['strong_recent_memory_read_only']
 
 
 def test_run_scan_once_respects_allowed_trade_sides(monkeypatch):

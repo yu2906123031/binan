@@ -6808,3 +6808,273 @@ def test_reconcile_runtime_state_materializes_exchange_position_when_repair_disa
     assert tracked['protection_status'] == 'missing'
     assert tracked['stop_price'] == pytest.approx(1.141074)
     assert tracked['exchange_reconcile_reason'] == 'exchange_position_present_runtime_missing'
+
+
+def test_evaluate_management_actions_closes_long_at_hard_stop_before_profit_actions():
+    state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=0.8)
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=101.0,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.5,
+        tp2_trigger_price=110.0,
+        tp2_close_qty=0.3,
+        runner_qty=0.2,
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=94.9,
+        ema5m=96.0,
+        trailing_reference=101.0,
+        trailing_buffer_pct=0.02,
+    )
+
+    assert actions == [{
+        'type': 'hard_stop_loss',
+        'close_qty': 0.8,
+        'stop_price': 95.0,
+        'exit_reason': 'hard_stop_loss',
+    }]
+
+
+def test_evaluate_management_actions_closes_short_at_hard_stop_before_profit_actions():
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.6,
+        side='short',
+        position_side='SHORT',
+    )
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=105.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=99.0,
+        tp1_trigger_price=95.0,
+        tp1_close_qty=0.5,
+        tp2_trigger_price=90.0,
+        tp2_close_qty=0.3,
+        runner_qty=0.2,
+        side='short',
+        position_side='SHORT',
+    )
+
+    actions = mod.evaluate_management_actions(
+        state,
+        plan,
+        current_price=105.2,
+        ema5m=102.0,
+        trailing_reference=98.0,
+        trailing_buffer_pct=0.02,
+    )
+
+    assert actions == [{
+        'type': 'hard_stop_loss',
+        'close_qty': 0.6,
+        'stop_price': 105.0,
+        'exit_reason': 'hard_stop_loss',
+    }]
+
+
+def test_evaluate_risk_guards_blocks_fee_trap_even_when_slippage_buffer_is_zero():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=100.0,
+        price_change_pct_24h=-12.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-2.0,
+        acceleration_ratio_5m_vs_15m=1.4,
+        breakout_level=99.0,
+        recent_swing_low=106.0,
+        stop_price=104.0,
+        quantity=1.0,
+        risk_per_unit=4.0,
+        recommended_leverage=3,
+        rsi_5m=33.0,
+        volume_multiple=1.8,
+        distance_from_ema20_5m_pct=-3.0,
+        distance_from_vwap_15m_pct=-2.4,
+        higher_tf_summary={'1h': 'down'},
+        score=72.0,
+        reasons=['candidate_selected'],
+        side='short',
+        position_side='SHORT',
+        state='launch',
+        setup_ready=True,
+        trigger_fired=True,
+        book_depth_fill_ratio=0.91,
+        expected_slippage_pct=0.0,
+        tradeability_score=0.71,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': True},
+    )
+    candidate.expected_edge = 0.10
+    candidate.expected_total_fee_pct = 0.12
+    candidate.execution_slippage_buffer_pct = 0.0
+    candidate.min_profit_buffer_pct = 0.0
+
+    result = mod.evaluate_risk_guards(candidate=candidate)
+
+    assert result['allowed'] is False
+    assert 'candidate_fee_trap' in result['reasons']
+
+
+def test_evaluate_risk_guards_blocks_short_chasing_after_extended_dump():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=92.0,
+        price_change_pct_24h=-24.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=-4.2,
+        acceleration_ratio_5m_vs_15m=2.4,
+        breakout_level=98.0,
+        recent_swing_low=110.0,
+        stop_price=99.0,
+        quantity=1.0,
+        risk_per_unit=7.0,
+        recommended_leverage=3,
+        rsi_5m=18.0,
+        volume_multiple=2.8,
+        distance_from_ema20_5m_pct=-9.0,
+        distance_from_vwap_15m_pct=-8.0,
+        higher_tf_summary={'1h': 'down'},
+        score=82.0,
+        reasons=['candidate_selected'],
+        side='short',
+        position_side='SHORT',
+        state='launch',
+        setup_ready=True,
+        trigger_fired=True,
+        book_depth_fill_ratio=0.91,
+        expected_slippage_pct=0.05,
+        tradeability_score=0.71,
+        must_pass_flags={'setup_ready': True, 'trigger_fired': True},
+    )
+
+    result = mod.evaluate_risk_guards(candidate=candidate)
+
+    assert result['allowed'] is False
+    assert 'candidate_short_chase_risk' in result['reasons']
+
+
+def test_build_trade_analytics_snapshot_adds_review_fields_for_stop_and_efficiency():
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.0,
+        opened_at='2026-04-29T00:00:00Z',
+        first_1r_at='2026-04-29T00:03:00Z',
+        highest_price_seen=106.0,
+        lowest_price_seen=94.5,
+        realized_r=-1.0,
+    )
+    plan = mod.TradeManagementPlan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=1.0,
+        initial_risk_per_unit=5.0,
+        breakeven_trigger_price=101.0,
+        tp1_trigger_price=105.0,
+        tp1_close_qty=0.5,
+        tp2_trigger_price=110.0,
+        tp2_close_qty=0.3,
+        runner_qty=0.2,
+    )
+
+    snapshot = mod.build_trade_analytics_snapshot(
+        state,
+        plan,
+        closed_at=mod.datetime.datetime(2026, 4, 29, 0, 8, tzinfo=mod.datetime.timezone.utc),
+    )
+
+    assert snapshot['hard_stop_price'] == 95.0
+    assert snapshot['stop_loss_hit'] is True
+    assert snapshot['max_favorable_excursion_r'] == 1.2
+    assert snapshot['max_adverse_excursion_r'] == 1.1
+    assert snapshot['exit_efficiency_r'] == -2.2
+    assert snapshot['initial_stop_distance_pct'] == 5.0
+
+
+def test_trade_memory_aggregates_closed_trades_by_profile_symbol_side_and_decile(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    rows = [
+        {'event_type': 'trade_invalidated', 'symbol': 'MEMEUSDT', 'side': 'LONG', 'profile': '10u-active', 'score_decile': '80-89', 'trigger_class': 'breakout', 'realized_r': 1.8, 'mfe_r': 2.4, 'mae_r': -0.2, 'exit_reason': 'tp2'},
+        {'event_type': 'trade_invalidated', 'symbol': 'MEMEUSDT', 'side': 'LONG', 'profile': '10u-active', 'score_decile': '80-89', 'trigger_class': 'breakout', 'realized_r': -1.0, 'mfe_r': 0.2, 'mae_r': -1.0, 'exit_reason': 'stop'},
+        {'event_type': 'candidate_rejected', 'symbol': 'MEMEUSDT', 'side': 'LONG', 'profile': '10u-active', 'score_decile': '80-89', 'trigger_class': 'breakout', 'reasons': ['risk_guard']},
+    ]
+    memory = mod.TradeMemoryEngine(store).aggregate(rows)
+
+    key = 'profile=10u-active|symbol=MEMEUSDT|side=LONG|trigger=breakout|decile=80-89'
+    bucket = memory['buckets'][key]
+    assert bucket['closed_trades'] == 2
+    assert bucket['rejections'] == 1
+    assert bucket['win_rate'] == 0.5
+    assert bucket['avg_realized_r'] == 0.4
+    assert bucket['avg_mfe_r'] == 1.3
+    assert bucket['avg_mae_r'] == -0.6
+
+
+def test_adaptive_profile_penalizes_poor_memory_bucket_and_persists_review(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    engine = mod.TradeMemoryEngine(store)
+    event = {
+        'event_type': 'trade_invalidated',
+        'symbol': 'RUGUSDT',
+        'side': 'LONG',
+        'profile': '10u-active',
+        'score_decile': '70-79',
+        'trigger_class': 'breakout',
+        'realized_r': -1.0,
+        'mfe_r': 0.1,
+        'mae_r': -1.0,
+        'exit_reason': 'stop',
+    }
+    review = engine.review_closed_trade(event)
+    memory = engine.aggregate([event, event, event])
+    args = argparse.Namespace(profile='10u-active', risk_usdt=1.0, min_score=70.0, enable_trade_memory=True)
+
+    adjusted = mod.apply_adaptive_trade_memory_profile(args, memory)
+
+    assert review['quality_label'] == 'loss'
+    assert store.load_json('trade_reviews', [])[0]['symbol'] == 'RUGUSDT'
+    assert adjusted.trade_memory_risk_multiplier == 0.5
+    assert adjusted.risk_usdt == 0.5
+    assert adjusted.min_score == 75.0
+    assert 'poor_recent_memory' in adjusted.trade_memory_adjustments
+
+
+def test_trade_memory_adjusts_candidate_score_for_matching_bucket(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    memory = mod.TradeMemoryEngine(store).aggregate([
+        {'event_type': 'trade_invalidated', 'symbol': 'HOTUSDT', 'side': 'LONG', 'profile': 'default', 'score_decile': '80-89', 'trigger_class': 'breakout', 'realized_r': -1.0, 'mfe_r': 0.2, 'mae_r': -1.0},
+        {'event_type': 'trade_invalidated', 'symbol': 'HOTUSDT', 'side': 'LONG', 'profile': 'default', 'score_decile': '80-89', 'trigger_class': 'breakout', 'realized_r': -0.8, 'mfe_r': 0.4, 'mae_r': -1.0},
+    ])
+    candidate = mod.Candidate(
+        symbol='HOTUSDT', last_price=10.0, price_change_pct_24h=8.0, quote_volume_24h=100000000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0, acceleration_ratio_5m_vs_15m=1.5, breakout_level=10.0,
+        recent_swing_low=9.5, stop_price=9.4, quantity=1.0, risk_per_unit=0.6,
+        recommended_leverage=5, rsi_5m=60.0, volume_multiple=2.0,
+        distance_from_ema20_5m_pct=1.0, distance_from_vwap_15m_pct=1.0,
+        higher_tf_summary={}, score=84.0, reasons=['base'], side='long', position_side='LONG',
+        trigger_type='breakout', alert_tier='high'
+    )
+
+    adjusted = mod.apply_trade_memory_to_candidate(candidate, memory, profile='default')
+
+    assert adjusted.score == 78.0
+    assert adjusted.trade_memory_adjustment == -6.0
+    assert any(reason.startswith('trade_memory_bucket=poor') for reason in adjusted.reasons)

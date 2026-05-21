@@ -769,6 +769,25 @@ def test_main_single_run_prints_scan_payload(monkeypatch, capsys):
 
 
 
+def test_resident_management_cycle_refreshes_last_cycle_for_auto_loop():
+    mod = load_module()
+    store = DummyStore()
+    args = make_args(auto_loop=True, live=True, scan_only=False, profile='10u-aggressive-v2')
+    cycle = {'cycle_no': 7, 'scan': {'ok': True, 'candidate_count': 0}}
+
+    result = mod.management_cycle(args, {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN'}, store=store)
+
+    assert result['ok'] is True
+    assert store.json_state['resident_last_result']['cycle_no'] == 7
+    last_cycle = store.json_state['last_cycle']
+    assert last_cycle['auto_loop'] is True
+    assert last_cycle['live_requested'] is True
+    assert last_cycle['profile'] == '10u-aggressive-v2'
+    assert last_cycle['cycle'] == cycle
+    assert isinstance(last_cycle['updated_at'], str) and last_cycle['updated_at']
+
+
+
 def test_resident_runtime_uses_split_cycles_instead_of_run_loop(monkeypatch, capsys):
     mod = load_module()
     args = make_args(auto_loop=True, max_scan_cycles=1, poll_interval_sec=0, base_url='https://example.com')
@@ -1294,6 +1313,28 @@ def test_scan_only_cycle_emits_manager_side_effects_without_direct_event_or_risk
     assert update['reconcile']['skip_reason'] == 'scanner_rest_full_reconcile_not_due'
 
     assert any(e['event_type'] == 'missed_trade' for e in update['event_updates'])
+
+
+def test_execution_cycle_passes_store_to_deadman_for_timeout_heartbeat(monkeypatch):
+    mod = load_module()
+    store = DummyStore()
+    args = make_args(execution_timeout_seconds=12.0)
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG')
+    req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 3}, 'requested_leverage': 3}
+    seen = {}
+
+    def fake_deadman(fn, *a, **k):
+        seen['store'] = k.get('store')
+        seen['timeout_seconds'] = k.get('timeout_seconds')
+        return {'ok': False, 'reason': 'deadman_timeout', 'component': 'execution', 'operation': 'place_live_trade'}
+
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', fake_deadman)
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    assert result['ok'] is False
+    assert seen['store'] is store
+    assert result['live_execution_error']['error'] == 'execution_timeout'
 
 
 def test_execution_task_routes_completion_event_through_manager_queue(monkeypatch):
@@ -3516,6 +3557,7 @@ def test_collect_book_ticker_samples_rate_limits_cache_miss_runtime_events(monke
     assert miss_events[0]['symbol'] == 'DOGEUSDT'
     assert miss_events[0]['fallback'] == 'rest_polling'
 
+    mod.flush_event_rate_limit_state(store, force=True)
     rate_state = store.load_json('event_rate_limit_state', {})
     assert rate_state['book_ticker_cache_miss']['DOGEUSDT']['suppressed_since_last'] == 2
     assert len(calls) == 3
@@ -3886,6 +3928,35 @@ def test_force_close_book_ticker_websocket_supervisor_closes_handle_and_bumps_ge
     assert any(e['event_type'] == 'book_ticker_ws_forced_restart' for e in store.events)
 
 
+def test_force_close_book_ticker_websocket_supervisor_keeps_alive_thread_when_join_times_out():
+    mod = load_module()
+    store = DummyStore()
+
+    import threading
+
+    stop = threading.Event()
+    thread = threading.Thread(target=lambda: stop.wait(10.0), name='stuck-ws', daemon=True)
+    thread.start()
+
+    class Ws:
+        def close(self):
+            return None
+
+    try:
+        mod._BOOK_TICKER_WS_SUPERVISOR_STATE.update({'thread': thread, 'thread_name': 'stuck-ws', 'started_at': 'old', 'ws': Ws(), 'generation_id': 8})
+
+        result = mod.force_close_book_ticker_websocket_supervisor(store, reason='stale:test')
+
+        assert result['thread_join_timed_out'] is True
+        assert result['thread_still_running'] is True
+        assert mod._BOOK_TICKER_WS_SUPERVISOR_STATE['thread'] is thread
+        assert mod._BOOK_TICKER_WS_SUPERVISOR_STATE['thread_name'] == 'stuck-ws'
+        assert mod._BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] is None
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
 def test_apply_queue_backpressure_coalesces_low_priority_manager_updates():
     mod = load_module()
     store = DummyStore()
@@ -3996,7 +4067,16 @@ def test_run_scan_once_prefilter_caps_expensive_symbol_fetches(monkeypatch, tmp_
     monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda client, symbol, **kwargs: [])
     monkeypatch.setattr(mod, 'build_candidate', lambda **kwargs: None)
 
-    args = make_args(runtime_state_dir=str(tmp_path), top_gainers=20, top_losers=0, max_candidates=3, scan_prefilter_multiplier=1)
+    args = make_args(
+        runtime_state_dir=str(tmp_path),
+        top_gainers=20,
+        top_losers=0,
+        max_candidates=3,
+        scan_prefilter_multiplier=1,
+        scanner_rest_fallback=True,
+        scanner_kline_rest_fallback=True,
+        scanner_kline_rest_fallback_min_interval_seconds=0,
+    )
     result, best, meta_map = mod.run_scan_once(DummyClient(), args)
 
     scanned_symbols = {symbol for symbol, interval in calls if symbol.startswith('COIN')}

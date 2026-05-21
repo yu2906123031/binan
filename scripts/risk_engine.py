@@ -243,6 +243,21 @@ def evaluate_risk_guards(
         total_cost_floor_pct = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
         if has_explicit_edge_cost_contract and total_cost_floor_pct > 0 and expected_edge <= total_cost_floor_pct:
             reasons.append('candidate_edge_after_costs_insufficient')
+            if expected_total_fee_pct > 0 and expected_edge <= expected_total_fee_pct + min_profit_buffer_pct:
+                reasons.append('candidate_fee_trap')
+        if candidate_side == 'SHORT':
+            short_extension_pct = max(
+                abs(_to_float(getattr(candidate, 'recent_5m_change_pct', 0.0))),
+                abs(_to_float(getattr(candidate, 'distance_from_ema20_5m_pct', 0.0))),
+                abs(_to_float(getattr(candidate, 'distance_from_vwap_15m_pct', 0.0))),
+            )
+            if (
+                _to_float(getattr(candidate, 'rsi_5m', 50.0), default=50.0) <= 20.0
+                and _to_float(getattr(candidate, 'price_change_pct_24h', 0.0)) <= -20.0
+                and short_extension_pct >= 4.0
+                and _to_float(getattr(candidate, 'volume_multiple', 0.0)) >= 2.0
+            ):
+                reasons.append('candidate_short_chase_risk')
         liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
         explicit_liquidity_grade = str(getattr(candidate, 'liquidity_grade', '') or '').strip().upper()
         if execution_liquidity_grade == 'E':

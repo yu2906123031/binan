@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import contextlib
+import gzip
 import portalocker
 import json
 import os
@@ -465,11 +466,44 @@ class RuntimeStateStore:
         with self._file_lock(path):
             return self._atomic_write_json(path, normalized_payload)
 
+    def _rotate_events_if_needed(self, path: Path, max_bytes: int = 50 * 1024 * 1024, retention_days: int = 7) -> None:
+        if not path.exists():
+            return
+        should_rotate = False
+        try:
+            stat = path.stat()
+            if stat.st_size >= max_bytes:
+                should_rotate = True
+            else:
+                modified_day = datetime.datetime.fromtimestamp(stat.st_mtime, datetime.timezone.utc).date()
+                should_rotate = modified_day < _utc_now().date()
+        except OSError:
+            return
+        if should_rotate:
+            stamp = _utc_now().strftime('%Y%m%dT%H%M%SZ')
+            rotated = path.with_name(f'{path.name}.{stamp}')
+            try:
+                os.replace(path, rotated)
+                gz_path = rotated.with_suffix(rotated.suffix + '.gz')
+                with rotated.open('rb') as src, gzip.open(gz_path, 'wb') as dst:
+                    dst.writelines(src)
+                rotated.unlink(missing_ok=True)
+            except OSError:
+                return
+        cutoff = _utc_now() - datetime.timedelta(days=max(int(retention_days or 0), 1))
+        for candidate in path.parent.glob(f'{path.name}.*.gz'):
+            try:
+                if datetime.datetime.fromtimestamp(candidate.stat().st_mtime, datetime.timezone.utc) < cutoff:
+                    candidate.unlink(missing_ok=True)
+            except OSError:
+                continue
+
     def append_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = self._events_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         row = {'event_type': event_type, 'recorded_at': _isoformat_utc(_utc_now()), **normalize_runtime_event_payload(payload or {})}
         with self._file_lock(path):
+            self._rotate_events_if_needed(path)
             with path.open('a', encoding='utf-8') as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + '\n')
                 fh.flush()
