@@ -32,7 +32,7 @@ import portalocker
 _REAL_TIME_TIME = time.time
 
 import candidate_builder as candidate_builder_mod
-from execution_engine import ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
+from execution_engine import cancel_stale_protection_orders_after_flat as execution_cancel_stale_protection_orders_after_flat, ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
@@ -1308,6 +1308,17 @@ class Candidate:
     min_profit_buffer_pct: float = 0.0
     min_notional_usdt: float = 0.0
     max_notional_usdt: float = 0.0
+    expected_net_profit_usdt: float = 0.0
+    expected_gross_profit_usdt: float = 0.0
+    expected_loss_usdt: float = 0.0
+    expected_rr: float = 0.0
+    estimated_fee_usdt: float = 0.0
+    estimated_slippage_usdt: float = 0.0
+    target_profit_reject_reason: str = ''
+    planned_take_profit_price: float = 0.0
+    planned_stop_price: float = 0.0
+    planned_quantity: float = 0.0
+    planned_notional_usdt: float = 0.0
 
     def __post_init__(self) -> None:
         self.side = normalize_trade_side(self.side)
@@ -3675,6 +3686,108 @@ def recommend_leverage(entry_price: float, stop_price: float, max_leverage: int 
     else:
         lev = 8
     return max(1, min(lev, max_leverage))
+
+
+def plan_five_usdt_target_trade(
+    side: str,
+    entry_price: float,
+    planned_take_profit_price: float,
+    stop_price: float,
+    *,
+    target_net_profit_usdt: float = 5.0,
+    min_target_net_profit_usdt: float = 4.2,
+    max_loss_usdt: float = 2.5,
+    min_expected_rr: float = 1.7,
+    min_notional_usdt: float = 0.0,
+    max_notional_usdt: float = 0.0,
+    taker_fee_rate: float = 0.0005,
+    slippage_buffer_pct: float = 0.0008,
+    step_size: float = 0.0,
+    tick_size: float = 0.0,
+    quantity_precision: int = 10,
+    price_precision: int = 10,
+    disable_tiny_tp: bool = True,
+) -> Dict[str, Any]:
+    trade_side = normalize_trade_side(side)
+    entry = float(entry_price or 0.0)
+    tp = float(planned_take_profit_price or 0.0)
+    stop = float(stop_price or 0.0)
+    if tick_size and tick_size > 0:
+        tp = round_price(tp, tick_size, price_precision)
+        stop = round_price(stop, tick_size, price_precision)
+    direction = 1.0 if trade_side == TRADE_SIDE_LONG else -1.0
+    profit_per_unit = direction * (tp - entry)
+    loss_per_unit = direction * (entry - stop)
+    result = {
+        'expected_net_profit_usdt': 0.0,
+        'expected_gross_profit_usdt': 0.0,
+        'expected_loss_usdt': 0.0,
+        'expected_rr': 0.0,
+        'estimated_fee_usdt': 0.0,
+        'estimated_slippage_usdt': 0.0,
+        'target_profit_reject_reason': '',
+        'planned_take_profit_price': tp,
+        'planned_stop_price': stop,
+        'planned_quantity': 0.0,
+        'planned_notional_usdt': 0.0,
+    }
+    if entry <= 0 or profit_per_unit <= 0:
+        result['target_profit_reject_reason'] = 'invalid_take_profit_distance'
+        return result
+    if disable_tiny_tp and profit_per_unit / entry < 0.001:
+        result['target_profit_reject_reason'] = 'tiny_profit_trade_rejected'
+        return result
+    if loss_per_unit <= 0:
+        result['target_profit_reject_reason'] = 'expected_loss_above_max'
+        return result
+    fee_rate = max(float(taker_fee_rate or 0.0), 0.0) * 2.0
+    slippage_rate = max(float(slippage_buffer_pct or 0.0), 0.0) * 2.0
+    round_trip_cost_per_unit = entry * (fee_rate + slippage_rate)
+    net_per_unit = profit_per_unit - round_trip_cost_per_unit
+    if net_per_unit <= 0:
+        result['target_profit_reject_reason'] = 'fee_ratio_too_high'
+        return result
+    qty = max(float(target_net_profit_usdt or 0.0), float(min_target_net_profit_usdt or 0.0), 0.0) / net_per_unit
+    if min_notional_usdt > 0:
+        qty = max(qty, float(min_notional_usdt) / entry)
+    if max_notional_usdt > 0:
+        qty = min(qty, float(max_notional_usdt) / entry)
+    loss_cost_per_unit = loss_per_unit + round_trip_cost_per_unit
+    if max_loss_usdt > 0:
+        qty = min(qty, float(max_loss_usdt) / loss_cost_per_unit)
+    qty = round_step(qty, step_size, quantity_precision)
+    notional = qty * entry
+    gross = qty * profit_per_unit
+    fee = notional * fee_rate
+    slippage = notional * slippage_rate
+    net = gross - fee - slippage
+    loss = qty * loss_per_unit + fee + slippage
+    rr = net / loss if loss > 0 else 0.0
+    result.update({
+        'expected_net_profit_usdt': round(net, 8),
+        'expected_gross_profit_usdt': round(gross, 8),
+        'expected_loss_usdt': round(loss, 8),
+        'expected_rr': round(rr, 8),
+        'estimated_fee_usdt': round(fee, 8),
+        'estimated_slippage_usdt': round(slippage, 8),
+        'planned_quantity': qty,
+        'planned_notional_usdt': round(notional, 8),
+    })
+    if qty <= 0:
+        result['target_profit_reject_reason'] = 'notional_below_min'
+    elif min_notional_usdt > 0 and notional + 1e-9 < min_notional_usdt:
+        result['target_profit_reject_reason'] = 'notional_below_min'
+    elif max_notional_usdt > 0 and notional > max_notional_usdt + 1e-9:
+        result['target_profit_reject_reason'] = 'notional_above_max'
+    elif target_net_profit_usdt > 0 and fee / float(target_net_profit_usdt) > 0.12:
+        result['target_profit_reject_reason'] = 'fee_ratio_too_high'
+    elif max_loss_usdt > 0 and loss > max_loss_usdt + 1e-9:
+        result['target_profit_reject_reason'] = 'expected_loss_above_max'
+    elif net < float(min_target_net_profit_usdt or 0.0):
+        result['target_profit_reject_reason'] = 'expected_net_profit_below_min'
+    elif rr < float(min_expected_rr or 0.0):
+        result['target_profit_reject_reason'] = 'expected_rr_below_min'
+    return result
 
 
 def build_trade_management_plan(entry_price: float, stop_price: float, quantity: float, tp1_r: float, tp1_close_pct: float, tp2_r: float, tp2_close_pct: float, breakeven_r: float = 1.0, atr_stop_distance: Optional[float] = None, side: str = POSITION_SIDE_LONG, breakeven_confirmation_mode: str = 'price_only', breakeven_min_buffer_pct: float = 0.0, tp1_profit_usdt: float = 0.0, tp2_profit_usdt: float = 0.0, micro_scalp_time_stop_sec: int = 0, micro_scalp_min_profit_r: float = 0.0) -> TradeManagementPlan:
@@ -7492,6 +7605,44 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             )
             if candidate is None:
                 continue
+            target_net_profit = float(getattr(args, 'target_net_profit_usdt', 0.0) or 0.0)
+            if target_net_profit > 0:
+                direction = 1.0 if normalize_trade_side(getattr(candidate, 'side', TRADE_SIDE_LONG)) == TRADE_SIDE_LONG else -1.0
+                risk_distance = abs(float(candidate.last_price or 0.0) - float(candidate.stop_price or 0.0))
+                planned_tp = float(candidate.last_price or 0.0) + direction * risk_distance * float(getattr(args, 'tp1_r', 1.5) or 1.5)
+                target_plan = plan_five_usdt_target_trade(
+                    getattr(candidate, 'side', TRADE_SIDE_LONG),
+                    float(candidate.last_price or 0.0),
+                    planned_tp,
+                    float(candidate.stop_price or 0.0),
+                    target_net_profit_usdt=target_net_profit,
+                    min_target_net_profit_usdt=float(getattr(args, 'min_target_net_profit_usdt', 0.0) or 0.0),
+                    max_loss_usdt=float(getattr(args, 'max_loss_usdt', 0.0) or 0.0),
+                    min_expected_rr=float(getattr(args, 'min_expected_rr', 0.0) or 0.0),
+                    min_notional_usdt=float(getattr(args, 'min_notional_usdt', 0.0) or 0.0),
+                    max_notional_usdt=float(getattr(args, 'max_notional_usdt', 0.0) or 0.0),
+                    taker_fee_rate=0.0005,
+                    slippage_buffer_pct=max(float(getattr(candidate, 'execution_slippage_buffer_pct', 0.0) or 0.0) / 100.0, 0.0008),
+                    step_size=float(getattr(meta, 'step_size', 0.0) or 0.0),
+                    tick_size=float(getattr(meta, 'tick_size', 0.0) or 0.0),
+                    quantity_precision=int(getattr(meta, 'quantity_precision', 10) or 10),
+                    price_precision=int(getattr(meta, 'price_precision', 10) or 10),
+                    disable_tiny_tp=bool(getattr(args, 'disable_tiny_tp', False)),
+                )
+                for key, value in target_plan.items():
+                    if hasattr(candidate, key):
+                        setattr(candidate, key, value)
+                if target_plan.get('planned_quantity', 0.0) > 0:
+                    candidate.quantity = float(target_plan['planned_quantity'])
+                candidate.reasons.append(f"target_net_profit_usdt={target_net_profit}")
+                candidate.reasons.append(f"expected_net_profit_usdt={candidate.expected_net_profit_usdt}")
+                candidate.reasons.append(f"expected_loss_usdt={candidate.expected_loss_usdt}")
+                candidate.reasons.append(f"expected_rr={candidate.expected_rr}")
+                if candidate.target_profit_reject_reason:
+                    apply_candidate_diagnostics(candidate)
+                    candidate.reasons.append(f"target_profit_reject:{candidate.target_profit_reject_reason}")
+                    rejected_events.append(append_candidate_rejected_event(None, candidate, [candidate.target_profit_reject_reason]))
+                    continue
             apply_candidate_diagnostics(candidate)
             built_candidates.append(candidate)
             external_veto_reason = apply_external_signal_to_candidate(candidate, external_signal)
@@ -7838,6 +7989,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--lookback-bars', type=int, default=12)
     parser.add_argument('--swing-bars', type=int, default=6)
     parser.add_argument('--risk-usdt', type=float, default=10.0)
+    parser.add_argument('--target-net-profit-usdt', type=float, default=0.0)
+    parser.add_argument('--min-target-net-profit-usdt', type=float, default=0.0)
+    parser.add_argument('--max-loss-usdt', type=float, default=0.0)
+    parser.add_argument('--min-expected-rr', type=float, default=0.0)
+    parser.add_argument('--prefer-maker', action='store_true')
+    parser.add_argument('--taker-fee-worst-case', action='store_true')
+    parser.add_argument('--disable-tiny-tp', action='store_true')
+    parser.add_argument('--daily-trade-limit', type=int, default=0)
+    parser.add_argument('--cooldown-after-loss-minutes', type=int, default=0)
+    parser.add_argument('--pause-after-consecutive-losses-hours', type=int, default=0)
     parser.add_argument('--max-notional-usdt', type=float, default=0.0)
     parser.add_argument('--min-notional-usdt', type=float, default=0.0)
     parser.add_argument('--min-5m-change-pct', type=float, default=2.0)
@@ -8034,6 +8195,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'aggressive-fee-aware-scalp-long-short',
         'aggressive-fee-aware-scalp-long-only',
         'aggressive-fee-aware-scalp-short-only',
+        'five-usdt-target-v1',
     }
     if profile not in valid_profiles:
         raise ValueError(f'Unknown profile: {profile}')
@@ -8123,6 +8285,42 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'enable_fee_aware_edge_filter': True,
             'atr_stop_multiplier': 1.5,
             'allowed_trade_sides': 'long,short',
+        }
+    elif profile == 'five-usdt-target-v1':
+        profile_overrides = {
+            'target_net_profit_usdt': 5.0,
+            'min_target_net_profit_usdt': 4.2,
+            'max_loss_usdt': 2.5,
+            'min_expected_rr': 1.7,
+            'risk_usdt': 2.5,
+            'leverage': 10,
+            'probe_max_leverage': 10,
+            'min_notional_usdt': 80.0,
+            'max_notional_usdt': 180.0,
+            'max_open_positions': 1,
+            'max_long_positions': 1,
+            'max_short_positions': 1,
+            'daily_trade_limit': 3,
+            'daily_max_loss_usdt': 6.0,
+            'max_consecutive_losses': 2,
+            'symbol_cooldown_minutes': 45,
+            'cooldown_after_loss_minutes': 45,
+            'pause_after_consecutive_losses_hours': 4,
+            'prefer_maker': True,
+            'taker_fee_worst_case': True,
+            'disable_tiny_tp': True,
+            'tp1_close_pct': 0.9,
+            'tp2_close_pct': 0.1,
+            'tp1_profit_usdt': 5.0,
+            'tp2_profit_usdt': 5.6,
+            'breakeven_r': 0.6,
+            'breakeven_min_buffer_pct': 0.003,
+            'breakeven_confirmation_mode': 'price_only',
+            'min_5m_change_pct': 0.45,
+            'min_volume_multiple': 1.1,
+            'max_candidates': 8,
+            'allowed_trade_sides': 'long,short',
+            'enable_fee_aware_edge_filter': True,
         }
     elif profile == '10u-active':
         profile_overrides = {
@@ -8883,11 +9081,26 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
             positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
     sync_result = sync_tracked_positions_with_exchange(store, exchange_positions, protected_symbols=protected_symbols)
+    stale_protection_cleanup = []
+    for closed_key in sync_result.get('closed_symbols', []) or []:
+        closed_symbol, closed_side = split_position_key(closed_key)
+        if not closed_symbol:
+            continue
+        cleanup_result = execution_cancel_stale_protection_orders_after_flat(
+            client=client,
+            symbol=closed_symbol,
+            position_side=closed_side,
+            fetch_open_orders=fetch_open_orders,
+            cancel_order=cancel_order,
+            emit_event=lambda event_type, payload: store.append_event(event_type, payload),
+        )
+        stale_protection_cleanup.append(cleanup_result)
     result = {
         'ok': True,
         'orphan_positions': orphan_positions,
         'positions_missing_protection': positions_missing_protection,
         'protection_repairs': protection_repairs,
+        'stale_protection_cleanup': stale_protection_cleanup,
         'exchange_position_count': len(exchange_positions),
         'position_count': len(exchange_positions),
         'closed_tracked_positions': sync_result.get('closed_symbols', []),

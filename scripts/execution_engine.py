@@ -143,6 +143,55 @@ def resolve_position_protection_status(
     }
 
 
+def cancel_stale_protection_orders_after_flat(
+    client: Any,
+    symbol: str,
+    position_side: str,
+    *,
+    fetch_open_orders: Callable[..., Any],
+    cancel_order: Callable[..., Any],
+    emit_event: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+) -> Dict[str, Any]:
+    symbol_norm = str(symbol or '').upper()
+    side_norm = str(position_side or '').upper()
+
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or '').strip().lower() in {'true', '1', 'yes', 'y'}
+
+    def _is_protection_order(row: Dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get('symbol') or symbol_norm).upper() != symbol_norm:
+            return False
+        row_side = str(row.get('positionSide') or row.get('position_side') or side_norm).upper()
+        if row_side != side_norm:
+            return False
+        order_type = str(row.get('type') or row.get('origType') or row.get('orderType') or '').upper()
+        protection_types = {'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET'}
+        return order_type in protection_types and (_truthy(row.get('reduceOnly')) or _truthy(row.get('closePosition')) or order_type.endswith('_MARKET'))
+
+    cancelled = []
+    failed = []
+    for row in fetch_open_orders(client, symbol_norm) or []:
+        if not _is_protection_order(row):
+            continue
+        order_id = row.get('orderId') or row.get('order_id')
+        try:
+            response = cancel_order(client, symbol_norm, order_id=order_id, client_order_id=row.get('clientOrderId'))
+            event = {'symbol': symbol_norm, 'position_side': side_norm, 'order_id': order_id, 'status': 'cancelled', 'response': response}
+            cancelled.append(event)
+            if emit_event:
+                emit_event('stale_protection_order_cancelled_after_flat', event)
+        except Exception as exc:
+            event = {'symbol': symbol_norm, 'position_side': side_norm, 'order_id': order_id, 'status': 'cancel_failed', 'error': str(exc)}
+            failed.append(event)
+            if emit_event:
+                emit_event('stale_protection_order_cancel_failed_after_flat', event)
+    return {'symbol': symbol_norm, 'position_side': side_norm, 'cancelled_count': len(cancelled), 'failed_count': len(failed), 'cancelled': cancelled, 'failed': failed}
+
+
 def repair_missing_protection(
     client: Any,
     symbol: str,
