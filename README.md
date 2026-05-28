@@ -87,6 +87,26 @@ python main.py --live --auto-loop --profile aggressive-fee-aware-scalp-short-onl
 python main.py --live --auto-loop --profile 10u-aggressive-v2
 ```
 
+## five-usdt-target-v1 profile
+
+- `five-usdt-target-v1` 面向单笔净利润约 `5 USDT` 的反推仓位模式，默认 `top_gainers=10`、`top_losers=10`、`max_candidates=5`、`scan_prefilter_multiplier=2`。
+- 选币分三层：A 层主流高流动性币种，B 层中等波动白名单，C 层热点/动量币种。
+- A/B/C 层分别使用更严格的 `expected_net_profit_usdt`、`expected_rr`、`expected_loss_usdt` 门槛；C 层额外要求放量、订单流确认与低滑点。
+- 最近亏损币种会进入冷却：单币最近大亏、当日累计亏损、最近 3 笔合计亏损都会触发 `symbol_recent_loss_cooldown` 或 `symbol_daily_loss_cooldown`。
+- `candidate_rejected`、`candidate_alerts`、`selected_alert` 会带上 `symbol_quality_tier`、`symbol_quality_reason`、`symbol_tier_min_expected_net_profit_usdt`、`symbol_tier_min_rr`、`symbol_tier_max_loss_usdt`，方便 recent diagnostics 复盘。
+
+扫描命令：
+
+```powershell
+python main.py --scan-only --profile five-usdt-target-v1 --output-format json
+```
+
+自动运行命令：
+
+```powershell
+python main.py --live --auto-loop --profile five-usdt-target-v1
+```
+
 ## 扫描输出补充字段
 
 - `candidate_alerts` / `selected_alert` 现在会暴露：

@@ -1319,6 +1319,12 @@ class Candidate:
     planned_stop_price: float = 0.0
     planned_quantity: float = 0.0
     planned_notional_usdt: float = 0.0
+    symbol_quality_tier: str = ''
+    symbol_quality_reason: str = ''
+    symbol_tier_min_expected_net_profit_usdt: float = 0.0
+    symbol_tier_min_rr: float = 0.0
+    symbol_tier_max_loss_usdt: float = 0.0
+
 
     def __post_init__(self) -> None:
         self.side = normalize_trade_side(self.side)
@@ -3126,6 +3132,11 @@ def append_candidate_rejected_event(store: Optional[RuntimeStateStore], candidat
                 trade_missing.append(reason)
     payload = {
         'symbol': candidate.symbol,
+        'symbol_quality_tier': str(getattr(candidate, 'symbol_quality_tier', '') or ''),
+        'symbol_quality_reason': str(getattr(candidate, 'symbol_quality_reason', '') or ''),
+        'symbol_tier_min_expected_net_profit_usdt': round(float(getattr(candidate, 'symbol_tier_min_expected_net_profit_usdt', 0.0) or 0.0), 4),
+        'symbol_tier_min_rr': round(float(getattr(candidate, 'symbol_tier_min_rr', 0.0) or 0.0), 4),
+        'symbol_tier_max_loss_usdt': round(float(getattr(candidate, 'symbol_tier_max_loss_usdt', 0.0) or 0.0), 4),
         'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')),
         'position_side': getattr(candidate, 'position_side', ''),
         'state': candidate.state,
@@ -6930,6 +6941,125 @@ def fetch_top_account_long_short_ratio(client: BinanceFuturesClient, symbol: str
     return _client_get_with_optional_purpose(client, '/futures/data/topLongShortAccountRatio', params={'symbol': symbol, 'period': period, 'limit': limit}, purpose='low_frequency_market_data')
 
 
+
+FIVE_USDT_TIER_A_SYMBOLS = {
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'LINKUSDT', 'AVAXUSDT', 'SUIUSDT',
+}
+FIVE_USDT_TIER_B_SYMBOLS = {
+    'NEARUSDT', 'ONDOUSDT', 'APTUSDT', 'SEIUSDT', 'TIAUSDT', 'INJUSDT', 'WIFUSDT', 'PEPEUSDT', 'FETUSDT', 'LDOUSDT',
+}
+FIVE_USDT_TIER_RULES = {
+    'A': {'min_profit': 4.2, 'min_rr': 1.7, 'max_loss': 2.5},
+    'B': {'min_profit': 4.5, 'min_rr': 1.8, 'max_loss': 2.5},
+    'C': {'min_profit': 5.0, 'min_rr': 2.0, 'max_loss': 2.2},
+}
+
+
+def classify_five_usdt_symbol_quality_tier(symbol: str) -> Dict[str, Any]:
+    normalized = normalize_symbol(symbol)
+    if normalized in FIVE_USDT_TIER_A_SYMBOLS:
+        tier = 'A'; reason = 'high_liquidity_whitelist'
+    elif normalized in FIVE_USDT_TIER_B_SYMBOLS:
+        tier = 'B'; reason = 'medium_volatility_whitelist'
+    else:
+        tier = 'C'; reason = 'hot_or_momentum_symbol'
+    rule = FIVE_USDT_TIER_RULES[tier]
+    return {
+        'symbol_quality_tier': tier,
+        'symbol_quality_reason': reason,
+        'symbol_tier_min_expected_net_profit_usdt': float(rule['min_profit']),
+        'symbol_tier_min_rr': float(rule['min_rr']),
+        'symbol_tier_max_loss_usdt': float(rule['max_loss']),
+    }
+
+
+def apply_five_usdt_symbol_quality_fields(candidate: Candidate) -> Candidate:
+    payload = classify_five_usdt_symbol_quality_tier(candidate.symbol)
+    for key, value in payload.items():
+        setattr(candidate, key, value)
+    candidate.reasons.append(f"symbol_quality_tier={payload['symbol_quality_tier']}")
+    candidate.reasons.append(f"symbol_quality_reason={payload['symbol_quality_reason']}")
+    return candidate
+
+
+def _event_time(row: Dict[str, Any]) -> Optional[datetime]:
+    return _parse_iso8601_utc(row.get('closed_at') or row.get('exit_at') or row.get('recorded_at') or row.get('updated_at'))
+
+
+def build_symbol_loss_cooldown_map(store: Optional[RuntimeStateStore], *, limit: int = 5000) -> Dict[str, Dict[str, Any]]:
+    if store is None or not hasattr(store, 'read_events'):
+        return {}
+    now = _utc_now()
+    rows = store.read_events(limit=limit)
+    by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if str(row.get('event_type') or '') not in {'trade_closed', 'position_closed', 'exit_filled', 'trade_summary'}:
+            continue
+        symbol = normalize_symbol(row.get('symbol'))
+        if not symbol:
+            continue
+        pnl = _to_float(row.get('net_pnl_usdt', row.get('realized_pnl_usdt', row.get('pnl_usdt', row.get('net_profit_usdt')))), default=0.0)
+        ts = _event_time(row)
+        if ts is None:
+            continue
+        by_symbol.setdefault(symbol, []).append({'pnl': pnl, 'ts': ts})
+    cooldowns: Dict[str, Dict[str, Any]] = {}
+    for symbol, trades in by_symbol.items():
+        trades.sort(key=lambda item: item['ts'])
+        last = trades[-1]
+        today_loss = sum(item['pnl'] for item in trades if item['ts'].date() == now.date() and item['pnl'] < 0)
+        recent3 = trades[-3:]
+        reasons: List[str] = []
+        until: Optional[datetime] = None
+        if float(last['pnl']) <= -2.5 and (now - last['ts']).total_seconds() < 24 * 3600:
+            reasons.append('symbol_recent_loss_cooldown')
+            until = max(until or now, last['ts'] + datetime.timedelta(hours=24))
+        if today_loss <= -3.0:
+            reasons.append('symbol_daily_loss_cooldown')
+            until = max(until or now, datetime.datetime.combine(now.date() + datetime.timedelta(days=1), datetime.datetime.min.time(), tzinfo=datetime.timezone.utc))
+        if len(recent3) >= 3 and sum(item['pnl'] for item in recent3) < 0:
+            reasons.append('symbol_recent_loss_cooldown')
+            until = max(until or now, last['ts'] + datetime.timedelta(hours=48))
+        if reasons:
+            cooldowns[symbol] = {'reasons': list(dict.fromkeys(reasons)), 'cooldown_until': _isoformat_utc(until or now), 'last_trade_net_pnl_usdt': round(float(last['pnl']), 4), 'today_loss_usdt': round(float(today_loss), 4)}
+    return cooldowns
+
+
+def apply_five_usdt_candidate_selection_filter(candidate: Candidate, args: argparse.Namespace, store: Optional[RuntimeStateStore], cooldown_map: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
+    apply_five_usdt_symbol_quality_fields(candidate)
+    tier = str(candidate.symbol_quality_tier or 'C')
+    if float(getattr(candidate, 'expected_net_profit_usdt', 0.0) or 0.0) < float(candidate.symbol_tier_min_expected_net_profit_usdt or 0.0):
+        return 'symbol_tier_expected_profit_too_low'
+    if float(getattr(candidate, 'expected_rr', 0.0) or 0.0) < float(candidate.symbol_tier_min_rr or 0.0):
+        return 'symbol_tier_rr_too_low'
+    if float(getattr(candidate, 'expected_loss_usdt', 0.0) or 0.0) > float(candidate.symbol_tier_max_loss_usdt or 0.0):
+        return 'symbol_tier_loss_too_high'
+    cd = (cooldown_map or {}).get(normalize_symbol(candidate.symbol), {})
+    if cd:
+        candidate.reasons.append(f"symbol_cooldown_until={cd.get('cooldown_until', '')}")
+        return str((cd.get('reasons') or ['symbol_recent_loss_cooldown'])[0])
+    execution_quality = compute_execution_quality_size_adjustment(candidate)
+    if tier in {'B', 'C'} and str(execution_quality.get('execution_liquidity_grade') or '') in {'D', 'F'}:
+        return 'c_tier_slippage_too_high' if tier == 'C' else 'execution_depth_veto'
+    if tier == 'C':
+        volume_spike = float(getattr(candidate, 'volume_multiple', 0.0) or 0.0) >= 1.5 or float(getattr(candidate, 'volume_zscore_5m', 0.0) or 0.0) >= 1.0
+        if not volume_spike:
+            return 'c_tier_missing_volume_spike'
+        flags = dict(getattr(candidate, 'trigger_confirmation_flags', {}) or {})
+        orderflow_confirms = 0
+        if flags.get('oi_taker_alignment_confirmed') or abs(float(getattr(candidate, 'oi_change_pct_5m', 0.0) or 0.0)) > 0.0:
+            orderflow_confirms += 1
+        if flags.get('cvd_alignment_confirmed') or abs(float(getattr(candidate, 'cvd_delta', 0.0) or 0.0)) > 0.0:
+            orderflow_confirms += 1
+        taker_ratio = getattr(candidate, 'taker_buy_ratio', None)
+        if taker_ratio is not None and abs(float(taker_ratio) - 0.5) >= 0.05:
+            orderflow_confirms += 1
+        if orderflow_confirms < 2:
+            return 'c_tier_missing_orderflow_confirmation'
+        if float(execution_quality.get('spread_bps') or 0.0) > 8.0 or float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0) > 0.12:
+            return 'c_tier_slippage_too_high'
+    return None
+
 def merged_candidate_symbols(**kwargs) -> Tuple[List[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
     allowed_symbols = {
         str(symbol).strip().upper()
@@ -7237,6 +7367,11 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
     )
     return {
         'symbol': candidate.symbol,
+        'symbol_quality_tier': str(getattr(candidate, 'symbol_quality_tier', '') or ''),
+        'symbol_quality_reason': str(getattr(candidate, 'symbol_quality_reason', '') or ''),
+        'symbol_tier_min_expected_net_profit_usdt': round(float(getattr(candidate, 'symbol_tier_min_expected_net_profit_usdt', 0.0) or 0.0), 4),
+        'symbol_tier_min_rr': round(float(getattr(candidate, 'symbol_tier_min_rr', 0.0) or 0.0), 4),
+        'symbol_tier_max_loss_usdt': round(float(getattr(candidate, 'symbol_tier_max_loss_usdt', 0.0) or 0.0), 4),
         'score': round(candidate.score, 2),
         'state': candidate.state,
         'alert_tier': candidate.alert_tier,
@@ -7456,6 +7591,8 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     external_signal_map = normalize_external_signal_map(external_signal_payload)
 
     square_symbols = list(explicit_square_symbols or load_manual_square_symbols(args))
+    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
+        square_symbols = square_symbols[:10]
     metas = fetch_exchange_meta(client)
     scan_seed_symbols = list(dict.fromkeys([*square_symbols, *list(external_signal_map.keys())]))
     fallback_symbols = scan_seed_symbols
@@ -7504,6 +7641,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     )
 
     rejected_events: List[Dict[str, Any]] = []
+    five_usdt_cooldown_map = build_symbol_loss_cooldown_map(store) if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1' else {}
     early_reject_stats: Dict[str, Any] = {'total': 0, 'by_reason': {}, 'by_side': {}}
     candidates: List[Candidate] = []
     built_candidates: List[Candidate] = []
@@ -7643,6 +7781,13 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                     candidate.reasons.append(f"target_profit_reject:{candidate.target_profit_reject_reason}")
                     rejected_events.append(append_candidate_rejected_event(None, candidate, [candidate.target_profit_reject_reason]))
                     continue
+            if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
+                symbol_tier_reject = apply_five_usdt_candidate_selection_filter(candidate, args, store, five_usdt_cooldown_map)
+                if symbol_tier_reject:
+                    apply_candidate_diagnostics(candidate)
+                    candidate.reasons.append(symbol_tier_reject)
+                    rejected_events.append(append_candidate_rejected_event(None, candidate, [symbol_tier_reject]))
+                    continue
             apply_candidate_diagnostics(candidate)
             built_candidates.append(candidate)
             external_veto_reason = apply_external_signal_to_candidate(candidate, external_signal)
@@ -7703,6 +7848,12 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             candidates.append(candidate)
 
     candidates.sort(key=lambda item: item.score, reverse=True)
+    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
+        candidates = sorted(
+            candidates,
+            key=lambda item: (-abs(float(getattr(item, 'expected_net_profit_usdt', 0.0) or 0.0) - 5.0), float(getattr(item, 'score', 0.0) or 0.0)),
+            reverse=True,
+        )[:5]
     candidate_alerts = [build_standardized_alert(item, regime_payload) for item in candidates]
     execution_candidates = [item for item in candidates if bool(getattr(item, 'trigger_fired', False))]
     relaxed_candidates = [build_trigger_relax_candidate(item, args) for item in candidates if is_trigger_relax_eligible(item, args, regime_payload)]
@@ -7714,6 +7865,12 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         ),
         reverse=True,
     )
+    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
+        execution_priority = sorted(
+            execution_priority,
+            key=lambda item: (-abs(float(getattr(item, 'expected_net_profit_usdt', 0.0) or 0.0) - 5.0), float(getattr(item, 'score', 0.0) or 0.0)),
+            reverse=True,
+        )[:1]
     best = execution_priority[0] if execution_priority else None
     selected = build_standardized_alert(best, regime_payload) if best else None
     early_rejected_events = [item for item in list(early_reject_stats.get('samples', []) or []) if isinstance(item, dict)]
@@ -8318,7 +8475,11 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'breakeven_confirmation_mode': 'price_only',
             'min_5m_change_pct': 0.45,
             'min_volume_multiple': 1.1,
-            'max_candidates': 8,
+            'top_gainers': 10,
+            'top_losers': 10,
+            'max_candidates': 5,
+            'scan_prefilter_multiplier': 2,
+            'enable_symbol_quality_tier': True,
             'allowed_trade_sides': 'long,short',
             'enable_fee_aware_edge_filter': True,
         }
