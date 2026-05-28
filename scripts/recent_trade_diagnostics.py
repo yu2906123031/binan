@@ -47,6 +47,7 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         f"- total_rejected: {rejected.get('total_rejected', 0)}",
         f"- distinct_rejected_symbols: {rejected.get('distinct_symbols', 0)}",
         f"- top_reject_reason: {rejected.get('top_reject_reason') or 'n/a'}",
+        f"- top_symbol_quality_tier: {rejected.get('top_symbol_quality_tier') or 'n/a'}",
         '',
         '## Artifacts',
         '',

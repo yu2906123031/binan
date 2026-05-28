@@ -21,6 +21,7 @@ def test_build_rejected_analysis_payload_aggregates_reason_label_grade_and_overe
             'overextension_flag': 'high',
             'expected_slippage_r': 0.22,
             'book_depth_fill_ratio': 0.41,
+            'symbol_quality_tier': 'C',
         },
         {
             'event_type': 'candidate_rejected',
@@ -31,6 +32,7 @@ def test_build_rejected_analysis_payload_aggregates_reason_label_grade_and_overe
             'overextension_flag': 'high',
             'expected_slippage_r': 0.12,
             'book_depth_fill_ratio': 0.52,
+            'symbol_quality_tier': 'C',
         },
         {
             'event_type': 'candidate_rejected',
@@ -41,6 +43,7 @@ def test_build_rejected_analysis_payload_aggregates_reason_label_grade_and_overe
             'overextension_flag': 'mild',
             'expected_slippage_r': 0.31,
             'book_depth_fill_ratio': 0.18,
+            'symbol_quality_tier': 'B',
         },
         {
             'event_type': 'entry_filled',
@@ -63,6 +66,10 @@ def test_build_rejected_analysis_payload_aggregates_reason_label_grade_and_overe
     assert payload['by_label'][0] == {'reject_reason_label': 'distribution', 'count': 2}
     assert payload['by_grade'][0] == {'execution_liquidity_grade': 'C', 'count': 2}
     assert payload['by_overextension'][0] == {'overextension_flag': 'high', 'count': 2}
+    assert payload['summary']['top_symbol_quality_tier'] == 'C'
+    assert payload['summary']['top_symbol_quality_tier_count'] == 2
+    assert payload['by_symbol_quality_tier'][0] == {'symbol_quality_tier': 'C', 'count': 2}
+    assert payload['by_symbol_quality_tier_reason'][0] == {'symbol_quality_tier': 'C', 'reject_reason': 'candidate_distribution_risk', 'count': 2}
 
 
 def test_run_reads_events_and_writes_report_files(tmp_path):
@@ -80,6 +87,7 @@ def test_run_reads_events_and_writes_report_files(tmp_path):
                 'overextension_flag': 'high',
                 'expected_slippage_r': 0.2,
                 'book_depth_fill_ratio': 0.4,
+                'symbol_quality_tier': 'C',
             }),
             json.dumps({
                 'event_type': 'candidate_rejected',
@@ -90,6 +98,7 @@ def test_run_reads_events_and_writes_report_files(tmp_path):
                 'overextension_flag': 'mild',
                 'expected_slippage_r': 0.3,
                 'book_depth_fill_ratio': 0.2,
+                'symbol_quality_tier': 'B',
             }),
         ]) + '\n',
         encoding='utf-8',
@@ -105,3 +114,4 @@ def test_run_reads_events_and_writes_report_files(tmp_path):
     assert '# Candidate Rejected Analysis' in markdown
     assert 'candidate_distribution_risk' in markdown
     assert 'slippage_risk' in markdown
+    assert 'By symbol quality tier' in markdown

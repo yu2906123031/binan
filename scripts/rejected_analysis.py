@@ -77,6 +77,8 @@ def build_rejected_analysis_payload(rows: Iterable[Dict[str, Any]]) -> Dict[str,
     label_counter: Counter = Counter()
     grade_counter: Counter = Counter()
     overextension_counter: Counter = Counter()
+    tier_counter: Counter = Counter()
+    tier_reason_counter: Counter = Counter()
     symbol_counter: Counter = Counter()
     aggregates: Dict[str, Dict[str, float]] = defaultdict(lambda: {'count': 0.0, 'slippage_sum': 0.0, 'depth_sum': 0.0})
 
@@ -85,6 +87,7 @@ def build_rejected_analysis_payload(rows: Iterable[Dict[str, Any]]) -> Dict[str,
         label = _normalize_text(row.get('reject_reason_label'))
         grade = _normalize_text(row.get('execution_liquidity_grade')).upper()
         overextension = _normalize_text(row.get('overextension_flag'))
+        tier = _normalize_text(row.get('symbol_quality_tier')).upper()
         symbol = _normalize_text(row.get('symbol'))
         slippage_r = _to_float(row.get('expected_slippage_r'))
         depth_ratio = _to_float(row.get('book_depth_fill_ratio'))
@@ -93,6 +96,8 @@ def build_rejected_analysis_payload(rows: Iterable[Dict[str, Any]]) -> Dict[str,
         label_counter[label] += 1
         grade_counter[grade] += 1
         overextension_counter[overextension] += 1
+        tier_counter[tier] += 1
+        tier_reason_counter[(tier, reason)] += 1
         symbol_counter[symbol] += 1
         aggregate = aggregates[reason]
         aggregate['count'] += 1
@@ -109,18 +114,28 @@ def build_rejected_analysis_payload(rows: Iterable[Dict[str, Any]]) -> Dict[str,
             'avg_book_depth_fill_ratio': _round(aggregate['depth_sum'] / count, 4),
         })
 
+    by_tier_reason = [
+        {'symbol_quality_tier': tier, 'reject_reason': reason, 'count': count}
+        for (tier, reason), count in sorted(tier_reason_counter.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+    ]
+
     top_reason = by_reason[0] if by_reason else None
+    top_tier = tier_counter.most_common(1)[0] if tier_counter else None
     return {
         'summary': {
             'total_rejected': len(rejected),
             'distinct_symbols': len(symbol_counter),
             'top_reject_reason': top_reason['reject_reason'] if top_reason else None,
             'top_reject_reason_count': top_reason['count'] if top_reason else 0,
+            'top_symbol_quality_tier': top_tier[0] if top_tier else None,
+            'top_symbol_quality_tier_count': top_tier[1] if top_tier else 0,
         },
         'by_reason': by_reason,
         'by_label': _count_table(label_counter, 'reject_reason_label'),
         'by_grade': _count_table(grade_counter, 'execution_liquidity_grade'),
         'by_overextension': _count_table(overextension_counter, 'overextension_flag'),
+        'by_symbol_quality_tier': _count_table(tier_counter, 'symbol_quality_tier'),
+        'by_symbol_quality_tier_reason': by_tier_reason,
         'by_symbol': _count_table(symbol_counter, 'symbol'),
     }
 
@@ -131,6 +146,7 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
     lines.append(f"- total_rejected: {summary.get('total_rejected', 0)}")
     lines.append(f"- distinct_symbols: {summary.get('distinct_symbols', 0)}")
     lines.append(f"- top_reject_reason: {summary.get('top_reject_reason') or 'n/a'}")
+    lines.append(f"- top_symbol_quality_tier: {summary.get('top_symbol_quality_tier') or 'n/a'}")
     lines.append('')
 
     def append_table(title: str, rows: List[Dict[str, Any]], columns: List[str]) -> None:
@@ -150,6 +166,8 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
     append_table('By label', payload.get('by_label', []), ['reject_reason_label', 'count'])
     append_table('By liquidity grade', payload.get('by_grade', []), ['execution_liquidity_grade', 'count'])
     append_table('By overextension', payload.get('by_overextension', []), ['overextension_flag', 'count'])
+    append_table('By symbol quality tier', payload.get('by_symbol_quality_tier', []), ['symbol_quality_tier', 'count'])
+    append_table('By symbol quality tier and reason', payload.get('by_symbol_quality_tier_reason', []), ['symbol_quality_tier', 'reject_reason', 'count'])
     append_table('By symbol', payload.get('by_symbol', []), ['symbol', 'count'])
     return '\n'.join(lines).rstrip() + '\n'
 
