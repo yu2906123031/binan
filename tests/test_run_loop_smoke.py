@@ -4042,6 +4042,77 @@ def test_reconcile_positions_and_orders_cancels_orphan_protection_orders():
 
 
 
+def test_reconcile_positions_and_orders_cancels_opening_orders_when_position_caps_reached():
+    mod = load_module()
+    store = DummyStore()
+
+    class Client:
+        def __init__(self):
+            self.deleted = []
+        def signed_get(self, path, params=None):
+            if path == '/fapi/v2/positionRisk':
+                return [
+                    {'symbol': 'ZECUSDT', 'positionAmt': '-0.001', 'positionSide': 'SHORT', 'markPrice': '600', 'entryPrice': '650', 'notional': '-0.6'},
+                    {'symbol': 'CAKEUSDT', 'positionAmt': '-14', 'positionSide': 'SHORT', 'markPrice': '1.4', 'entryPrice': '1.45', 'notional': '-19.6'},
+                    {'symbol': 'ASTERUSDT', 'positionAmt': '-30', 'positionSide': 'SHORT', 'markPrice': '0.67', 'entryPrice': '0.68', 'notional': '-20.1'},
+                    {'symbol': 'BEATUSDT', 'positionAmt': '18', 'positionSide': 'LONG', 'markPrice': '1.3', 'entryPrice': '1.08', 'notional': '23.4'},
+                ]
+            if path == '/fapi/v1/openOrders':
+                return [
+                    {'symbol': 'GENIUSUSDT', 'orderId': 11, 'type': 'LIMIT', 'side': 'SELL', 'positionSide': 'SHORT', 'reduceOnly': False, 'clientOrderId': 'entry_short'},
+                    {'symbol': 'BEATUSDT', 'orderId': 12, 'type': 'LIMIT', 'side': 'SELL', 'positionSide': 'LONG', 'reduceOnly': True, 'clientOrderId': 'reduce_long'},
+                    {'symbol': 'CAKEUSDT', 'orderId': 13, 'type': 'STOP_MARKET', 'side': 'BUY', 'positionSide': 'SHORT', 'reduceOnly': True, 'clientOrderId': 'bm_CAKEUSDT_short_stop_live'},
+                ]
+            if path == '/fapi/v1/openAlgoOrders':
+                return []
+            raise AssertionError(path)
+        def signed_post(self, path, params):
+            self.deleted.append((path, params))
+            return {'ok': True, 'params': params}
+
+    client = Client()
+    result = mod.reconcile_positions_and_orders(client, store, max_open_positions=3, max_short_positions=3)
+
+    assert result['ok'] is True
+    assert result['cap_opening_order_detected'] == 1
+    assert result['cap_opening_order_cancelled'] == 1
+    assert client.deleted == [('/fapi/v1/order/cancel', {'symbol': 'GENIUSUSDT', 'orderId': 11, 'origClientOrderId': 'entry_short'})]
+    event_types = [row['event_type'] for row in store.events]
+    assert 'position_cap_opening_order_detected' in event_types
+    assert 'position_cap_opening_order_cancelled' in event_types
+
+
+def test_reconcile_positions_and_orders_cancels_orphan_algo_orders():
+    mod = load_module()
+    store = DummyStore()
+
+    class Client:
+        def __init__(self):
+            self.deleted = []
+        def signed_get(self, path, params=None):
+            if path == '/fapi/v2/positionRisk':
+                return [{'symbol': 'DOGEUSDT', 'positionAmt': '2', 'positionSide': 'LONG', 'markPrice': '1', 'entryPrice': '1', 'notional': '2'}]
+            if path == '/fapi/v1/openOrders':
+                return []
+            if path == '/fapi/v1/openAlgoOrders':
+                return [
+                    {'symbol': 'DOGEUSDT', 'algoId': 1, 'orderType': 'STOP_MARKET', 'positionSide': 'LONG', 'clientAlgoId': 'bm_DOGEUSDT_long_stop_live'},
+                    {'symbol': 'PROVEUSDT', 'algoId': 2, 'orderType': 'TAKE_PROFIT_MARKET', 'positionSide': 'LONG', 'clientAlgoId': 'bm_PROVEUSDT_long_tp_old'},
+                ]
+            raise AssertionError(path)
+        def signed_delete(self, path, params):
+            self.deleted.append((path, params))
+            return {'ok': True, 'params': params}
+
+    client = Client()
+    result = mod.reconcile_positions_and_orders(client, store)
+
+    assert result['ok'] is True
+    assert result['orphan_order_detected'] == 1
+    assert result['orphan_order_cancelled'] == 1
+    assert client.deleted == [('/fapi/v1/algoOrder', {'symbol': 'PROVEUSDT', 'algoId': 2})]
+
+
 def test_run_scan_once_prefilter_caps_expensive_symbol_fetches(monkeypatch, tmp_path):
     mod = load_module()
     store = mod.RuntimeStateStore(str(tmp_path))
@@ -4258,6 +4329,73 @@ def test_reconnecting_websocket_allows_maker_only_degradation():
     assert freshness['execution_degradation_mode'] == 'maker_only'
     assert degraded.execution_mode_override == 'maker_only'
     assert degraded.quantity == 5.0
+
+
+def test_websocket_degradation_preserves_min_notional_floor():
+    mod = load_module()
+    freshness = {'execution_degradation_mode': 'maker_only', 'state': 'reconnecting'}
+    candidate = SimpleNamespace(
+        symbol='CHZUSDT',
+        last_price=0.05,
+        quantity=400.0,
+        position_size_pct=1.0,
+        min_notional_usdt=20.0,
+        reasons=[],
+    )
+
+    degraded = mod.build_websocket_degraded_candidate(candidate, freshness)
+
+    assert degraded.execution_mode_override == 'maker_only'
+    assert degraded.quantity == 400.0
+    assert degraded.quantity * degraded.last_price >= 20.0
+
+
+def test_execution_size_multiplier_preserves_min_notional_floor(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=False, live=True, require_book_ticker_ws=False)
+    store = DummyStore()
+    candidate = SimpleNamespace(
+        symbol='ETHUSDT',
+        side='LONG',
+        position_side='LONG',
+        recommended_leverage=8,
+        last_price=2137.59,
+        entry_price=2137.59,
+        stop_price=2133.36,
+        quantity=0.014,
+        position_size_pct=3.0,
+        min_notional_usdt=20.0,
+        reasons=[],
+    )
+    risk_guard_payload = {
+        'allowed': True,
+        'reasons': [],
+        'execution_mode': 'maker_confirm',
+        'execution_size_multiplier': 0.35,
+        'trigger_confidence': {'level': 'watch_confirm'},
+        'trigger_state': 'maker_confirm',
+        'trigger_gate_action': 'maker_confirm',
+    }
+    request = {
+        'candidate': candidate,
+        'meta': {'symbol': 'ETHUSDT'},
+        'risk_guard': risk_guard_payload,
+        'reconcile': {'ok': True},
+        'cycle': {'cycle_no': 21},
+        'requested_leverage': 8,
+    }
+    seen = {}
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: risk_guard_payload)
+    monkeypatch.setattr(mod, 'evaluate_portfolio_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'snapshot': {'candidate_notional_usdt': 29.92626}})
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, cand, lev, meta, passed_args: seen.setdefault('candidate', cand) or {'symbol': cand.symbol, 'quantity': cand.quantity})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
+
+    result = mod.execution_cycle(DummyClient(), args, request, store=store)
+
+    assert result['ok'] is True
+    assert seen['candidate'].quantity == 0.014
+    assert seen['candidate'].quantity * seen['candidate'].last_price >= 20.0
 
 
 def test_dead_websocket_still_blocks_execution_cycle(monkeypatch):

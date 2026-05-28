@@ -477,6 +477,32 @@ def test_execution_module_matches_script_resolve_position_protection_status(monk
     assert extracted_result['matched_via'] == 'open_algo_orders'
 
 
+def test_resolve_position_protection_status_ignores_opening_limit_orders(monkeypatch):
+    positions = [{'symbol': 'DOGEUSDT', 'positionAmt': '-5', 'positionSide': 'SHORT'}]
+    open_orders = [{
+        'symbol': 'DOGEUSDT',
+        'orderId': 991,
+        'type': 'LIMIT',
+        'side': 'SELL',
+        'positionSide': 'SHORT',
+        'reduceOnly': False,
+        'origQty': '5',
+    }]
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: copy.deepcopy(positions))
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: copy.deepcopy(open_orders))
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+
+    result = mod.resolve_position_protection_status(
+        client=object(),
+        symbol='DOGEUSDT',
+        side='SHORT',
+    )
+
+    assert result['status'] == 'missing'
+    assert result['matched_via'] == 'unmatched'
+
+
 
 def test_execution_module_matches_script_repair_missing_protection(monkeypatch):
     tracked = {'side': 'LONG', 'stop_price': 98.5}

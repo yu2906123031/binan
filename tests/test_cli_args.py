@@ -310,9 +310,9 @@ def test_aggressive_profile_uses_relaxed_live_entry_thresholds():
     assert args.top_gainers == 45
     assert args.top_losers == 45
     assert args.max_candidates == 24
-    assert args.max_open_positions == 3
-    assert args.max_long_positions == 3
-    assert args.max_short_positions == 3
+    assert args.max_open_positions == 5
+    assert args.max_long_positions == 5
+    assert args.max_short_positions == 5
     assert args.watch_breakout_tolerance_pct == 1.2
     assert args.setup_breakout_tolerance_pct == 0.8
     assert args.oi_hard_reversal_threshold_pct == 1.2
@@ -398,6 +398,9 @@ def test_v2_profile_enables_structural_filters_and_relaxed_probe_defaults():
     assert args.enable_fee_aware_edge_filter is True
     assert args.atr_stop_multiplier > 0
     assert args.allowed_trade_sides == 'long,short'
+    assert args.max_open_positions == 5
+    assert args.max_long_positions == 5
+    assert args.max_short_positions == 5
 
 
 def test_v2_profile_keeps_explicit_probe_flag_override():

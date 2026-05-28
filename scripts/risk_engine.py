@@ -87,6 +87,18 @@ def evaluate_risk_guards(
         normalized['portfolio_heat_r_by_correlation'] = {}
     if not isinstance(normalized.get('daily_symbol_trade_counts'), dict):
         normalized['daily_symbol_trade_counts'] = {}
+    if not isinstance(normalized.get('daily_symbol_loss_usdt'), dict):
+        normalized['daily_symbol_loss_usdt'] = {}
+    if not isinstance(normalized.get('rolling_symbol_loss_usdt'), dict):
+        normalized['rolling_symbol_loss_usdt'] = {}
+    if not isinstance(normalized.get('symbol_consecutive_losses'), dict):
+        normalized['symbol_consecutive_losses'] = {}
+    if not isinstance(normalized.get('recent_symbol_entries'), dict):
+        normalized['recent_symbol_entries'] = {}
+    if not isinstance(normalized.get('limit_cancel_replace_count_by_symbol'), dict):
+        normalized['limit_cancel_replace_count_by_symbol'] = {}
+    if not isinstance(normalized.get('loss_deweighted_symbols'), dict):
+        normalized['loss_deweighted_symbols'] = {}
     if not isinstance(normalized.get('recent_closed_trades'), list):
         normalized['recent_closed_trades'] = []
 
@@ -125,10 +137,62 @@ def evaluate_risk_guards(
         reasons.append('max_consecutive_losses_reached')
 
     cooldown_until = None
+    reduce_only_context = bool(kwargs.get('reduce_only') or kwargs.get('close_position') or kwargs.get('allow_reduce_only'))
+    cooldown_minutes_after_loss = max(int(kwargs.get('after_symbol_loss_cooldown_minutes', 180) or 0), 0)
+    cooldown_seconds_after_loss = cooldown_minutes_after_loss * 60
     if normalized_symbol:
         cooldown_until = normalized['symbol_cooldowns'].get(normalized_symbol)
-        if cooldown_until and ts < int(cooldown_until):
+        if cooldown_until and ts < int(cooldown_until) and not reduce_only_context:
             reasons.append('symbol_cooldown_active')
+        daily_loss_limit = max(_to_float(kwargs.get('symbol_daily_loss_limit_usdt', 1.2)), 0.0)
+        rolling_loss_limit = max(_to_float(kwargs.get('symbol_rolling_loss_limit_usdt', 2.0)), 0.0)
+        max_symbol_losses = max(int(kwargs.get('max_consecutive_losses_per_symbol', 1) or 0), 0)
+        symbol_daily_loss = _to_float(normalized['daily_symbol_loss_usdt'].get(normalized_symbol, 0.0))
+        symbol_rolling_loss = _to_float(normalized['rolling_symbol_loss_usdt'].get(normalized_symbol, 0.0))
+        symbol_loss_streak = int(normalized['symbol_consecutive_losses'].get(normalized_symbol, 0) or 0)
+        loss_limit_hit = False
+        if daily_loss_limit > 0 and symbol_daily_loss <= -daily_loss_limit:
+            reasons.append('symbol_daily_loss_limit_reached')
+            loss_limit_hit = True
+        if rolling_loss_limit > 0 and symbol_rolling_loss <= -rolling_loss_limit:
+            reasons.append('symbol_rolling_loss_limit_reached')
+            loss_limit_hit = True
+        if max_symbol_losses > 0 and symbol_loss_streak >= max_symbol_losses:
+            reasons.append('symbol_consecutive_losses_reached')
+            loss_limit_hit = True
+        if loss_limit_hit and cooldown_seconds_after_loss > 0:
+            existing_until = int(normalized['symbol_cooldowns'].get(normalized_symbol, 0) or 0)
+            cooldown_until = max(existing_until, ts + cooldown_seconds_after_loss)
+            normalized['symbol_cooldowns'][normalized_symbol] = cooldown_until
+        if reduce_only_context:
+            reasons = [reason for reason in reasons if reason not in {'symbol_cooldown_active', 'symbol_daily_loss_limit_reached', 'symbol_rolling_loss_limit_reached', 'symbol_consecutive_losses_reached', 'symbol_recent_loss_cooldown_active', 'symbol_limit_cancel_replace_limit_reached', 'symbol_reentry_30m_limit_reached'}]
+        if not reduce_only_context and cooldown_seconds_after_loss > 0:
+            for closed_trade in reversed(normalized['recent_closed_trades']):
+                if not isinstance(closed_trade, dict):
+                    continue
+                closed_symbol = str(closed_trade.get('symbol') or '').strip().upper()
+                if closed_symbol != normalized_symbol:
+                    continue
+                pnl_value = _to_float(closed_trade.get('pnl_usdt', closed_trade.get('realized_pnl', 0.0)))
+                closed_at = closed_trade.get('closed_at')
+                if pnl_value < 0 and closed_at is not None and ts - int(closed_at) < cooldown_seconds_after_loss:
+                    reasons.append('symbol_recent_loss_cooldown_active')
+                    cooldown_until = max(int(normalized['symbol_cooldowns'].get(normalized_symbol, 0) or 0), int(closed_at) + cooldown_seconds_after_loss)
+                    normalized['symbol_cooldowns'][normalized_symbol] = cooldown_until
+                break
+        if not reduce_only_context:
+            reentry_window_seconds = max(int(kwargs.get('symbol_reentry_window_minutes', 30) or 0), 0) * 60
+            max_reentries = max(int(kwargs.get('max_symbol_entries_per_window', 1) or 0), 0)
+            recent_entries = normalized['recent_symbol_entries'].get(normalized_symbol, [])
+            if reentry_window_seconds > 0 and max_reentries > 0 and isinstance(recent_entries, list):
+                active_entries = [int(entry_ts) for entry_ts in recent_entries if ts - int(entry_ts) < reentry_window_seconds]
+                normalized['recent_symbol_entries'][normalized_symbol] = active_entries
+                if len(active_entries) >= max_reentries:
+                    reasons.append('symbol_reentry_30m_limit_reached')
+            max_cancel_replace = max(int(kwargs.get('max_limit_cancel_replace_per_symbol', 2) or 0), 0)
+            cancel_replace_count = int(normalized['limit_cancel_replace_count_by_symbol'].get(normalized_symbol, 0) or 0)
+            if max_cancel_replace > 0 and cancel_replace_count > max_cancel_replace:
+                reasons.append('symbol_limit_cancel_replace_limit_reached')
         daily_symbol_trade_limit = max(int(kwargs.get('daily_symbol_trade_limit', 0) or 0), 0)
         if daily_symbol_trade_limit > 0:
             current_trade_count = int(normalized['daily_symbol_trade_counts'].get(normalized_symbol, 0) or 0)
@@ -151,6 +215,22 @@ def evaluate_risk_guards(
 
     if candidate is not None:
         state = getattr(candidate, 'state', '')
+        score_threshold_penalty = max(_to_float(kwargs.get('loss_deweighted_score_penalty', 12.0)), 0.0)
+        base_score_threshold = _to_float(kwargs.get('score_threshold', getattr(candidate, 'score_threshold', 0.0)))
+        candidate_score = _to_float(getattr(candidate, 'score', 0.0))
+        deweighted_until = 0
+        deweighted_payload = normalized.get('loss_deweighted_symbols', {}).get(normalized_symbol) if normalized_symbol else None
+        if isinstance(deweighted_payload, dict):
+            deweighted_until = int(deweighted_payload.get('cooldown_until', 0) or 0)
+        elif deweighted_payload:
+            deweighted_until = int(deweighted_payload)
+        if normalized_symbol in {'NEARUSDT', 'PUMPBTCUSDT', 'ONDOUSDT', 'AGTUSDT'} and not deweighted_until:
+            rolling_loss_value = _to_float(normalized.get('rolling_symbol_loss_usdt', {}).get(normalized_symbol, 0.0))
+            if rolling_loss_value < 0 and cooldown_seconds_after_loss > 0:
+                deweighted_until = ts + cooldown_seconds_after_loss
+                normalized['loss_deweighted_symbols'][normalized_symbol] = {'cooldown_until': deweighted_until, 'score_penalty': score_threshold_penalty}
+        if base_score_threshold > 0 and deweighted_until and ts >= deweighted_until and candidate_score < base_score_threshold + score_threshold_penalty:
+            reasons.append('symbol_loss_deweighted_score_below_threshold')
         must_pass_flags = getattr(candidate, 'must_pass_flags', None)
         if not isinstance(must_pass_flags, dict):
             must_pass_flags = {}

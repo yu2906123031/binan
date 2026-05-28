@@ -92,6 +92,50 @@ def test_main_starts_child_for_recoverable_runtime_position(monkeypatch, isolate
     assert recorded['cmd'][2] == str(supervisor.BOT_SCRIPT)
 
 
+def test_main_starts_child_for_reconciled_runtime_position(monkeypatch, isolated_supervisor_files):
+    positions_json = isolated_supervisor_files
+    positions_json.write_text(
+        json.dumps(
+            {
+                'IOUSDT:SHORT': {
+                    'symbol': 'IOUSDT',
+                    'position_side': 'SHORT',
+                    'status': 'reconciled',
+                    'remaining_quantity': 49.0,
+                    'entry_price': 0.1497,
+                }
+            }
+        ),
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(
+        supervisor,
+        'fetch_account_state',
+        lambda: {
+            'positions': [{'symbol': 'IOUSDT', 'positionAmt': '-49', 'entryPrice': '0.1497'}],
+            'risk_positions': [{'symbol': 'IOUSDT', 'positionAmt': '-49', 'entryPrice': '0.1497'}],
+            'position_mismatch': False,
+            'open_orders': [],
+            'ignored_open_orders': [],
+        },
+    )
+
+    recorded = {}
+
+    def fake_popen(cmd, **kwargs):
+        recorded['cmd'] = cmd
+        raise Spawned('spawned child')
+
+    monkeypatch.setattr(supervisor.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(supervisor.time, 'sleep', lambda _seconds: (_ for _ in ()).throw(AssertionError('should spawn child before sleeping')))
+
+    with pytest.raises(Spawned):
+        supervisor.main()
+
+    assert recorded['cmd'][0] == supervisor.resolve_strategy_python()
+
+
 def test_main_blocks_when_runtime_state_cannot_recover_account_position(monkeypatch, isolated_supervisor_files, capsys):
     positions_json = isolated_supervisor_files
     positions_json.write_text(json.dumps({'positions': []}), encoding='utf-8')

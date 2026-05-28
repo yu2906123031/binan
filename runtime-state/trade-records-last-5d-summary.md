@@ -1,70 +1,100 @@
 # Binance Futures trade records — last 5 days
 
-- Generated at: `2026-05-25T03:44:03.930000Z`
-- Window start: `2026-05-20T03:44:03.930000Z`
-- Window end: `2026-05-25T03:44:03.930000Z`
+- Generated at: `2026-05-28T01:52:59.542022Z`
+- Window start: `2026-05-23T01:52:59.542022Z`
+- Window end: `2026-05-28T01:52:59.542022Z`
 - Source: Binance USDT-M Futures REST API: income, userTrades, allOrders
-- Total records: `512`
-- Symbols: `ADAUSDT, AGTUSDT, ASTERUSDT, AVAXUSDT, BEATUSDT, BOMEUSDT, CAKEUSDT, CGPTUSDT, CHZUSDT, DOGEUSDT, ETHUSDT, FIDAUSDT, GRASSUSDT, IOUSDT, JSTUSDT, LAYERUSDT, NEARUSDT, NILUSDT, NOTUSDT, ONDOUSDT, PROVEUSDT, PUMPBTCUSDT, XLMUSDT, ZECUSDT, ZROUSDT`
+- Total records: `357`
+- Symbols: `ADAUSDT, AGTUSDT, ASTERUSDT, BEATUSDT, CAKEUSDT, CHZUSDT, DOGEUSDT, GRASSUSDT, HIGHUSDT, JSTUSDT, NEARUSDT, NILUSDT, NOTUSDT, ONDOUSDT, XLMUSDT, ZECUSDT`
+- realized_pnl: `3.27469358`
+- commission: `-0.40136936`
+- funding_fee: `-0.00864792`
+- net_realized_after_fee: `2.86467630`
+- open_position_symbols: `ZECUSDT, HIGHUSDT, DOGEUSDT, JSTUSDT`
+- open_position_unrealized_pnl: `1.82817416`
+- estimated_total_pnl: `4.69285046`
 
 ## Source counts
-- `binance_futures_income`: `230`
-- `binance_futures_orders`: `176`
-- `binance_futures_user_trades`: `106`
+- `binance_futures_income`: `187`
+- `binance_futures_orders`: `112`
+- `binance_futures_user_trades`: `58`
 
 ## Income by type (USDT)
-- `COMMISSION`: `-0.68907272`
-- `FUNDING_FEE`: `-0.00693861`
-- `REALIZED_PNL`: `2.29752499`
+- `COMMISSION`: `-0.40136936`
+- `FUNDING_FEE`: `-0.00864792`
+- `REALIZED_PNL`: `3.27469358`
 
 ## Realized PnL by symbol (USDT)
 - `ADAUSDT`: `0.57330000`
 - `AGTUSDT`: `-0.68590800`
-- `ASTERUSDT`: `0.77790000`
-- `AVAXUSDT`: `-0.15600000`
+- `ASTERUSDT`: `-0.04570000`
 - `BEATUSDT`: `4.43520000`
-- `BOMEUSDT`: `-0.19634160`
-- `CAKEUSDT`: `0.47600000`
-- `CGPTUSDT`: `0.64938000`
-- `CHZUSDT`: `-0.21900000`
+- `CAKEUSDT`: `0.46200000`
+- `CHZUSDT`: `-0.39298000`
 - `DOGEUSDT`: `0.05999999`
-- `ETHUSDT`: `-0.10780000`
-- `FIDAUSDT`: `-0.24275000`
-- `IOUSDT`: `-0.19110000`
-- `LAYERUSDT`: `0.00533000`
+- `GRASSUSDT`: `-0.32870000`
+- `JSTUSDT`: `0.40506999`
 - `NEARUSDT`: `-4.85800000`
-- `NILUSDT`: `1.05913200`
+- `NILUSDT`: `3.75508900`
 - `NOTUSDT`: `0.92980260`
 - `ONDOUSDT`: `-0.88315000`
-- `PROVEUSDT`: `-0.32819000`
-- `PUMPBTCUSDT`: `-1.13812000`
 - `XLMUSDT`: `0.20394000`
-- `ZECUSDT`: `2.04858000`
-- `ZROUSDT`: `0.08532000`
+- `ZECUSDT`: `-0.35527000`
 
 ## Commission by symbol (USDT)
 - `ADAUSDT`: `-0.03056165`
 - `AGTUSDT`: `-0.01503203`
-- `ASTERUSDT`: `-0.01810725`
-- `AVAXUSDT`: `-0.02787600`
-- `BEATUSDT`: `-0.01593900`
-- `BOMEUSDT`: `-0.03012835`
-- `CAKEUSDT`: `-0.02218468`
-- `CGPTUSDT`: `-0.03027781`
-- `CHZUSDT`: `-0.04509685`
+- `ASTERUSDT`: `-0.02372889`
+- `BEATUSDT`: `-0.01201860`
+- `CAKEUSDT`: `-0.00995680`
+- `CHZUSDT`: `-0.03000683`
 - `DOGEUSDT`: `-0.03451295`
-- `ETHUSDT`: `-0.02344660`
-- `FIDAUSDT`: `-0.02909600`
-- `GRASSUSDT`: `-0.00418809`
-- `IOUSDT`: `-0.00523026`
-- `JSTUSDT`: `-0.01509531`
-- `LAYERUSDT`: `-0.03493636`
+- `GRASSUSDT`: `-0.01482268`
+- `HIGHUSDT`: `-0.00419628`
+- `JSTUSDT`: `-0.02284550`
 - `NEARUSDT`: `-0.03206700`
-- `NILUSDT`: `-0.01530316`
+- `NILUSDT`: `-0.01657263`
 - `NOTUSDT`: `-0.03101579`
 - `ONDOUSDT`: `-0.05973545`
-- `PROVEUSDT`: `-0.02923108`
-- `PUMPBTCUSDT`: `-0.03046653`
 - `XLMUSDT`: `-0.03008115`
-- `ZECUSDT`: `-0.07433699`
-- `ZROUSDT`: `-0.00512638`
+- `ZECUSDT`: `-0.03421513`
+
+## Open position unrealized PnL (USDT)
+- `DOGEUSDT`: `0.32595000`
+- `HIGHUSDT`: `0.09096000`
+- `JSTUSDT`: `0.64795416`
+- `ZECUSDT`: `0.76331000`
+
+## Order quality
+- `market_order_count`: `36`
+- `limit_order_count`: `76`
+- `canceled_limit_count`: `70`
+- `taker_trade_count`: `51`
+- `maker_trade_count`: `7`
+- `taker_fee_ratio`: `0.9274551999`
+- `fast_stop_count`: `0`
+- `cancel_replace_count_by_symbol`:
+  - `ASTERUSDT`: `1`
+  - `DOGEUSDT`: `1`
+  - `GRASSUSDT`: `1`
+  - `HIGHUSDT`: `1`
+  - `JSTUSDT`: `1`
+  - `NEARUSDT`: `2`
+  - `NILUSDT`: `1`
+  - `ONDOUSDT`: `1`
+  - `XLMUSDT`: `1`
+  - `ZECUSDT`: `2`
+- `avg_hold_seconds_by_symbol`:
+  - `ADAUSDT`: `15436.376`
+  - `AGTUSDT`: `12433.587`
+  - `ASTERUSDT`: `272249.487`
+  - `CHZUSDT`: `13480.045`
+  - `DOGEUSDT`: `80433.025`
+  - `GRASSUSDT`: `51329.392`
+  - `JSTUSDT`: `296466.108`
+  - `NEARUSDT`: `89031.998`
+  - `NILUSDT`: `7102.979`
+  - `NOTUSDT`: `11474.632`
+  - `ONDOUSDT`: `2983.8465`
+  - `XLMUSDT`: `6519.434`
+  - `ZECUSDT`: `5378.728`

@@ -1306,6 +1306,8 @@ class Candidate:
     expected_total_fee_pct: float = 0.0
     execution_slippage_buffer_pct: float = 0.0
     min_profit_buffer_pct: float = 0.0
+    min_notional_usdt: float = 0.0
+    max_notional_usdt: float = 0.0
 
     def __post_init__(self) -> None:
         self.side = normalize_trade_side(self.side)
@@ -1837,7 +1839,14 @@ def build_websocket_degraded_candidate(candidate: Any, freshness: Dict[str, Any]
     if mode not in {'reduced_aggression', 'maker_only'}:
         return candidate
     ratio = 0.7 if mode == 'reduced_aggression' else 0.5
-    quantity = max(float(getattr(candidate, 'quantity', 0.0) or 0.0) * ratio, 0.0)
+    original_quantity = max(float(getattr(candidate, 'quantity', 0.0) or 0.0), 0.0)
+    quantity = original_quantity * ratio
+    last_price = float(getattr(candidate, 'last_price', 0.0) or 0.0)
+    min_notional_usdt = max(float(getattr(candidate, 'min_notional_usdt', 0.0) or 0.0), 0.0)
+    if last_price > 0 and min_notional_usdt > 0:
+        min_quantity = min_notional_usdt / last_price
+        if original_quantity >= min_quantity and quantity < min_quantity:
+            quantity = original_quantity
     position_size_pct = round(float(getattr(candidate, 'position_size_pct', 0.0) or 0.0) * ratio, 4)
     reasons = list(getattr(candidate, 'reasons', []) or []) + [f'websocket_degradation={mode}', f"websocket_state={freshness.get('state')}"]
     updates = {'quantity': quantity, 'position_size_pct': position_size_pct, 'reasons': reasons}
@@ -3845,20 +3854,86 @@ def order_position_key(order: Dict[str, Any]) -> str:
 
 def cancel_protection_order(client: Any, order: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(order.get('symbol') or '')
-    order_id = order.get('orderId') or order.get('algoId')
+    algo_id = order.get('algoId')
+    if algo_id is not None and hasattr(client, 'signed_delete'):
+        return client.signed_delete('/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': algo_id})
+    order_id = order.get('orderId')
     client_id = order_client_id(order) or None
     return cancel_order(client, symbol, order_id=order_id, client_order_id=client_id)
 
 
-def reconcile_positions_and_orders(client: Any, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:
+def order_is_reduce_only(order: Dict[str, Any]) -> bool:
+    value = order.get('reduceOnly')
+    return value is True or str(value).lower() == 'true'
+
+
+def is_opening_order(order: Dict[str, Any]) -> bool:
+    if order_is_reduce_only(order) or is_protection_order(order):
+        return False
+    order_type = str(order.get('type') or order.get('origType') or '').upper()
+    if order_type in {'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET'}:
+        return False
+    return bool(order.get('symbol'))
+
+
+def order_opening_side(order: Dict[str, Any]) -> str:
+    position_side = normalize_position_side(order.get('positionSide') or '')
+    if position_side in {POSITION_SIDE_LONG, POSITION_SIDE_SHORT}:
+        return position_side
+    return POSITION_SIDE_SHORT if str(order.get('side') or '').upper() == 'SELL' else POSITION_SIDE_LONG
+
+
+def cancel_open_order(client: Any, order: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(order.get('symbol') or '')
+    order_id = order.get('orderId')
+    client_id = order_client_id(order) or None
+    return cancel_order(client, symbol, order_id=order_id, client_order_id=client_id)
+
+
+def reconcile_positions_and_orders(
+    client: Any,
+    store: Optional[RuntimeStateStore] = None,
+    max_open_positions: Optional[int] = None,
+    max_short_positions: Optional[int] = None,
+) -> Dict[str, Any]:
     positions = fetch_open_positions(client)
     regular_orders = fetch_open_orders(client)
     algo_orders = fetch_open_algo_orders(client)
     open_position_keys = {build_position_key(row.get('symbol'), position_side_from_exchange_position(row)) for row in positions if isinstance(row, dict)}
+    open_position_count = len(open_position_keys)
+    short_position_count = sum(1 for row in positions if isinstance(row, dict) and position_side_from_exchange_position(row) == POSITION_SIDE_SHORT)
+    position_cap_reached = max_open_positions is not None and open_position_count >= int(max_open_positions)
+    short_cap_reached = max_short_positions is not None and short_position_count >= int(max_short_positions)
     detected: List[Dict[str, Any]] = []
     cancelled: List[Dict[str, Any]] = []
+    cap_detected: List[Dict[str, Any]] = []
+    cap_cancelled: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     for order in list(regular_orders or []) + list(algo_orders or []):
+        if is_opening_order(order) and (position_cap_reached or (short_cap_reached and order_opening_side(order) == POSITION_SIDE_SHORT)):
+            payload = {
+                'symbol': order.get('symbol'),
+                'position_side': order_opening_side(order),
+                'orderId': order.get('orderId') or order.get('algoId'),
+                'clientOrderId': order_client_id(order),
+                'type': order.get('type') or order.get('origType'),
+                'open_position_count': open_position_count,
+                'short_position_count': short_position_count,
+                'max_open_positions': max_open_positions,
+                'max_short_positions': max_short_positions,
+            }
+            cap_detected.append(payload)
+            append_runtime_event(store, 'position_cap_opening_order_detected', payload)
+            try:
+                result = cancel_open_order(client, order)
+                cancel_payload = {**payload, 'cancel_result': result}
+                cap_cancelled.append(cancel_payload)
+                append_runtime_event(store, 'position_cap_opening_order_cancelled', cancel_payload)
+            except Exception as exc:
+                error_payload = {**payload, 'error': str(exc)}
+                errors.append(error_payload)
+                append_runtime_event(store, 'position_cap_opening_order_cancel_failed', error_payload)
+            continue
         if not isinstance(order, dict) or not is_protection_order(order):
             continue
         pos_key = order_position_key(order)
@@ -3876,7 +3951,7 @@ def reconcile_positions_and_orders(client: Any, store: Optional[RuntimeStateStor
             error_payload = {**payload, 'error': str(exc)}
             errors.append(error_payload)
             append_runtime_event(store, 'orphan_order_cancel_failed', error_payload)
-    return {'ok': not errors, 'positions': len(positions), 'open_orders': len(list(regular_orders or [])) + len(list(algo_orders or [])), 'orphan_order_detected': len(detected), 'orphan_order_cancelled': len(cancelled), 'errors': errors}
+    return {'ok': not errors, 'positions': len(positions), 'open_orders': len(list(regular_orders or [])) + len(list(algo_orders or [])), 'orphan_order_detected': len(detected), 'orphan_order_cancelled': len(cancelled), 'cap_opening_order_detected': len(cap_detected), 'cap_opening_order_cancelled': len(cap_cancelled), 'errors': errors}
 
 
 def should_send_position_side(client: Any) -> bool:
@@ -7862,6 +7937,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--daily-max-loss-usdt', type=float, default=0.0, help='Block new trades after realized daily loss reaches this USDT threshold (0 disables).')
     parser.add_argument('--max-consecutive-losses', type=int, default=0, help='Block new trades after this many consecutive losses (0 disables).')
     parser.add_argument('--symbol-cooldown-minutes', type=int, default=0, help='Per-symbol cooldown after a loss or stop-out (0 disables).')
+    parser.add_argument('--symbol-daily-loss-limit-usdt', type=float, default=1.2, help='Block new entries for a symbol after its daily realized loss reaches this USDT amount.')
+    parser.add_argument('--symbol-rolling-loss-limit-usdt', type=float, default=2.0, help='Block new entries for a symbol after rolling-window realized loss reaches this USDT amount.')
+    parser.add_argument('--symbol-rolling-window-days', type=int, default=5, help='Rolling window in days used for per-symbol loss review.')
+    parser.add_argument('--max-consecutive-losses-per-symbol', type=int, default=1, help='Block new entries after this many consecutive losses on the same symbol.')
+    parser.add_argument('--after-symbol-loss-cooldown-minutes', type=int, default=180, help='Cooldown minutes after a symbol loss-limit or losing close.')
+    parser.add_argument('--loss-deweighted-score-penalty', type=float, default=12.0, help='Extra score points required for recently losing symbols after cooldown.')
     parser.add_argument('--gross-heat-cap-r', type=float, default=0.0, help='Maximum total portfolio heat in R units (0 disables).')
     parser.add_argument('--same-theme-heat-cap-r', type=float, default=0.0, help='Maximum heat in R units for the same narrative/theme bucket (0 disables).')
     parser.add_argument('--same-correlation-heat-cap-r', type=float, default=0.0, help='Maximum heat in R units for the same correlation bucket (0 disables).')
@@ -7976,9 +8057,9 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'top_gainers': 45,
             'top_losers': 45,
             'max_candidates': 24,
-            'max_open_positions': 3,
-            'max_long_positions': 3,
-            'max_short_positions': 3,
+            'max_open_positions': 5,
+            'max_long_positions': 5,
+            'max_short_positions': 5,
             'max_rsi_5m': 84.0,
             'min_volume_multiple': 0.5,
             'min_5m_change_pct': 0.2,
@@ -8015,9 +8096,9 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'top_gainers': 45,
             'top_losers': 45,
             'max_candidates': 24,
-            'max_open_positions': 3,
-            'max_long_positions': 3,
-            'max_short_positions': 3,
+            'max_open_positions': 5,
+            'max_long_positions': 5,
+            'max_short_positions': 5,
             'max_rsi_5m': 88.0,
             'min_volume_multiple': 0.35,
             'min_5m_change_pct': 0.15,
@@ -8274,6 +8355,12 @@ def default_risk_state() -> Dict[str, Any]:
         'daily_realized_pnl': 0.0,
         'daily_loss_limit_hit': False,
         'symbol_cooldowns': {},
+        'daily_symbol_loss_usdt': {},
+        'rolling_symbol_loss_usdt': {},
+        'symbol_consecutive_losses': {},
+        'recent_symbol_entries': {},
+        'limit_cancel_replace_count_by_symbol': {},
+        'loss_deweighted_symbols': {},
         'last_reset_date': datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
         'consecutive_losses': 0,
         'last_loss_at': None,
@@ -8990,12 +9077,25 @@ def evaluate_sim_probe_entry(candidate: Any, risk_guard: Dict[str, Any], args: a
 
 def build_probe_candidate(candidate: Candidate, size_ratio: float) -> Candidate:
     ratio = clamp(float(size_ratio or 0.0), 0.0, 1.0)
+    base_quantity = max(float(candidate.quantity or 0.0), 0.0)
+    last_price = max(float(candidate.last_price or 0.0), 0.0)
+    quantity = max(base_quantity * ratio, 0.0)
+    reasons = list(candidate.reasons or []) + [f'sim_probe_size_ratio={ratio:.2f}']
+    min_notional = max(float(getattr(candidate, 'min_notional_usdt', 0.0) or 0.0), 0.0)
+    max_notional = max(float(getattr(candidate, 'max_notional_usdt', 0.0) or 0.0), 0.0)
+    if last_price > 0.0 and min_notional > 0.0 and quantity * last_price < min_notional:
+        quantity = min_notional / last_price
+        reasons.append(f'sim_probe_notional_floor={min_notional:.2f}')
+    if last_price > 0.0 and max_notional > 0.0 and quantity * last_price > max_notional:
+        quantity = max_notional / last_price
+        reasons.append(f'sim_probe_notional_cap={max_notional:.2f}')
+    position_size_pct = float(candidate.position_size_pct or 0.0) * (quantity / base_quantity) if base_quantity > 0.0 else 0.0
     return replace(
         candidate,
-        quantity=max(float(candidate.quantity or 0.0) * ratio, 0.0),
-        position_size_pct=round(float(candidate.position_size_pct or 0.0) * ratio, 4),
+        quantity=quantity,
+        position_size_pct=round(position_size_pct, 4),
         probe_entry=True,
-        reasons=list(candidate.reasons or []) + [f'sim_probe_size_ratio={ratio:.2f}'],
+        reasons=reasons,
     )
 
 
@@ -9607,6 +9707,15 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
                 return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'blocked_reason': 'binance_ip_ban'}}
             else:
                 raise
+    if not binance_simulated_trading and not getattr(args, 'scan_only', False) and reconcile.get('skip_reason') != 'missing_api_secret':
+        order_reconcile = reconcile_positions_and_orders(
+            client,
+            store,
+            max_open_positions=getattr(args, 'max_open_positions', None),
+            max_short_positions=(getattr(args, 'max_short_positions', None) or None),
+        )
+        reconcile['order_reconcile'] = order_reconcile
+        reconcile['ok'] = bool(reconcile.get('ok', True)) and bool(order_reconcile.get('ok', True))
     if getattr(args, 'reconcile_only', False):
         reconcile_payload = {'reconcile': reconcile}
         persist_cycle_snapshot(reconcile_payload)
@@ -9731,6 +9840,13 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0),
         portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''),
         portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''),
+        symbol_daily_loss_limit_usdt=float(getattr(args, 'symbol_daily_loss_limit_usdt', 1.2) or 0.0),
+        symbol_rolling_loss_limit_usdt=float(getattr(args, 'symbol_rolling_loss_limit_usdt', 2.0) or 0.0),
+        symbol_rolling_window_days=int(getattr(args, 'symbol_rolling_window_days', 5) or 5),
+        max_consecutive_losses_per_symbol=int(getattr(args, 'max_consecutive_losses_per_symbol', 1) or 0),
+        after_symbol_loss_cooldown_minutes=int(getattr(args, 'after_symbol_loss_cooldown_minutes', 180) or 0),
+        loss_deweighted_score_penalty=float(getattr(args, 'loss_deweighted_score_penalty', 12.0) or 0.0),
+        score_threshold=float(getattr(args, 'score_threshold', 0.0) or 0.0),
     )
     if getattr(args, 'live', False) and not binance_simulated_trading:
         open_positions = fetch_open_positions(client)
@@ -10111,6 +10227,15 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
                 raise
         if isinstance(reconcile, dict) and reconcile.get('ok', True):
             scanner_reconcile_cursor_update = {'last_full_reconcile_at_monotonic': time.monotonic(), 'updated_at': _isoformat_utc(_utc_now())}
+    if not binance_simulated_trading and not getattr(args, 'scan_only', False) and reconcile.get('skip_reason') != 'missing_api_secret' and not reconcile.get('skipped_rest_reconcile_due_to_circuit'):
+        order_reconcile = reconcile_positions_and_orders(
+            client,
+            store,
+            max_open_positions=getattr(args, 'max_open_positions', None),
+            max_short_positions=(getattr(args, 'max_short_positions', None) or None),
+        )
+        reconcile['order_reconcile'] = order_reconcile
+        reconcile['ok'] = bool(reconcile.get('ok', True)) and bool(order_reconcile.get('ok', True))
     cycle: Dict[str, Any] = {'reconcile': reconcile}
     if scanner_reconcile_cursor_update:
         cycle['scanner_reconcile_cursor_update'] = scanner_reconcile_cursor_update
@@ -10180,8 +10305,16 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard, 'trigger_confidence': risk_guard.get('trigger_confidence', {'level': 'confirmed', 'score': 1.0, 'factors': []}), 'execution_mode': risk_guard.get('execution_mode', 'taker'), 'execution_size_multiplier': risk_guard.get('execution_size_multiplier', 1.0), 'trigger_state': risk_guard.get('trigger_state', 'confirmed'), 'trigger_gate_action': risk_guard.get('trigger_gate_action', 'execute')}
     if risk_guard['allowed'] and risk_guard.get('execution_mode') in {'maker_probe', 'maker_confirm'}:
         size_multiplier = max(min(float(risk_guard.get('execution_size_multiplier') or 1.0), 1.0), 0.0)
+        original_quantity = max(float(getattr(best_candidate, 'quantity', 0.0) or 0.0), 0.0)
+        adjusted_quantity = original_quantity * size_multiplier
+        last_price = float(getattr(best_candidate, 'last_price', 0.0) or 0.0)
+        min_notional_usdt = max(float(getattr(best_candidate, 'min_notional_usdt', 0.0) or 0.0), 0.0)
+        if last_price > 0.0 and min_notional_usdt > 0.0:
+            min_quantity = min_notional_usdt / last_price
+            if original_quantity >= min_quantity and adjusted_quantity < min_quantity:
+                adjusted_quantity = original_quantity
         updates = {
-            'quantity': max(float(getattr(best_candidate, 'quantity', 0.0) or 0.0) * size_multiplier, 0.0),
+            'quantity': adjusted_quantity,
             'execution_mode_override': 'maker_only',
             'execution_liquidity_grade_override': 'D',
             'execution_degradation_mode': risk_guard.get('execution_mode'),

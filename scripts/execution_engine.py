@@ -64,7 +64,36 @@ def resolve_position_protection_status(
             'matched_via': 'flat',
             'side': position_side,
         }
-    open_orders = fetch_open_orders(client, symbol)
+    def _is_reduce_only(row: Dict[str, Any]) -> bool:
+        value = row.get('reduceOnly')
+        if isinstance(value, bool):
+            return value
+        return str(value or '').strip().lower() == 'true'
+
+    def _order_position_side(row: Dict[str, Any]) -> str:
+        return normalize_position_side(row.get('positionSide') or row.get('position_side') or position_side)
+
+    def _is_stop_protection_order(row: Dict[str, Any]) -> bool:
+        order_type = str(row.get('type') or row.get('origType') or row.get('orderType') or '').upper()
+        return order_type in {'STOP', 'STOP_MARKET', 'TRAILING_STOP_MARKET'}
+
+    def _is_matching_protection(row: Dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get('symbol') or symbol).upper() != str(symbol or '').upper():
+            return False
+        if _order_position_side(row) != position_side:
+            return False
+        if not _is_stop_protection_order(row):
+            return False
+        side_text = str(row.get('side') or '').upper()
+        if position_side == position_side_long and side_text and side_text != 'SELL':
+            return False
+        if position_side != position_side_long and side_text and side_text != 'BUY':
+            return False
+        return _is_reduce_only(row) or row.get('closePosition') is True or str(row.get('closePosition') or '').lower() == 'true' or str(row.get('orderType') or '').upper() == 'STOP_MARKET'
+
+    open_orders = [row for row in fetch_open_orders(client, symbol) if _is_matching_protection(row)]
     matched = None
     matched_via = 'unmatched'
     matched_trigger_price = None
@@ -77,7 +106,7 @@ def resolve_position_protection_status(
         matched = open_orders[0]
         matched_via = 'open_orders'
     if matched is None:
-        open_algo_orders = fetch_open_algo_orders(client, symbol)
+        open_algo_orders = [row for row in fetch_open_algo_orders(client, symbol) if _is_matching_protection(row)]
         if expected_client_algo_id:
             candidates = [row for row in open_algo_orders if row.get('clientAlgoId') == expected_client_algo_id]
             if expected_trigger_price > 0:
@@ -433,7 +462,9 @@ def place_live_trade(
         raise binance_api_error(error_payload['message'])
     entry_order_error: Optional[Exception] = None
     entry_position_mode = 'HEDGE' if should_send_position_side(client) else 'ONE_WAY'
-    execution_mode = str(execution_quality.get('execution_mode') or ('maker_only' if execution_quality.get('execution_liquidity_grade') == 'D' else 'taker')).lower()
+    requested_execution_mode = str(execution_quality.get('execution_mode') or 'maker_only').lower()
+    allow_taker_entry = bool(getattr(args, 'allow_taker_entry', False))
+    execution_mode = requested_execution_mode if requested_execution_mode == 'maker_only' or allow_taker_entry else 'maker_only'
     entry_side = 'SELL' if position_side != position_side_long else 'BUY'
     entry_params = {
         'symbol': candidate.symbol,
@@ -457,16 +488,19 @@ def place_live_trade(
         entry_params.update({'type': 'LIMIT', 'timeInForce': 'GTX', 'price': format_decimal(maker_price, price_precision)})
     if should_send_position_side(client):
         entry_params['positionSide'] = position_side
+    started_at = time_module.time()
     try:
         entry_order = client.signed_post('/fapi/v1/order', entry_params)
         if execution_mode == 'maker_only':
             order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else None
             client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None
             timeout_seconds = max(float(getattr(args, 'maker_only_timeout_seconds', 10.0) or 10.0), 0.0)
-            retry_count = max(int(getattr(args, 'maker_only_max_retries', 2) or 2), 0)
-            started_at = time_module.time()
+            retry_count = min(max(int(getattr(args, 'maker_only_max_retries', 2) or 2), 0), 2)
             confirmed = entry_order
             for attempt in range(retry_count + 1):
+                status = str(entry_order.get('status') or '').upper() if isinstance(entry_order, dict) else ''
+                if _to_float(entry_order.get('executedQty'), default=0.0) > 0 or status in {'FILLED', 'PARTIALLY_FILLED'}:
+                    break
                 while time_module.time() - started_at <= timeout_seconds:
                     confirmed = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id)
                     status = str(confirmed.get('status') or '').upper()

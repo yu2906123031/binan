@@ -57,6 +57,10 @@ def num(value):
         return 0.0
 
 
+def rounded(value):
+    return round(float(value), 10)
+
+
 def fetch_income(start_ms, end_ms):
     rows = []
     cursor = start_ms
@@ -88,6 +92,174 @@ def fetch_symbol_pages(path, symbol, start_ms, end_ms):
         cursor = max_time + 1
         time.sleep(0.15)
     return rows
+
+
+def compute_order_quality(trades_by_symbol, orders_by_symbol):
+    market_order_count = 0
+    limit_order_count = 0
+    canceled_limit_count = 0
+    cancel_replace_count_by_symbol = defaultdict(int)
+    taker_trade_count = 0
+    maker_trade_count = 0
+    taker_fee = 0.0
+    total_fee = 0.0
+    avg_hold_seconds_by_symbol = {}
+    fast_stop_count_by_symbol = defaultdict(int)
+
+    for symbol, orders in (orders_by_symbol or {}).items():
+        ordered = sorted(orders or [], key=lambda row: int(row.get("updateTime") or row.get("time") or 0))
+        last_canceled_limit = False
+        for row in ordered:
+            order_type = str(row.get("type") or "").upper()
+            status = str(row.get("status") or "").upper()
+            if order_type == "MARKET":
+                market_order_count += 1
+            if "LIMIT" in order_type:
+                limit_order_count += 1
+                if status == "CANCELED":
+                    canceled_limit_count += 1
+                    last_canceled_limit = True
+                    continue
+            if last_canceled_limit and status in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                cancel_replace_count_by_symbol[symbol] += 1
+            last_canceled_limit = False
+
+    for symbol, trades in (trades_by_symbol or {}).items():
+        ordered = sorted(trades or [], key=lambda row: int(row.get("time") or 0))
+        entry_time = None
+        hold_seconds = []
+        for row in ordered:
+            fee = abs(num(row.get("commission")))
+            total_fee += fee
+            if bool(row.get("maker")):
+                maker_trade_count += 1
+            else:
+                taker_trade_count += 1
+                taker_fee += fee
+            realized = num(row.get("realizedPnl", row.get("realized_pnl")))
+            ts = int(row.get("time") or 0)
+            if abs(realized) < 1e-12 and entry_time is None:
+                entry_time = ts
+            elif realized != 0 and entry_time is not None:
+                held = max((ts - entry_time) / 1000.0, 0.0)
+                hold_seconds.append(held)
+                if realized < 0 and held <= 300:
+                    fast_stop_count_by_symbol[symbol] += 1
+                entry_time = None
+        if hold_seconds:
+            avg_hold_seconds_by_symbol[symbol] = rounded(sum(hold_seconds) / len(hold_seconds))
+
+    return {
+        "market_order_count": market_order_count,
+        "limit_order_count": limit_order_count,
+        "canceled_limit_count": canceled_limit_count,
+        "cancel_replace_count_by_symbol": dict(sorted(cancel_replace_count_by_symbol.items())),
+        "taker_trade_count": taker_trade_count,
+        "maker_trade_count": maker_trade_count,
+        "taker_fee_ratio": rounded(taker_fee / total_fee) if total_fee else 0.0,
+        "avg_hold_seconds_by_symbol": dict(sorted(avg_hold_seconds_by_symbol.items())),
+        "fast_stop_count": int(sum(fast_stop_count_by_symbol.values())),
+        "fast_stop_count_by_symbol": dict(sorted(fast_stop_count_by_symbol.items())),
+    }
+
+
+def build_summary(*, now, start, records, income, positions, trades_by_symbol, orders_by_symbol, symbols):
+    source_counts = Counter(r["source"] for r in records)
+    event_counts = Counter(str(r.get("event_type")) for r in records)
+    symbol_counts = Counter(r.get("symbol") or "" for r in records)
+    realized_by_symbol = defaultdict(float)
+    commission_by_symbol = defaultdict(float)
+    income_by_type = defaultdict(float)
+    for row in income:
+        income_type = row.get("incomeType") or ""
+        value = num(row.get("income"))
+        income_by_type[income_type] += value
+        if income_type == "REALIZED_PNL":
+            realized_by_symbol[row.get("symbol") or ""] += value
+        if income_type == "COMMISSION":
+            commission_by_symbol[row.get("symbol") or ""] += value
+
+    open_positions = [row for row in positions if num(row.get("positionAmt")) != 0]
+    unrealized_by_symbol = {
+        row["symbol"]: rounded(num(row.get("unRealizedProfit", row.get("unrealizedProfit"))))
+        for row in open_positions
+    }
+    realized_pnl = income_by_type.get("REALIZED_PNL", 0.0)
+    commission = income_by_type.get("COMMISSION", 0.0)
+    funding_fee = income_by_type.get("FUNDING_FEE", 0.0)
+    open_unrealized = sum(unrealized_by_symbol.values())
+    return {
+        "generated_at": now.isoformat().replace("+00:00", "Z"),
+        "window_start": start.isoformat().replace("+00:00", "Z"),
+        "window_end": now.isoformat().replace("+00:00", "Z"),
+        "source": "Binance USDT-M Futures REST API: income, userTrades, allOrders",
+        "symbols": symbols,
+        "record_count": len(records),
+        "source_counts": dict(source_counts),
+        "event_type_counts": dict(event_counts),
+        "symbol_record_counts": dict(symbol_counts),
+        "income_by_type_usdt": dict(sorted((k, rounded(v)) for k, v in income_by_type.items())),
+        "realized_pnl_by_symbol_usdt": dict(sorted((k, rounded(v)) for k, v in realized_by_symbol.items())),
+        "commission_by_symbol_usdt": dict(sorted((k, rounded(v)) for k, v in commission_by_symbol.items())),
+        "realized_pnl_usdt": rounded(realized_pnl),
+        "commission_usdt": rounded(commission),
+        "funding_fee_usdt": rounded(funding_fee),
+        "net_realized_after_fee_usdt": rounded(realized_pnl + commission + funding_fee),
+        "open_position_symbols": [row["symbol"] for row in open_positions],
+        "open_position_symbols_at_export": [row["symbol"] for row in open_positions],
+        "unrealized_pnl_by_symbol_usdt": unrealized_by_symbol,
+        "open_position_unrealized_pnl_usdt": rounded(open_unrealized),
+        "estimated_total_pnl_usdt": rounded(realized_pnl + commission + funding_fee + open_unrealized),
+        "order_quality": compute_order_quality(trades_by_symbol, orders_by_symbol),
+    }
+
+
+def render_markdown(summary):
+    lines = [
+        "# Binance Futures trade records — last 5 days",
+        "",
+        f"- Generated at: `{summary['generated_at']}`",
+        f"- Window start: `{summary['window_start']}`",
+        f"- Window end: `{summary['window_end']}`",
+        f"- Source: {summary['source']}",
+        f"- Total records: `{summary['record_count']}`",
+        f"- Symbols: `{', '.join(summary['symbols']) if summary['symbols'] else 'none'}`",
+        f"- realized_pnl: `{summary['realized_pnl_usdt']:.8f}`",
+        f"- commission: `{summary['commission_usdt']:.8f}`",
+        f"- funding_fee: `{summary['funding_fee_usdt']:.8f}`",
+        f"- net_realized_after_fee: `{summary['net_realized_after_fee_usdt']:.8f}`",
+        f"- open_position_symbols: `{', '.join(summary['open_position_symbols']) if summary['open_position_symbols'] else 'none'}`",
+        f"- open_position_unrealized_pnl: `{summary['open_position_unrealized_pnl_usdt']:.8f}`",
+        f"- estimated_total_pnl: `{summary['estimated_total_pnl_usdt']:.8f}`",
+        "",
+        "## Source counts",
+    ]
+    for key, value in sorted(summary["source_counts"].items()):
+        lines.append(f"- `{key}`: `{value}`")
+    lines += ["", "## Income by type (USDT)"]
+    for key, value in sorted(summary["income_by_type_usdt"].items()):
+        lines.append(f"- `{key}`: `{value:.8f}`")
+    lines += ["", "## Realized PnL by symbol (USDT)"]
+    for key, value in sorted(summary["realized_pnl_by_symbol_usdt"].items()):
+        lines.append(f"- `{key}`: `{value:.8f}`")
+    lines += ["", "## Commission by symbol (USDT)"]
+    for key, value in sorted(summary["commission_by_symbol_usdt"].items()):
+        lines.append(f"- `{key}`: `{value:.8f}`")
+    lines += ["", "## Open position unrealized PnL (USDT)"]
+    for key, value in sorted(summary["unrealized_pnl_by_symbol_usdt"].items()):
+        lines.append(f"- `{key}`: `{value:.8f}`")
+    lines += ["", "## Order quality"]
+    quality = summary["order_quality"]
+    for key in ["market_order_count", "limit_order_count", "canceled_limit_count", "taker_trade_count", "maker_trade_count", "taker_fee_ratio", "fast_stop_count"]:
+        lines.append(f"- `{key}`: `{quality.get(key)}`")
+    lines.append("- `cancel_replace_count_by_symbol`:")
+    for key, value in sorted(quality.get("cancel_replace_count_by_symbol", {}).items()):
+        lines.append(f"  - `{key}`: `{value}`")
+    lines.append("- `avg_hold_seconds_by_symbol`:")
+    for key, value in sorted(quality.get("avg_hold_seconds_by_symbol", {}).items()):
+        lines.append(f"  - `{key}`: `{value}`")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main():
@@ -170,61 +342,18 @@ def main():
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
-    source_counts = Counter(r["source"] for r in records)
-    event_counts = Counter(str(r.get("event_type")) for r in records)
-    symbol_counts = Counter(r.get("symbol") or "" for r in records)
-    realized_by_symbol = defaultdict(float)
-    commission_by_symbol = defaultdict(float)
-    income_by_type = defaultdict(float)
-    for row in income:
-        income_by_type[row.get("incomeType") or ""] += num(row.get("income"))
-        if row.get("incomeType") == "REALIZED_PNL":
-            realized_by_symbol[row.get("symbol") or ""] += num(row.get("income"))
-        if row.get("incomeType") == "COMMISSION":
-            commission_by_symbol[row.get("symbol") or ""] += num(row.get("income"))
-
-    summary = {
-        "generated_at": now.isoformat().replace("+00:00", "Z"),
-        "window_start": start.isoformat().replace("+00:00", "Z"),
-        "window_end": now.isoformat().replace("+00:00", "Z"),
-        "source": "Binance USDT-M Futures REST API: income, userTrades, allOrders",
-        "symbols": symbols,
-        "record_count": len(records),
-        "source_counts": dict(source_counts),
-        "event_type_counts": dict(event_counts),
-        "symbol_record_counts": dict(symbol_counts),
-        "income_by_type_usdt": dict(sorted(income_by_type.items())),
-        "realized_pnl_by_symbol_usdt": dict(sorted(realized_by_symbol.items())),
-        "commission_by_symbol_usdt": dict(sorted(commission_by_symbol.items())),
-        "open_position_symbols_at_export": [row["symbol"] for row in positions if num(row.get("positionAmt")) != 0],
-    }
+    summary = build_summary(
+        now=now,
+        start=start,
+        records=records,
+        income=income,
+        positions=positions,
+        trades_by_symbol=trades_by_symbol,
+        orders_by_symbol=orders_by_symbol,
+        symbols=symbols,
+    )
     summary_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    lines = [
-        "# Binance Futures trade records — last 5 days",
-        "",
-        f"- Generated at: `{summary['generated_at']}`",
-        f"- Window start: `{summary['window_start']}`",
-        f"- Window end: `{summary['window_end']}`",
-        f"- Source: {summary['source']}",
-        f"- Total records: `{len(records)}`",
-        f"- Symbols: `{', '.join(symbols) if symbols else 'none'}`",
-        "",
-        "## Source counts",
-    ]
-    for key, value in sorted(source_counts.items()):
-        lines.append(f"- `{key}`: `{value}`")
-    lines += ["", "## Income by type (USDT)"]
-    for key, value in sorted(income_by_type.items()):
-        lines.append(f"- `{key}`: `{value:.8f}`")
-    lines += ["", "## Realized PnL by symbol (USDT)"]
-    for key, value in sorted(realized_by_symbol.items()):
-        lines.append(f"- `{key}`: `{value:.8f}`")
-    lines += ["", "## Commission by symbol (USDT)"]
-    for key, value in sorted(commission_by_symbol.items()):
-        lines.append(f"- `{key}`: `{value:.8f}`")
-    lines.append("")
-    summary_md_path.write_text("\n".join(lines), encoding="utf-8")
+    summary_md_path.write_text(render_markdown(summary), encoding="utf-8")
 
     print(json.dumps({"jsonl": str(jsonl_path), "summary_json": str(summary_json_path), "summary_md": str(summary_md_path), "record_count": len(records), "symbols": symbols}, ensure_ascii=False, indent=2))
 

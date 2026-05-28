@@ -81,6 +81,8 @@ def finalize_candidate_construction(
     expected_total_fee_pct: Optional[float] = None,
     execution_slippage_buffer_pct: Optional[float] = None,
     min_profit_buffer_pct: Optional[float] = None,
+    min_notional_usdt: float = 0.0,
+    max_notional_usdt: float = 0.0,
 ):
     if expected_total_fee_pct is None:
         expected_total_fee_pct = max(_safe_float(legacy_kwargs.get('expected_total_fee_pct'), default=0.16), 0.0)
@@ -167,6 +169,8 @@ def finalize_candidate_construction(
         expected_total_fee_pct=expected_total_fee_pct,
         execution_slippage_buffer_pct=execution_slippage_buffer_pct,
         min_profit_buffer_pct=min_profit_buffer_pct,
+        min_notional_usdt=float(min_notional_usdt or 0.0),
+        max_notional_usdt=float(max_notional_usdt or 0.0),
         book_depth_fill_ratio=book_depth_fill_ratio,
         liquidity_grade=liquidity_grade,
         loser_rank=loser_rank,
@@ -796,6 +800,8 @@ def build_candidate(
         expected_total_fee_pct=expected_total_fee_pct,
         execution_slippage_buffer_pct=execution_slippage_buffer_pct,
         min_profit_buffer_pct=min_profit_buffer_pct,
+        min_notional_usdt=float(min_notional_usdt or 0.0),
+        max_notional_usdt=float(max_notional_usdt or 0.0),
         book_depth_fill_ratio=book_depth_fill_ratio,
         liquidity_grade=liquidity_grade,
         funding_rate_threshold=funding_rate_threshold,

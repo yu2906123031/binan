@@ -58,6 +58,44 @@ def make_bearish_ticker():
     }
 
 
+def test_build_probe_candidate_keeps_configured_notional_floor():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=0.2,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.0,
+        acceleration_ratio_5m_vs_15m=1.0,
+        breakout_level=0.19,
+        recent_swing_low=0.18,
+        stop_price=0.18,
+        quantity=100.0,
+        risk_per_unit=0.02,
+        recommended_leverage=10,
+        rsi_5m=70.0,
+        volume_multiple=1.5,
+        distance_from_ema20_5m_pct=1.0,
+        distance_from_vwap_15m_pct=1.0,
+        higher_tf_summary='1h uptrend',
+        score=72.0,
+        reasons=['candidate_trigger_not_fired'],
+        position_size_pct=24.0,
+        min_notional_usdt=20.0,
+        max_notional_usdt=30.0,
+    )
+
+    probe = mod.build_probe_candidate(candidate, 0.3)
+
+    assert probe.probe_entry is True
+    assert probe.quantity * probe.last_price >= 20.0
+    assert probe.quantity * probe.last_price <= 30.0
+    assert 'sim_probe_notional_floor=20.00' in probe.reasons
+
+
 def test_compute_expected_slippage_r_and_execution_grade():
     candidate = mod.Candidate(
         symbol='TESTUSDT',
@@ -3840,7 +3878,7 @@ def test_place_initial_stop_with_retries_supports_short_longer_retry_chain(monke
     assert calls == [
         ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
         ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
-        ('/fapi/v1/order', {'symbol': 'TESTUSDT', 'side': 'BUY', 'type': 'MARKET', 'quantity': '6.5', 'newOrderRespType': 'RESULT', 'positionSide': 'LONG'}),
+        ('/fapi/v1/order', {'symbol': 'TESTUSDT', 'side': 'BUY', 'type': 'LIMIT', 'quantity': '6.5', 'newOrderRespType': 'RESULT', 'timeInForce': 'GTX', 'price': '100.00', 'positionSide': 'LONG'}),
     ]
 
 
