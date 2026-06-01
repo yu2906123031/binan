@@ -751,8 +751,8 @@ def test_compute_market_regime_filter_blocks_when_btc_and_sol_both_break_down():
     payload = mod.compute_market_regime_filter(btc_klines=btc, sol_klines=sol)
 
     assert payload['risk_on'] is False
-    assert payload['score_multiplier'] == 0.55
-    assert payload['label'] == 'risk_off'
+    assert payload['score_multiplier'] == 0.6
+    assert payload['label'] == 'PANIC'
     assert 'btc_trend_down' in payload['reasons']
     assert 'btc_momentum_breakdown' in payload['reasons']
     assert 'sol_trend_down' in payload['reasons']
@@ -1231,6 +1231,133 @@ def test_run_loop_records_rejection_event_when_max_open_positions_blocks_trade(m
     assert rows[-1]['event_type'] == 'candidate_rejected'
     assert rows[-1]['symbol'] == 'TESTUSDT'
     assert rows[-1]['reasons'] == ['max_open_positions_reached']
+
+
+def test_run_loop_counts_pending_opening_orders_toward_max_open_positions(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        max_open_positions=2,
+        profile='test',
+        auto_loop=False,
+        disable_notify=True,
+        notify_target='',
+        require_book_ticker_ws=False,
+    )
+    candidate = mod.Candidate(
+        symbol='NEWUSDT', last_price=10.0, price_change_pct_24h=10.0, quote_volume_24h=80_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0, acceleration_ratio_5m_vs_15m=1.4, breakout_level=9.0,
+        recent_swing_low=8.0, stop_price=7.0, quantity=1.0, risk_per_unit=1.0,
+        recommended_leverage=3, rsi_5m=67.0, volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0, distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'}, score=72.0, reasons=['candidate_selected'],
+        state='launch', state_reasons=['impulse_ready'],
+    )
+    placed = []
+
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(mod, 'reconcile_positions_and_orders', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'NEWUSDT'}]}, candidate, {'NEWUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'XRPUSDT', 'positionAmt': '46.9', 'positionSide': 'LONG'}])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client: [{'symbol': 'NEARUSDT', 'side': 'SELL', 'type': 'LIMIT', 'reduceOnly': False, 'positionSide': 'SHORT'}])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client: [])
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: placed.append(True))
+
+    result = mod.run_loop(client=object(), args=args)
+
+    assert placed == []
+    cycle = result['cycles'][0]
+    assert len(cycle['live_skipped_due_to_projected_positions']) == 2
+    assert cycle['pending_opening_orders_count'] == 1
+
+
+def test_scan_only_cycle_counts_pending_opening_orders_toward_max_open_positions(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = argparse.Namespace(
+        reconcile_only=False,
+        halt_on_orphan_position=False,
+        repair_missing_protection=False,
+        daily_max_loss_usdt=0.0,
+        max_consecutive_losses=0,
+        symbol_cooldown_minutes=0,
+        live=True,
+        scan_only=False,
+        max_open_positions=2,
+        max_long_positions=0,
+        max_short_positions=0,
+        max_net_exposure_usdt=0.0,
+        max_gross_exposure_usdt=0.0,
+        per_symbol_single_side_only=True,
+        opposite_side_flip_cooldown_minutes=0,
+        profile='test',
+        disable_notify=True,
+        notify_target='',
+        require_book_ticker_ws=False,
+        diagnostic_trading_mode=False,
+        scanner_timeout_seconds=10.0,
+        position_order_reconcile_interval_seconds=0.0,
+    )
+    candidate = mod.Candidate(
+        symbol='NEWUSDT', last_price=10.0, price_change_pct_24h=10.0, quote_volume_24h=80_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=2.0, acceleration_ratio_5m_vs_15m=1.4, breakout_level=9.0,
+        recent_swing_low=8.0, stop_price=7.0, quantity=1.0, risk_per_unit=1.0,
+        recommended_leverage=3, rsi_5m=67.0, volume_multiple=1.8,
+        distance_from_ema20_5m_pct=3.0, distance_from_vwap_15m_pct=2.4,
+        higher_tf_summary={'1h': 'up'}, score=72.0, reasons=['candidate_selected'],
+        state='launch', state_reasons=['impulse_ready'],
+    )
+
+    monkeypatch.setattr(mod, 'cleanup_symbol_runtime_state_ttl', lambda *a, **k: None)
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda store: {'state': 'CLOSED', 'rest_used_weight_1m': 0, 'next_retry_after_seconds': 0})
+    monkeypatch.setattr(mod, 'reconcile_runtime_state', lambda *a, **k: {'ok': True, 'orphan_positions': [], 'positions_missing_protection': []})
+    monkeypatch.setattr(mod, 'reconcile_positions_and_orders', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
+    monkeypatch.setattr(mod, 'run_scan_once', lambda *a, **k: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'NEWUSDT'}]}, candidate, {'NEWUSDT': make_meta()}))
+    monkeypatch.setattr(mod, 'load_risk_state', lambda _store: mod.default_risk_state())
+    monkeypatch.setattr(mod, 'evaluate_risk_guards', lambda **kwargs: {'allowed': True, 'reasons': [], 'cooldown_until': None, 'normalized_risk_state': mod.default_risk_state()})
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'XRPUSDT', 'positionAmt': '46.9', 'positionSide': 'LONG'}])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client: [{'symbol': 'NEARUSDT', 'side': 'SELL', 'type': 'LIMIT', 'reduceOnly': False, 'positionSide': 'SHORT'}])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client: [])
+
+    result = mod.scan_only_cycle(client=object(), args=args, store=store, cycle_no=1)
+
+    assert 'execution_request' not in result
+    cycle = result['cycle']
+    assert len(cycle['live_skipped_due_to_projected_positions']) == 2
+    assert cycle['open_positions_count'] == 1
+    assert cycle['pending_opening_orders_count'] == 1
+    assert result['manager_update']['reason'] == 'max_open_positions_reached'
+
+
+def test_reconcile_positions_and_orders_cancels_opening_orders_when_projected_position_cap_exceeded(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    cancelled = []
+    orders = [
+        {'symbol': 'NEARUSDT', 'side': 'SELL', 'type': 'LIMIT', 'reduceOnly': False, 'orderId': 1, 'positionSide': 'SHORT'},
+        {'symbol': 'UNIUSDT', 'side': 'SELL', 'type': 'LIMIT', 'reduceOnly': False, 'orderId': 2, 'positionSide': 'SHORT'},
+    ]
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'XRPUSDT', 'positionAmt': '46.9', 'positionSide': 'LONG'}])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client: orders)
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client: [])
+    monkeypatch.setattr(mod, 'cancel_open_order', lambda client, order: cancelled.append(order['symbol']) or {'ok': True})
+
+    result = mod.reconcile_positions_and_orders(object(), store, max_open_positions=2)
+
+    assert result['projected_positions'] == 3
+    assert result['cap_opening_order_detected'] == 2
+    assert result['cap_opening_order_cancelled'] == 2
+    assert cancelled == ['NEARUSDT', 'UNIUSDT']
 
 
 def test_run_loop_okx_simulated_reconcile_clears_stale_position_before_max_open_check(monkeypatch, tmp_path):
@@ -6724,6 +6851,108 @@ def test_run_scan_once_ticker_rest_fallback_called_once_when_patch_missing(tmp_p
     assert payload['funnel']['symbols_skipped_due_to_missing_ticker_24hr'] >= 1
 
 
+def test_run_scan_once_limits_low_frequency_microstructure_to_top_10(tmp_path, monkeypatch):
+    symbols = [f'T{i}USDT' for i in range(12)]
+    args = _ticker_args(
+        runtime_state_dir=str(tmp_path),
+        max_candidates=12,
+        top_gainers=12,
+        scan_prefilter_multiplier=1,
+        min_quote_volume=0,
+        min_5m_change_pct=0,
+        book_ticker_rest_fallback=False,
+    )
+    store = mod.RuntimeStateStore(str(tmp_path))
+    monkeypatch.setattr(mod, 'get_runtime_state_store', lambda _args: store)
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'fetch_exchange_meta', lambda client: {symbol: make_meta() for symbol in symbols})
+    monkeypatch.setattr(mod, 'fetch_tickers', lambda client: [
+        {'symbol': symbol, 'priceChangePercent': str(20 - idx), 'quoteVolume': '1000000', 'lastPrice': '100'}
+        for idx, symbol in enumerate(symbols)
+    ])
+    monkeypatch.setattr(mod, '_runtime_store_rest_guard_snapshot', lambda _store: {'state': 'CLOSED', 'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 100})
+    monkeypatch.setattr(mod, 'merged_candidate_symbols', lambda **kwargs: (symbols, {}, {symbol: idx + 1 for idx, symbol in enumerate(symbols)}))
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'risk_on', 'momentum_flags': {}})
+    monkeypatch.setattr(mod, 'resolve_scan_klines', lambda *args, **kwargs: [make_kline(1, 1, 1, 1) for _ in range(40)])
+    calls = {'funding': [], 'oi': [], 'ratio': [], 'order_book': [], 'book_ticker': []}
+    monkeypatch.setattr(mod, 'fetch_funding_rates', lambda _client, symbol, limit=3: calls['funding'].append(symbol) or [])
+    monkeypatch.setattr(mod, 'fetch_open_interest_hist', lambda _client, symbol, period='5m', limit=30: calls['oi'].append(symbol) or [])
+    monkeypatch.setattr(mod, 'fetch_top_account_long_short_ratio', lambda _client, symbol, period='5m', limit=10: calls['ratio'].append(symbol) or [])
+    monkeypatch.setattr(mod, 'resolve_scan_order_book', lambda _client, _store, _args, symbol, limit=20: calls['order_book'].append(symbol) or {'bids': [], 'asks': []})
+    monkeypatch.setattr(mod, 'collect_book_ticker_samples', lambda _client, symbol, **kwargs: calls['book_ticker'].append(symbol) or [])
+    monkeypatch.setattr(mod, 'build_candidate', lambda *args, **kwargs: None)
+
+    mod.run_scan_once(client=object(), args=args)
+
+    for called_symbols in calls.values():
+        assert set(called_symbols).issubset(set(symbols))
+        assert called_symbols == symbols[:len(called_symbols)]
+        assert len(called_symbols) <= 10
+
+
+class RecordingClient:
+    def __init__(self):
+        self.paths = []
+
+    def get(self, path, params=None, timeout=15, *, purpose='market_data'):
+        self.paths.append(path)
+        if path == '/fapi/v1/ticker/24hr':
+            return [{'symbol': 'BTCUSDT', 'priceChangePercent': '1', 'quoteVolume': '1000000', 'lastPrice': '100'}]
+        if path == '/fapi/v1/exchangeInfo':
+            return {'symbols': [{
+                'symbol': 'BTCUSDT', 'pricePrecision': 2, 'quantityPrecision': 3, 'quoteAsset': 'USDT', 'status': 'TRADING', 'contractType': 'PERPETUAL',
+                'filters': [{'filterType': 'PRICE_FILTER', 'tickSize': '0.01'}, {'filterType': 'LOT_SIZE', 'stepSize': '0.001', 'minQty': '0.001'}],
+            }]}
+        if path == '/fapi/v1/klines':
+            return [make_kline(1, 1, 1, 1) for _ in range(40)]
+        if path == '/fapi/v1/fundingRate':
+            return []
+        if path in {'/futures/data/openInterestHist', '/futures/data/topLongShortAccountRatio'}:
+            return []
+        if path == '/fapi/v1/depth':
+            return {'bids': [], 'asks': []}
+        if path == '/fapi/v1/ticker/bookTicker':
+            return {'symbol': (params or {}).get('symbol', 'BTCUSDT'), 'bidPrice': '99', 'askPrice': '101', 'bidQty': '1', 'askQty': '1'}
+        return []
+
+
+def test_run_scan_once_never_uses_agg_trades_for_market_scan(tmp_path, monkeypatch):
+    args = _ticker_args(
+        runtime_state_dir=str(tmp_path),
+        max_candidates=1,
+        top_gainers=1,
+        scan_prefilter_multiplier=1,
+        min_quote_volume=0,
+        min_5m_change_pct=0,
+        book_ticker_rest_fallback=False,
+    )
+    monkeypatch.setattr(mod, 'load_manual_square_symbols', lambda _args: [])
+    monkeypatch.setattr(mod, 'compute_market_regime_filter', lambda **kwargs: {'risk_on': True, 'score_multiplier': 1.0, 'reasons': [], 'label': 'risk_on', 'momentum_flags': {}})
+    monkeypatch.setattr(mod, 'build_candidate', lambda *args, **kwargs: None)
+    client = RecordingClient()
+
+    mod.run_scan_once(client=client, args=args)
+
+    assert '/fapi/v1/aggTrades' not in client.paths
+
+
+def test_micro_scalp_score_breakdown_contains_core_signal_fields():
+    candidate = SimpleNamespace(
+        volume_multiple=2.4, recent_5m_change_pct=0.3, spread_bps=1.2,
+        distance_from_ema20_5m_pct=0.1, distance_from_vwap_15m_pct=0.1,
+        oi_change_pct_5m=0.7, cvd_delta=1.4, entry_distance_from_breakout_pct=0.2,
+        funding_rate=0.0002,
+    )
+
+    breakdown = mod.compute_micro_scalp_score_breakdown(candidate)
+
+    assert set(mod.MICRO_SCALP_SCORE_KEYS).issubset(breakdown)
+    assert breakdown['volume_spike_score'] > 0
+    assert breakdown['oi_delta_score'] > 0
+    assert breakdown['cvd_alignment_score'] > 0
+    assert breakdown['funding_crowding_score'] > 0
+
+
 def test_reconcile_runtime_state_materializes_exchange_position_and_repairs_missing_protection(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     client = SimpleNamespace()
@@ -7078,3 +7307,48 @@ def test_trade_memory_adjusts_candidate_score_for_matching_bucket(tmp_path):
     assert adjusted.score == 78.0
     assert adjusted.trade_memory_adjustment == -6.0
     assert any(reason.startswith('trade_memory_bucket=poor') for reason in adjusted.reasons)
+
+def test_position_reconcile_interval_honors_60_second_live_safety_cadence():
+    args = argparse.Namespace(position_order_reconcile_interval_seconds=60.0)
+
+    assert mod.compute_position_order_reconcile_interval_seconds(args) == 60.0
+
+
+def test_hard_max_loss_guard_halts_from_exchange_and_runtime_truth(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'hard_max_loss_usdt': 4.0,
+        }
+    })
+    exchange_positions = [{
+        'symbol': 'DOGEUSDT',
+        'positionSide': 'LONG',
+        'positionAmt': '100',
+        'unRealizedProfit': '-4.25',
+    }]
+
+    result = mod.evaluate_hard_max_loss_guard(exchange_positions, store)
+    risk_state = store.load_json('risk_state', {})
+
+    assert result['ok'] is False
+    assert result['hard_max_loss_breaches'] == ['DOGEUSDT:LONG']
+    assert risk_state['halted'] is True
+    assert risk_state['halt_reason'] == 'hard_max_loss:DOGEUSDT:LONG'
+
+
+def test_okx_live_management_failure_is_fatal_and_halts_runtime(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    exc = RuntimeError('OKX reduce-only exit rejected')
+
+    result = mod.handle_okx_live_management_exception(store, 'close_position', exc)
+    risk_state = store.load_json('risk_state', {})
+
+    assert result['ok'] is False
+    assert result['fatal'] is True
+    assert result['halt_reason'] == 'okx_live_management_failure:close_position'
+    assert risk_state['halted'] is True
+    assert risk_state['halt_reason'] == 'okx_live_management_failure:close_position'

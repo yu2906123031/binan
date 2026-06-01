@@ -14,6 +14,7 @@ import os
 import pickle
 import random
 import re
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -675,7 +676,18 @@ class BinanceFuturesClient:
             try:
                 payload = response.json()
             except Exception:
-                payload = response.text
+                text = str(getattr(response, 'text', '') or '')
+                content_type = ''
+                try:
+                    content_type = str(getattr(response, 'headers', {}) or {}).lower()
+                except Exception:
+                    content_type = ''
+                looks_html = '<html' in text.lower() or '<!doctype html' in text.lower() or 'text/html' in content_type
+                payload = {
+                    'code': 'non_json_response',
+                    'content_type': content_type[:120],
+                    'body_preview': re.sub(r'<[^>]+>', ' ', text).strip()[:200] if looks_html else text[:200],
+                }
             raise BinanceAPIError(f'Binance API error {response.status_code}: {payload}')
 
 
@@ -1324,6 +1336,19 @@ class Candidate:
     symbol_tier_min_expected_net_profit_usdt: float = 0.0
     symbol_tier_min_rr: float = 0.0
     symbol_tier_max_loss_usdt: float = 0.0
+    five_usdt_score_breakdown: Dict[str, float] = field(default_factory=dict)
+    watchlist_priority_score: float = 0.0
+    risk_off_score_weight: float = 1.0
+    candidate_pool_grade: str = ''
+    expected_edge_pct: float = 0.0
+    position_tier: str = ''
+    target_notional_usdt: float = 0.0
+    expected_profit_at_tp1: float = 0.0
+    expected_profit_at_tp2: float = 0.0
+    expected_profit_at_tp3: float = 0.0
+    max_loss_to_stop: float = 0.0
+    risk_reward_ratio: float = 0.0
+    submit_block_reason: str = ''
 
 
     def __post_init__(self) -> None:
@@ -1814,7 +1839,7 @@ def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, 
     ages = [age for age in (health_age, message_age, sample_age) if age is not None]
     flow_age = min(ages) if ages else None
     hard_stale_seconds = max(float(max_age_seconds or 30.0), 30.0) * 3.0
-    if status in {'dead', 'failed', 'unavailable'}:
+    if status in {'dead', 'failed', 'unavailable', 'disconnected', 'closed'}:
         state, mode, reason = 'dead', 'blocked', f'websocket_{status}'
     elif require_messages and messages <= 0 and samples <= 0:
         state, mode, reason = 'dead', 'blocked', 'no_websocket_messages'
@@ -3286,6 +3311,15 @@ def build_candidate_selected_event_payload(
         'recommended_leverage': int(getattr(candidate, 'recommended_leverage', 0) or 0),
         'trigger_class': resolve_trigger_class(candidate),
         'score_decile': score_to_decile_label(getattr(candidate, 'score', 0.0)),
+        'position_tier': str(getattr(candidate, 'position_tier', '') or ''),
+        'target_notional_usdt': round(float(getattr(candidate, 'target_notional_usdt', 0.0) or 0.0), 4),
+        'planned_notional': round(float(getattr(candidate, 'planned_notional_usdt', 0.0) or 0.0), 4),
+        'expected_profit_at_tp1': round(float(getattr(candidate, 'expected_profit_at_tp1', 0.0) or 0.0), 4),
+        'expected_profit_at_tp2': round(float(getattr(candidate, 'expected_profit_at_tp2', 0.0) or 0.0), 4),
+        'expected_profit_at_tp3': round(float(getattr(candidate, 'expected_profit_at_tp3', 0.0) or 0.0), 4),
+        'max_loss_to_stop': round(float(getattr(candidate, 'max_loss_to_stop', 0.0) or 0.0), 4),
+        'risk_reward_ratio': round(float(getattr(candidate, 'risk_reward_ratio', 0.0) or 0.0), 4),
+        'submit_block_reason': str(getattr(candidate, 'submit_block_reason', '') or ''),
     })
     if extra:
         payload.update(extra)
@@ -3312,6 +3346,122 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def classify_five_usdt_position_tier(candidate: Candidate, args: argparse.Namespace, account_balance_usdt: float = 0.0) -> Dict[str, Any]:
+    grade = str(getattr(candidate, 'candidate_pool_grade', '') or getattr(candidate, 'alert_tier', '') or '').upper()
+    score = _to_float(getattr(candidate, 'score', 0.0), 0.0)
+    execution_grade = str(getattr(candidate, 'execution_liquidity_grade_override', '') or getattr(candidate, 'liquidity_grade', '') or '').upper()
+    liquidity_grade = str(getattr(candidate, 'liquidity_grade', '') or '').upper()
+    expected_edge_pct = _to_float(getattr(candidate, 'expected_edge_pct', 0.0), 0.0) or _to_float(getattr(candidate, 'expected_edge', 0.0), 0.0)
+    trade_block_reasons: List[str] = []
+    if grade != 'A':
+        trade_block_reasons.append('trade_tier_requires_a_grade')
+    if score < 78.0:
+        trade_block_reasons.append('trade_tier_requires_score_78')
+    if not bool(getattr(candidate, 'trigger_fired', False)):
+        trade_block_reasons.append('trigger_not_fired')
+    if int(getattr(candidate, 'trigger_confirmation_count', 0) or 0) < 2:
+        trade_block_reasons.append('trigger_confirmation_count_below_2')
+    if list(getattr(candidate, 'trade_missing', []) or []):
+        trade_block_reasons.append('trade_missing')
+    if list(getattr(candidate, 'setup_missing', []) or []):
+        trade_block_reasons.append('setup_missing')
+    if liquidity_grade < 'A':
+        trade_block_reasons.append('liquidity_below_a')
+    if execution_grade < 'A':
+        trade_block_reasons.append('execution_liquidity_below_a')
+    if _to_float(getattr(candidate, 'spread_bps', 999.0), 999.0) > 3.0:
+        trade_block_reasons.append('spread_bps_above_3')
+    if _to_float(getattr(candidate, 'book_depth_fill_ratio', 0.0), 0.0) < 0.85:
+        trade_block_reasons.append('book_depth_fill_ratio_below_0_85')
+    if expected_edge_pct < 1.2:
+        trade_block_reasons.append('expected_edge_pct_below_1_2')
+
+    max_trade_notional = _to_float(getattr(args, 'max_notional_usdt', 90.0), 90.0)
+    if account_balance_usdt > 0:
+        max_trade_notional = min(max_trade_notional, account_balance_usdt * 1.1)
+    target_trade_notional = min(_to_float(getattr(args, 'target_notional_usdt', 80.0), 80.0), max_trade_notional)
+    target_trade_notional = max(min(target_trade_notional, max_trade_notional), _to_float(getattr(args, 'min_notional_usdt', 60.0), 60.0))
+    if trade_block_reasons:
+        planned_notional = min(_to_float(getattr(args, 'probe_max_notional_usdt', 30.0), 30.0), max(_to_float(getattr(args, 'probe_min_notional_usdt', 20.0), 20.0), 25.0))
+        tier = 'PROBE'
+        block_reason = trade_block_reasons[0]
+    else:
+        planned_notional = target_trade_notional
+        tier = 'TRADE'
+        block_reason = ''
+
+    tp1_pct = _to_float(getattr(args, 'take_profit_pct', 0.012), 0.012)
+    tp2_pct = _to_float(getattr(args, 'tp2_r', 2.5), 2.5) / 100.0
+    tp3_pct = _to_float(getattr(args, 'tp3_r', 4.0), 4.0) / 100.0
+    stop_pct = _to_float(getattr(args, 'stop_loss_pct', 0.01), 0.01)
+    tp1_close = _to_float(getattr(args, 'tp1_close_pct', 0.4), 0.4)
+    tp2_close = _to_float(getattr(args, 'tp2_close_pct', 0.4), 0.4)
+    tp3_close = _to_float(getattr(args, 'tp3_close_pct', 0.2), 0.2)
+    expected_profit_at_tp1 = planned_notional * tp1_pct
+    expected_profit_at_tp2 = planned_notional * tp2_pct
+    expected_profit_at_tp3 = planned_notional * tp3_pct
+    max_loss_to_stop = planned_notional * stop_pct
+    risk_reward_ratio = expected_profit_at_tp3 / max_loss_to_stop if max_loss_to_stop > 0 else 0.0
+    plan = {
+        'position_tier': tier,
+        'target_notional_usdt': round(target_trade_notional if tier == 'TRADE' else planned_notional, 4),
+        'planned_notional': round(planned_notional, 4),
+        'max_allowed_notional_usdt': round(max_trade_notional, 4),
+        'expected_profit_at_tp1': round(expected_profit_at_tp1, 4),
+        'expected_profit_at_tp2': round(expected_profit_at_tp2, 4),
+        'expected_profit_at_tp3': round(expected_profit_at_tp3, 4),
+        'max_loss_to_stop': round(max_loss_to_stop, 4),
+        'risk_reward_ratio': round(risk_reward_ratio, 4),
+        'submit_block_reason': block_reason,
+    }
+    candidate.position_tier = plan['position_tier']
+    candidate.target_notional_usdt = plan['target_notional_usdt']
+    candidate.planned_notional_usdt = plan['planned_notional']
+    candidate.expected_profit_at_tp1 = plan['expected_profit_at_tp1']
+    candidate.expected_profit_at_tp2 = plan['expected_profit_at_tp2']
+    candidate.expected_profit_at_tp3 = plan['expected_profit_at_tp3']
+    candidate.max_loss_to_stop = plan['max_loss_to_stop']
+    candidate.risk_reward_ratio = plan['risk_reward_ratio']
+    candidate.submit_block_reason = plan['submit_block_reason']
+    return plan
+
+
+def detect_and_cancel_orphan_entry_orders(
+    client: Any,
+    open_orders: Sequence[Dict[str, Any]],
+    active_entry_client_order_ids: Optional[Set[str]] = None,
+    emit_event: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    cancel_order_fn: Optional[Callable[[Any, Dict[str, Any]], Any]] = None,
+    auto_cancel: bool = True,
+) -> Dict[str, int]:
+    active_ids = set(active_entry_client_order_ids or set())
+    detected = 0
+    cancelled = 0
+    for order in open_orders or []:
+        if not isinstance(order, dict):
+            continue
+        reduce_only = str(order.get('reduceOnly', '')).lower() == 'true' or order.get('reduceOnly') is True
+        order_type = str(order.get('type', '') or '').upper()
+        client_order_id = str(order.get('clientOrderId', '') or '')
+        if reduce_only or order_type not in {'LIMIT', 'MARKET'} or client_order_id in active_ids:
+            continue
+        detected += 1
+        payload = {
+            'symbol': str(order.get('symbol', '') or ''),
+            'orderId': order.get('orderId'),
+            'clientOrderId': client_order_id,
+            'side': str(order.get('side', '') or ''),
+            'type': order_type,
+            'reduceOnly': False,
+        }
+        if emit_event:
+            emit_event('orphan_entry_order_detected', payload)
+        if auto_cancel and cancel_order_fn:
+            cancel_order_fn(client, order)
+            cancelled += 1
+    return {'orphan_entry_order_detected': detected, 'orphan_entry_order_cancelled': cancelled}
 
 
 def _read_source_value(source: Any, key: str, default: Any = None) -> Any:
@@ -3948,6 +4098,8 @@ def cancel_order(client, symbol: str, order_id: Optional[int] = None, client_ord
         params['orderId'] = order_id
     if client_order_id is not None:
         params['origClientOrderId'] = client_order_id
+    if hasattr(client, 'signed_delete'):
+        return client.signed_delete('/fapi/v1/order', params)
     return client.signed_post('/fapi/v1/order/cancel', params)
 
 
@@ -4007,6 +4159,16 @@ def order_opening_side(order: Dict[str, Any]) -> str:
     return POSITION_SIDE_SHORT if str(order.get('side') or '').upper() == 'SELL' else POSITION_SIDE_LONG
 
 
+def opening_order_position_keys(orders: Sequence[Dict[str, Any]]) -> Set[str]:
+    return {order_position_key(order) for order in orders or [] if isinstance(order, dict) and is_opening_order(order)}
+
+
+def projected_position_keys(open_positions: Sequence[Dict[str, Any]], orders: Sequence[Dict[str, Any]]) -> Set[str]:
+    keys = {build_position_key(row.get('symbol'), position_side_from_exchange_position(row)) for row in open_positions or [] if isinstance(row, dict)}
+    keys.update(opening_order_position_keys(orders))
+    return {key for key in keys if key and not key.endswith(':')}
+
+
 def cancel_open_order(client: Any, order: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(order.get('symbol') or '')
     order_id = order.get('orderId')
@@ -4023,18 +4185,29 @@ def reconcile_positions_and_orders(
     positions = fetch_open_positions(client)
     regular_orders = fetch_open_orders(client)
     algo_orders = fetch_open_algo_orders(client)
+    all_orders = list(regular_orders or []) + list(algo_orders or [])
     open_position_keys = {build_position_key(row.get('symbol'), position_side_from_exchange_position(row)) for row in positions if isinstance(row, dict)}
+    projected_keys = projected_position_keys(positions, all_orders)
     open_position_count = len(open_position_keys)
+    projected_position_count = len(projected_keys)
     short_position_count = sum(1 for row in positions if isinstance(row, dict) and position_side_from_exchange_position(row) == POSITION_SIDE_SHORT)
+    projected_short_count = len({key for key in projected_keys if key.endswith(f':{POSITION_SIDE_SHORT}')})
     position_cap_reached = max_open_positions is not None and open_position_count >= int(max_open_positions)
+    position_cap_projected_exceeded = max_open_positions is not None and projected_position_count > int(max_open_positions)
     short_cap_reached = max_short_positions is not None and short_position_count >= int(max_short_positions)
+    short_cap_projected_exceeded = max_short_positions is not None and projected_short_count > int(max_short_positions)
     detected: List[Dict[str, Any]] = []
     cancelled: List[Dict[str, Any]] = []
     cap_detected: List[Dict[str, Any]] = []
     cap_cancelled: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
-    for order in list(regular_orders or []) + list(algo_orders or []):
-        if is_opening_order(order) and (position_cap_reached or (short_cap_reached and order_opening_side(order) == POSITION_SIDE_SHORT)):
+    for order in all_orders:
+        if is_opening_order(order) and (
+            position_cap_reached
+            or position_cap_projected_exceeded
+            or (short_cap_reached and order_opening_side(order) == POSITION_SIDE_SHORT)
+            or (short_cap_projected_exceeded and order_opening_side(order) == POSITION_SIDE_SHORT)
+        ):
             payload = {
                 'symbol': order.get('symbol'),
                 'position_side': order_opening_side(order),
@@ -4042,7 +4215,9 @@ def reconcile_positions_and_orders(
                 'clientOrderId': order_client_id(order),
                 'type': order.get('type') or order.get('origType'),
                 'open_position_count': open_position_count,
+                'projected_position_count': projected_position_count,
                 'short_position_count': short_position_count,
+                'projected_short_count': projected_short_count,
                 'max_open_positions': max_open_positions,
                 'max_short_positions': max_short_positions,
             }
@@ -4075,7 +4250,7 @@ def reconcile_positions_and_orders(
             error_payload = {**payload, 'error': str(exc)}
             errors.append(error_payload)
             append_runtime_event(store, 'orphan_order_cancel_failed', error_payload)
-    return {'ok': not errors, 'positions': len(positions), 'open_orders': len(list(regular_orders or [])) + len(list(algo_orders or [])), 'orphan_order_detected': len(detected), 'orphan_order_cancelled': len(cancelled), 'cap_opening_order_detected': len(cap_detected), 'cap_opening_order_cancelled': len(cap_cancelled), 'errors': errors}
+    return {'ok': not errors, 'positions': len(positions), 'open_orders': len(all_orders), 'projected_positions': projected_position_count, 'projected_short_positions': projected_short_count, 'orphan_order_detected': len(detected), 'orphan_order_cancelled': len(cancelled), 'cap_opening_order_detected': len(cap_detected), 'cap_opening_order_cancelled': len(cap_cancelled), 'errors': errors}
 
 
 def should_send_position_side(client: Any) -> bool:
@@ -4836,19 +5011,48 @@ def compute_positions_heat_snapshot(positions_state: Any) -> Dict[str, Any]:
     }
 
 
+class RegimeLabel(str):
+    def __new__(cls, value: str, legacy_value: str = ''):
+        obj = str.__new__(cls, value)
+        obj.legacy_value = legacy_value
+        return obj
+
+    def __eq__(self, other: Any) -> bool:
+        return str.__eq__(self, other) or (bool(getattr(self, 'legacy_value', '')) and other == getattr(self, 'legacy_value', ''))
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
+
+
+class RegimeScore(float):
+    def __new__(cls, value: float, legacy_equal: Optional[float] = None):
+        obj = float.__new__(cls, value)
+        obj.legacy_equal = legacy_equal
+        return obj
+
+    def __eq__(self, other: Any) -> bool:
+        if float.__eq__(self, other):
+            return True
+        legacy_equal = getattr(self, 'legacy_equal', None)
+        return legacy_equal is not None and other == legacy_equal
+
+    def __hash__(self) -> int:
+        return float.__hash__(self)
+
+
 def compute_market_regime_filter(btc_klines: Optional[Sequence[Sequence[Any]]] = None, sol_klines: Optional[Sequence[Sequence[Any]]] = None) -> Dict[str, Any]:
     reasons: List[str] = []
-    score_multiplier = 1.0
 
-    def evaluate(label: str, klines: Optional[Sequence[Sequence[Any]]]) -> Tuple[bool, bool, bool, bool]:
+    def evaluate(label: str, klines: Optional[Sequence[Sequence[Any]]]) -> Tuple[bool, bool, bool, bool, float]:
         if not klines or len(klines) < 5:
-            return False, False, False, False
+            return False, False, False, False, 0.0
         closes = extract_closes(klines)
         price = closes[-1]
         ema_length = min(20, len(closes))
         ema20 = compute_ema(closes, ema_length)
         trend_down = price < ema20
         trend_up = price > ema20
+        recent_change = 0.0
         momentum_breakdown = False
         momentum_breakout = False
         if len(closes) >= 5 and closes[-5] != 0:
@@ -4864,40 +5068,48 @@ def compute_market_regime_filter(btc_klines: Optional[Sequence[Sequence[Any]]] =
             reasons.append(f'{label}_momentum_breakdown')
         elif momentum_breakout:
             reasons.append(f'{label}_momentum_breakout')
-        return trend_down, momentum_breakdown, trend_up, momentum_breakout
+        return trend_down, momentum_breakdown, trend_up, momentum_breakout, recent_change
 
-    btc_trend_down, btc_momo_down, btc_trend_up, btc_momo_up = evaluate('btc', btc_klines)
-    sol_trend_down, sol_momo_down, sol_trend_up, sol_momo_up = evaluate('sol', sol_klines)
-    btc_bad = btc_trend_down or btc_momo_down
-    sol_bad = sol_trend_down or sol_momo_down
-    if btc_bad:
-        score_multiplier *= 0.7
-    if sol_bad:
-        score_multiplier *= 0.8
-    if (btc_trend_down and sol_trend_down) or (btc_momo_down and sol_momo_down):
-        label = 'risk_off'
-        score_multiplier = min(score_multiplier, 0.55)
-    elif btc_bad or sol_bad:
-        label = 'caution'
-        score_multiplier = min(score_multiplier, 0.85)
-    elif btc_trend_up and sol_trend_up and (btc_momo_up or sol_momo_up):
-        label = 'risk_on'
-        score_multiplier = 1.05
-        if btc_momo_up:
-            score_multiplier += 0.05
-        if sol_momo_up:
-            score_multiplier += 0.05
+    btc_trend_down, btc_momo_down, btc_trend_up, btc_momo_up, btc_recent = evaluate('btc', btc_klines)
+    sol_trend_down, sol_momo_down, sol_trend_up, sol_momo_up, sol_recent = evaluate('sol', sol_klines)
+    panic = btc_recent <= -8.0
+    euphoria = btc_recent >= 8.0
+    legacy_score_equal = None
+    if panic:
+        label = 'PANIC'
+        score_multiplier = 0.60
+        side_weights = {'LONG': 0.10, 'SHORT': 0.90}
+    elif euphoria:
+        label = 'EUPHORIA'
+        score_multiplier = 0.90
+        side_weights = {'LONG': 0.60, 'SHORT': 0.40}
+    elif btc_trend_up and sol_trend_up:
+        label = 'BULL_TREND'
+        score_multiplier = 1.10
+        legacy_score_equal = 1.0
+        side_weights = {'LONG': 0.70, 'SHORT': 0.30}
+    elif btc_trend_down and sol_trend_down:
+        label = 'BEAR_TREND'
+        score_multiplier = 0.55
+        legacy_score_equal = 0.8
+        side_weights = {'LONG': 0.20, 'SHORT': 0.80}
     else:
-        label = 'neutral'
+        label = 'RANGE'
+        score_multiplier = 0.90
+        side_weights = {'LONG': 0.50, 'SHORT': 0.50}
+    legacy_label = {'BULL_TREND': 'risk_on', 'BEAR_TREND': 'risk_off', 'RANGE': 'neutral', 'PANIC': 'risk_off', 'EUPHORIA': 'risk_on'}[label]
     return {
-        'risk_on': label == 'risk_on',
-        'score_multiplier': max(0.35, min(score_multiplier, 1.15)),
+        'risk_on': label in {'BULL_TREND', 'EUPHORIA'},
+        'score_multiplier': RegimeScore(max(0.35, min(score_multiplier, 1.15)), legacy_score_equal),
         'reasons': reasons,
-        'label': label,
+        'label': RegimeLabel(label, legacy_label),
+        'structural_label': label,
+        'side_weights': side_weights,
         'trend_flags': {'btc': btc_trend_down, 'sol': sol_trend_down},
         'momentum_flags': {'btc': btc_momo_down, 'sol': sol_momo_down},
         'bullish_trend_flags': {'btc': btc_trend_up, 'sol': sol_trend_up},
         'bullish_momentum_flags': {'btc': btc_momo_up, 'sol': sol_momo_up},
+        'legacy_label': legacy_label,
     }
 
 
@@ -5384,6 +5596,83 @@ def normalize_symbol(symbol: Optional[str]) -> Optional[str]:
 def is_strategy_websocket_symbol_allowed(symbol: Optional[str]) -> bool:
     normalized = normalize_symbol(symbol)
     return bool(normalized and normalized.endswith('USDT'))
+
+
+def parse_symbol_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r'[\s,;]+', value)
+    else:
+        try:
+            raw_items = list(value)
+        except TypeError:
+            raw_items = [value]
+    symbols = [normalize_symbol(item) for item in raw_items if str(item or '').strip()]
+    return [symbol for symbol in dict.fromkeys(symbols) if symbol]
+
+
+def resolve_expensive_scan_symbol_sets(
+    evaluated_symbols: Sequence[str],
+    *,
+    watchlist_symbols: Optional[Sequence[str]] = None,
+    microstructure_limit: int = 10,
+    funding_limit: Optional[int] = None,
+    open_interest_limit: Optional[int] = None,
+    cvd_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    base_symbols = parse_symbol_list(evaluated_symbols)
+    watchlist = [symbol for symbol in parse_symbol_list(watchlist_symbols or []) if symbol in set(base_symbols)]
+    priority_symbols = [*watchlist, *[symbol for symbol in base_symbols if symbol not in set(watchlist)]]
+    micro_limit = max(0, int(microstructure_limit or 0))
+    funding_cap = micro_limit if funding_limit is None else max(0, int(funding_limit or 0))
+    oi_cap = micro_limit if open_interest_limit is None else max(0, int(open_interest_limit or 0))
+    cvd_cap = micro_limit if cvd_limit is None else max(0, int(cvd_limit or 0))
+    micro_symbols = priority_symbols[:micro_limit]
+    funding_symbols = priority_symbols[:min(micro_limit, funding_cap)]
+    oi_symbols = priority_symbols[:min(micro_limit, oi_cap)]
+    cvd_symbols = priority_symbols[:min(micro_limit, cvd_cap)]
+    diagnostics = {
+        'watchlist_symbol_count': len(watchlist),
+        'priority_symbol_count': len(priority_symbols),
+        'microstructure_symbol_limit': micro_limit,
+        'funding_symbol_limit': funding_cap,
+        'open_interest_symbol_limit': oi_cap,
+        'cvd_symbol_limit': cvd_cap,
+        'microstructure_symbol_count': len(micro_symbols),
+        'funding_symbol_count': len(funding_symbols),
+        'open_interest_symbol_count': len(oi_symbols),
+        'cvd_symbol_count': len(cvd_symbols),
+    }
+    return {
+        'priority_symbols': priority_symbols,
+        'watchlist_symbols': watchlist,
+        'microstructure_symbols': set(micro_symbols),
+        'funding_symbols': set(funding_symbols),
+        'open_interest_symbols': set(oi_symbols),
+        'cvd_symbols': set(cvd_symbols),
+        'diagnostics': diagnostics,
+    }
+
+
+def build_scan_budget_diagnostics(args: argparse.Namespace, scan_symbol_plan: Dict[str, Any]) -> Dict[str, Any]:
+    diagnostics = dict(scan_symbol_plan.get('diagnostics', {}) if isinstance(scan_symbol_plan, dict) else {})
+    return {
+        'profile': str(getattr(args, 'profile', 'default') or 'default'),
+        'watchlist_symbol_count': int(diagnostics.get('watchlist_symbol_count') or 0),
+        'microstructure_symbol_count': int(diagnostics.get('microstructure_symbol_count') or 0),
+        'expensive_fetch_budget': {
+            'microstructure': int(diagnostics.get('microstructure_symbol_limit') or 0),
+            'funding': int(diagnostics.get('funding_symbol_limit') or 0),
+            'open_interest': int(diagnostics.get('open_interest_symbol_limit') or 0),
+            'cvd': int(diagnostics.get('cvd_symbol_limit') or 0),
+        },
+        'expensive_fetch_counts': {
+            'funding': int(diagnostics.get('funding_symbol_count') or 0),
+            'open_interest': int(diagnostics.get('open_interest_symbol_count') or 0),
+            'cvd': int(diagnostics.get('cvd_symbol_count') or 0),
+        },
+    }
 
 
 def load_manual_square_symbols(args: argparse.Namespace) -> List[str]:
@@ -6123,12 +6412,13 @@ def resolve_scan_klines(client: BinanceFuturesClient, store: Optional[RuntimeSta
     if not scanner_kline_rest_fallback_enabled(args):
         diagnostics['scanner_kline_rest_fallback_skipped_reason'] = 'scanner_kline_rest_fallback_disabled'
         return ([], diagnostics) if return_diagnostics else []
-    decision = _scanner_market_data_rest_fallback_decision(store, args, 'last_kline_rest_fallback_at_ms', 'scanner_kline_rest_fallback_min_interval_seconds')
+    cursor_key = f'last_kline_rest_fallback_at_ms:{str(symbol).upper()}:{str(interval)}'
+    decision = _scanner_market_data_rest_fallback_decision(store, args, cursor_key, 'scanner_kline_rest_fallback_min_interval_seconds')
     if not decision.get('allowed'):
         diagnostics['scanner_kline_rest_fallback_skipped_reason'] = str(decision.get('reason') or 'fallback_not_allowed')
         return ([], diagnostics) if return_diagnostics else []
     rows = fetch_klines(client, symbol, interval, limit)
-    _save_scanner_rest_fallback_cursor_key(store, 'last_kline_rest_fallback_at_ms')
+    _save_scanner_rest_fallback_cursor_key(store, cursor_key)
     diagnostics['scanner_kline_rest_fallback_used'] = True
     return (rows, diagnostics) if return_diagnostics else rows
 
@@ -7025,6 +7315,38 @@ def build_symbol_loss_cooldown_map(store: Optional[RuntimeStateStore], *, limit:
     return cooldowns
 
 
+def apply_five_usdt_watchlist_scoring(candidate: Candidate, regime_payload: Optional[Dict[str, Any]] = None) -> Candidate:
+    regime_label = str((regime_payload or {}).get('label') or getattr(candidate, 'regime_label', '') or '').lower()
+    risk_off_weight = 0.85 if regime_label == 'risk_off' else 1.0
+    expected_profit = max(float(getattr(candidate, 'expected_net_profit_usdt', 0.0) or 0.0), 0.0)
+    expected_rr = max(float(getattr(candidate, 'expected_rr', 0.0) or 0.0), 0.0)
+    loss = max(float(getattr(candidate, 'expected_loss_usdt', 0.0) or 0.0), 0.0)
+    volume_multiple = max(float(getattr(candidate, 'volume_multiple', 0.0) or 0.0), 0.0)
+    oi_abs = abs(float(getattr(candidate, 'oi_change_pct_5m', 0.0) or 0.0))
+    cvd_abs = abs(float(getattr(candidate, 'cvd_delta', 0.0) or 0.0))
+    breakout_distance = abs(float(getattr(candidate, 'entry_distance_from_breakout_pct', 0.0) or 0.0))
+    flags = dict(getattr(candidate, 'trigger_confirmation_flags', {}) or {})
+    setup_bonus = 5.0 if bool(getattr(candidate, 'setup_ready', False)) else 0.0
+    trigger_bonus = 8.0 if bool(getattr(candidate, 'trigger_fired', False)) else 0.0
+    confirmation_bonus = 4.0 if flags.get('oi_taker_alignment_confirmed') else 0.0
+    breakdown = {
+        'expected_profit_score': round(min(expected_profit / 5.0, 1.4) * 22.0, 4),
+        'rr_score': round(min(expected_rr / 2.0, 1.4) * 16.0, 4),
+        'loss_control_score': round(max(0.0, 1.0 - max(loss - 2.0, 0.0) / 3.0) * 10.0, 4),
+        'volume_score': round(min(volume_multiple / 2.0, 1.5) * 12.0, 4),
+        'orderflow_score': round(min((oi_abs + cvd_abs) / 2.0, 1.5) * 16.0 + confirmation_bonus, 4),
+        'breakout_proximity_score': round(max(0.0, 1.0 - breakout_distance / 1.2) * 12.0, 4),
+        'setup_trigger_score': round(setup_bonus + trigger_bonus, 4),
+    }
+    watchlist_score = sum(float(value or 0.0) for value in breakdown.values()) * risk_off_weight
+    candidate.five_usdt_score_breakdown = breakdown
+    candidate.risk_off_score_weight = round(risk_off_weight, 4)
+    candidate.watchlist_priority_score = round(max(float(getattr(candidate, 'score', 0.0) or 0.0), watchlist_score), 4)
+    candidate.reasons.append(f"watchlist_priority_score={candidate.watchlist_priority_score}")
+    candidate.reasons.append(f"risk_off_score_weight={candidate.risk_off_score_weight}")
+    return candidate
+
+
 def apply_five_usdt_candidate_selection_filter(candidate: Candidate, args: argparse.Namespace, store: Optional[RuntimeStateStore], cooldown_map: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
     apply_five_usdt_symbol_quality_fields(candidate)
     tier = str(candidate.symbol_quality_tier or 'C')
@@ -7325,27 +7647,280 @@ def recommended_position_size_pct(score_or_tier: Any, alert_tier: Optional[str] 
     return round(base * effective_multiplier, 4)
 
 
+def refresh_candidate_execution_sizing(candidate: Candidate, external_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    external_signal = external_signal or {}
+    candidate.alert_tier = classify_alert_tier(candidate)
+    external_tier = str(external_signal.get('external_signal_tier', '') or '').lower()
+    tier_order = {'blocked': 0, 'watch': 1, 'high': 2, 'critical': 3}
+    if tier_order.get(external_tier, -1) > tier_order.get(candidate.alert_tier, 0):
+        candidate.alert_tier = external_tier
+    external_position_size_pct = next(
+        (
+            float(reason.split('=', 1)[1])
+            for reason in reversed(candidate.reasons)
+            if str(reason).startswith('external_position_size_pct=')
+        ),
+        None,
+    )
+    side_multiplier = float(getattr(candidate, 'side_risk_multiplier', 1.0) or 1.0)
+    base_position_size_pct = recommended_position_size_pct(
+        candidate.score,
+        candidate.alert_tier,
+        float(getattr(candidate, 'regime_multiplier', 1.0) or 1.0),
+        side_multiplier,
+    )
+    execution_quality = compute_execution_quality_size_adjustment(candidate)
+    effective_position_size_pct = round(base_position_size_pct * float(execution_quality['size_multiplier']), 4)
+    candidate.position_size_pct = round(external_position_size_pct, 4) if external_position_size_pct and external_position_size_pct > 0 else effective_position_size_pct
+    candidate.reasons.append(f'alert_tier={candidate.alert_tier}')
+    candidate.reasons.append(f'base_position_size_pct={base_position_size_pct}')
+    candidate.reasons.append(f"execution_quality_size_multiplier={execution_quality['size_multiplier']}")
+    candidate.reasons.append(f"execution_quality_size_bucket={execution_quality['size_bucket']}")
+    candidate.reasons.append(f'position_size_pct={candidate.position_size_pct}')
+    return {
+        'base_position_size_pct': base_position_size_pct,
+        'execution_quality': execution_quality,
+        'position_size_pct': candidate.position_size_pct,
+        'alert_tier': candidate.alert_tier,
+    }
+
+
+def _normalize_regime_label(regime_label: str) -> str:
+    normalized = str(regime_label or 'RANGE').strip().upper()
+    legacy = {
+        'RISK_ON': 'BULL_TREND',
+        'RISK_OFF': 'BEAR_TREND',
+        'CAUTION': 'RANGE',
+        'NEUTRAL': 'RANGE',
+    }
+    return legacy.get(normalized, normalized)
+
+
 def derive_side_risk_multiplier(side: str, regime_label: str) -> float:
     normalized_side = normalize_position_side(side)
-    normalized_regime = str(regime_label or 'neutral').strip().lower()
-    if normalized_regime == 'risk_on':
+    raw_regime = str(regime_label or 'neutral').strip().lower()
+    legacy_bias = {
+        'risk_on': {POSITION_SIDE_LONG: 1.15, POSITION_SIDE_SHORT: 0.85},
+        'risk_off': {POSITION_SIDE_LONG: 0.85, POSITION_SIDE_SHORT: 1.15},
+        'caution': {POSITION_SIDE_LONG: 0.9, POSITION_SIDE_SHORT: 0.9},
+        'neutral': {POSITION_SIDE_LONG: 1.0, POSITION_SIDE_SHORT: 1.0},
+    }
+    if raw_regime in legacy_bias:
+        return legacy_bias[raw_regime].get(normalized_side, 1.0)
+    normalized_regime = _normalize_regime_label(regime_label)
+    if normalized_regime == 'BULL_TREND':
         return 1.15 if normalized_side == POSITION_SIDE_LONG else 0.85
-    if normalized_regime == 'risk_off':
+    if normalized_regime == 'BEAR_TREND':
         return 0.85 if normalized_side == POSITION_SIDE_LONG else 1.15
-    if normalized_regime == 'caution':
-        return 0.9
-    return 1.0
+    if normalized_regime == 'PANIC':
+        return 0.6 if normalized_side == POSITION_SIDE_LONG else 1.0
+    if normalized_regime == 'EUPHORIA':
+        return 1.0 if normalized_side == POSITION_SIDE_LONG else 0.8
+    if normalized_regime == 'RANGE':
+        return 1.0
+    return 0.9
 
 
 def derive_directional_score_multiplier(side: str, regime_label: str, base_multiplier: float) -> float:
     normalized_side = normalize_position_side(side)
-    normalized_regime = str(regime_label or 'neutral').strip().lower()
+    raw_regime = str(regime_label or '').strip().lower()
+    if raw_regime in {'risk_on', 'risk_off'}:
+        return 1.0 if normalized_side == POSITION_SIDE_SHORT else round(max(float(base_multiplier or 1.0), 0.0), 4)
+    normalized_regime = _normalize_regime_label(regime_label)
     base = max(float(base_multiplier or 1.0), 0.0)
-    if normalized_regime == 'risk_off' and normalized_side == POSITION_SIDE_SHORT:
-        return max(base, 1.0)
-    if normalized_regime == 'risk_on' and normalized_side == POSITION_SIDE_SHORT:
-        return min(base, 1.0)
-    return base
+    side_weights = {
+        'BULL_TREND': {'LONG': 0.70, 'SHORT': 0.30},
+        'BEAR_TREND': {'LONG': 0.20, 'SHORT': 0.80},
+        'RANGE': {'LONG': 0.50, 'SHORT': 0.50},
+        'PANIC': {'LONG': 0.10, 'SHORT': 0.90},
+        'EUPHORIA': {'LONG': 0.60, 'SHORT': 0.40},
+    }.get(normalized_regime, {'LONG': 0.50, 'SHORT': 0.50})
+    side_key = 'SHORT' if normalized_side == POSITION_SIDE_SHORT else 'LONG'
+    return round(base * (0.5 + side_weights[side_key]), 4)
+
+
+MICRO_SCALP_SCORE_KEYS = (
+    'volume_spike_score',
+    'price_acceleration_score',
+    'book_imbalance_score',
+    'vwap_ema_reclaim_score',
+    'oi_delta_score',
+    'cvd_alignment_score',
+    'breakout_proximity_score',
+    'funding_crowding_score',
+)
+
+
+def _clamp_score(value: float, cap: float) -> float:
+    return round(max(0.0, min(float(value or 0.0), cap)), 4)
+
+
+def compute_micro_scalp_score_breakdown(candidate: Candidate) -> Dict[str, float]:
+    volume_multiple = float(getattr(candidate, 'volume_multiple', 0.0) or 0.0)
+    price_move = abs(float(getattr(candidate, 'recent_5m_change_pct', 0.0) or 0.0))
+    spread_bps = abs(float(getattr(candidate, 'spread_bps', getattr(candidate, 'expected_spread_bps', 0.0)) or 0.0))
+    breakout_distance = abs(float(getattr(candidate, 'entry_distance_from_breakout_pct', 0.0) or 0.0))
+    ema_distance = abs(float(getattr(candidate, 'distance_from_ema20_5m_pct', 0.0) or 0.0))
+    vwap_distance = abs(float(getattr(candidate, 'distance_from_vwap_15m_pct', getattr(candidate, 'entry_distance_from_vwap_pct', 0.0)) or 0.0))
+    oi_delta = abs(float(getattr(candidate, 'oi_change_pct_5m', getattr(candidate, 'oi_delta_pct', 0.0)) or 0.0))
+    cvd_delta = abs(float(getattr(candidate, 'cvd_delta', getattr(candidate, 'cvd_delta_5m', 0.0)) or 0.0))
+    funding_rate = abs(float(getattr(candidate, 'funding_rate', 0.0) or 0.0))
+    bid_ask_imbalance = abs(float(getattr(candidate, 'book_imbalance', getattr(candidate, 'bid_ask_imbalance', 0.0)) or 0.0))
+
+    return {
+        'volume_spike_score': _clamp_score(volume_multiple / 1.5 * 20.0, 20.0),
+        'price_acceleration_score': _clamp_score(price_move / 0.18 * 15.0, 15.0),
+        'book_imbalance_score': _clamp_score((bid_ask_imbalance * 15.0) if bid_ask_imbalance else max(0.0, 15.0 - spread_bps * 2.5), 15.0),
+        'vwap_ema_reclaim_score': _clamp_score(15.0 - (ema_distance + vwap_distance) * 4.0, 15.0),
+        'oi_delta_score': _clamp_score(oi_delta / 0.35 * 10.0, 10.0),
+        'cvd_alignment_score': _clamp_score(cvd_delta / 1.0 * 10.0, 10.0),
+        'breakout_proximity_score': _clamp_score(10.0 - breakout_distance * 8.0, 10.0),
+        'funding_crowding_score': _clamp_score(5.0 - funding_rate * 5000.0, 5.0),
+    }
+
+
+def classify_micro_scalp_score(score: float) -> Dict[str, bool]:
+    score = float(score or 0.0)
+    return {
+        'candidate_pool': score >= 55.0,
+        'strong_trade_candidate': score >= 70.0,
+    }
+
+
+SECTOR_SYMBOL_MAP = {
+    'MEME': {'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'BONKUSDT', '1000BONKUSDT', 'FLOKIUSDT', 'WIFUSDT'},
+    'AI': {'FETUSDT', 'AGIXUSDT', 'AIUSDT', 'NFPUSDT', 'ARKMUSDT', 'WLDUSDT', 'TAOUSDT'},
+    'L2': {'ARBUSDT', 'OPUSDT', 'STRKUSDT', 'MANTAUSDT', 'METISUSDT'},
+    'DEFI': {'UNIUSDT', 'AAVEUSDT', 'MKRUSDT', 'LDOUSDT', 'CRVUSDT', 'SUSHIUSDT'},
+    'RWA': {'ONDOUSDT', 'PENDLEUSDT', 'POLYXUSDT', 'OMUSDT'},
+    'INFRASTRUCTURE': {'LINKUSDT', 'ATOMUSDT', 'DOTUSDT', 'NEARUSDT', 'FILUSDT', 'ICPUSDT'},
+}
+
+
+def classify_symbol_sector(symbol: str) -> str:
+    normalized = str(symbol or '').upper()
+    for sector, symbols in SECTOR_SYMBOL_MAP.items():
+        if normalized in symbols:
+            return sector
+    return 'OTHER'
+
+
+def compute_sector_score(symbol: str, peer_symbols: Sequence[str]) -> Dict[str, Any]:
+    sector = classify_symbol_sector(symbol)
+    same_sector = [s for s in (peer_symbols or []) if classify_symbol_sector(str(s).upper()) == sector and str(s).upper() != str(symbol).upper()]
+    sector_score = min(12.0, len(same_sector) * 4.0) if sector != 'OTHER' else 0.0
+    return {'sector': sector, 'same_sector_count': len(same_sector), 'sector_score': sector_score, 'same_sector_symbols': same_sector[:10]}
+
+
+def classify_candidate_pool_grade(score: float, *, setup_ready: bool = False, trigger_fired: bool = False) -> Dict[str, Any]:
+    numeric_score = float(score or 0.0)
+    if trigger_fired and numeric_score >= 75.0:
+        grade = 'A'
+    elif setup_ready or numeric_score >= 60.0:
+        grade = 'B'
+    else:
+        grade = 'C'
+    return {'grade': grade, 'candidate_pool': numeric_score >= 45.0 or setup_ready or trigger_fired}
+
+
+def _connect_watchlist_db(db_path: Any) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS watchlist ('
+        'symbol TEXT PRIMARY KEY, score REAL NOT NULL, first_seen REAL NOT NULL, '
+        'last_seen REAL NOT NULL, max_score REAL NOT NULL, sector TEXT NOT NULL)'
+    )
+    return conn
+
+
+def upsert_watchlist_db(db_path: Any, rows: Sequence[Dict[str, Any]], *, now_ts: Optional[float] = None) -> None:
+    now_value = float(now_ts if now_ts is not None else time.time())
+    with _connect_watchlist_db(db_path) as conn:
+        for row in rows or []:
+            symbol = str(row.get('symbol') or '').upper().strip()
+            if not symbol:
+                continue
+            score = float(row.get('score', row.get('scalp_score', 0.0)) or 0.0)
+            sector = str(row.get('sector') or classify_symbol_sector(symbol))
+            existing = conn.execute('SELECT first_seen, max_score FROM watchlist WHERE symbol = ?', (symbol,)).fetchone()
+            first_seen = float(existing[0]) if existing else now_value
+            max_score = max(float(existing[1]) if existing else score, score)
+            conn.execute(
+                'INSERT OR REPLACE INTO watchlist(symbol, score, first_seen, last_seen, max_score, sector) VALUES (?, ?, ?, ?, ?, ?)',
+                (symbol, score, first_seen, now_value, max_score, sector),
+            )
+
+
+def load_watchlist_db(db_path: Any, *, now_ts: Optional[float] = None, ttl_hours: float = 72.0) -> List[Dict[str, Any]]:
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    now_value = float(now_ts if now_ts is not None else time.time())
+    cutoff = now_value - float(ttl_hours or 72.0) * 3600.0
+    with _connect_watchlist_db(path) as conn:
+        conn.execute('DELETE FROM watchlist WHERE last_seen < ?', (cutoff,))
+        fetched = conn.execute(
+            'SELECT symbol, score, first_seen, last_seen, max_score, sector FROM watchlist ORDER BY max_score DESC, last_seen DESC'
+        ).fetchall()
+    return [
+        {'symbol': symbol, 'score': score, 'first_seen': first_seen, 'last_seen': last_seen, 'max_score': max_score, 'sector': sector}
+        for symbol, score, first_seen, last_seen, max_score, sector in fetched
+    ]
+
+
+def build_micro_scalp_cycle_diagnostics(
+    *,
+    early_filter_pass_count: int,
+    early_filter_reject_reasons: Dict[str, Any],
+    candidate_alerts: List[Dict[str, Any]],
+    blocked_reasons: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    blocked_reasons = dict(blocked_reasons or {})
+    top_candidates = sorted(
+        list(candidate_alerts or []),
+        key=lambda item: float(item.get('scalp_score', item.get('score', 0.0)) or 0.0),
+        reverse=True,
+    )[:10]
+    why_no_order = {
+        'liquidity_failed': int(blocked_reasons.get('liquidity_failed', 0) or 0),
+        'spread_failed': int(blocked_reasons.get('spread_failed', 0) or 0),
+        'score_too_low': int(blocked_reasons.get('score_too_low', 0) or 0),
+        'trigger_missing': int(blocked_reasons.get('trigger_missing', 0) or 0),
+        'risk_blocked': int(blocked_reasons.get('risk_blocked', 0) or 0),
+        'execution_blocked': int(blocked_reasons.get('execution_blocked', 0) or 0),
+    }
+    runtime_stats = {
+        'candidate_count': len(candidate_alerts or []),
+        'near_trade_count': sum(1 for item in (candidate_alerts or []) if item.get('candidate_pool_grade') in {'A', 'B'} or item.get('setup_ready')),
+        'watchlist_count': int(blocked_reasons.get('watchlist_count', 0) or 0),
+        'oi_cache_hits': int(blocked_reasons.get('oi_cache_hits', 0) or 0),
+        'funding_cache_hits': int(blocked_reasons.get('funding_cache_hits', 0) or 0),
+        'rest_weight': int(blocked_reasons.get('rest_weight', blocked_reasons.get('rest_used_weight_1m', 0)) or 0),
+    }
+    why_no_trade_top5 = [
+        {
+            'symbol': item.get('symbol'),
+            'scalp_score': item.get('scalp_score', item.get('score', 0.0)),
+            'candidate_pool_grade': item.get('candidate_pool_grade'),
+            'trade_missing': list(item.get('trade_missing') or item.get('trigger_missing') or item.get('setup_missing') or []),
+        }
+        for item in top_candidates[:5]
+    ]
+    return {
+        'early_filter_pass_count': int(early_filter_pass_count or 0),
+        'early_filter_reject_reasons': dict(early_filter_reject_reasons or {}),
+        'scalp_score_top_symbols': [
+            {
+                'symbol': item.get('symbol'),
+                'scalp_score': item.get('scalp_score', item.get('score', 0.0)),
+            }
+            for item in top_candidates
+        ],
+        'top_10_candidates': top_candidates,
+        'why_no_order': why_no_order,
+        'why_no_trade_top5': why_no_trade_top5,
+        'runtime_stats': runtime_stats,
+    }
 
 
 def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -7367,12 +7942,23 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
     )
     return {
         'symbol': candidate.symbol,
+        'sector': str(getattr(candidate, 'sector', classify_symbol_sector(candidate.symbol)) or ''),
+        'sector_score': round(float(getattr(candidate, 'sector_score', 0.0) or 0.0), 4),
+        'candidate_pool_grade': str(getattr(candidate, 'candidate_pool_grade', '') or ''),
+        'candidate_pool': bool(getattr(candidate, 'candidate_pool', False)),
+        'market_regime': str((regime_payload or {}).get('label') or getattr(candidate, 'regime_label', '') or ''),
         'symbol_quality_tier': str(getattr(candidate, 'symbol_quality_tier', '') or ''),
         'symbol_quality_reason': str(getattr(candidate, 'symbol_quality_reason', '') or ''),
         'symbol_tier_min_expected_net_profit_usdt': round(float(getattr(candidate, 'symbol_tier_min_expected_net_profit_usdt', 0.0) or 0.0), 4),
         'symbol_tier_min_rr': round(float(getattr(candidate, 'symbol_tier_min_rr', 0.0) or 0.0), 4),
         'symbol_tier_max_loss_usdt': round(float(getattr(candidate, 'symbol_tier_max_loss_usdt', 0.0) or 0.0), 4),
         'score': round(candidate.score, 2),
+        'scalp_score': round(float(getattr(candidate, 'scalp_score', 0.0) or 0.0), 2),
+        'scalp_score_breakdown': dict(getattr(candidate, 'scalp_score_breakdown', {}) or {}),
+        'five_usdt_score_breakdown': dict(getattr(candidate, 'five_usdt_score_breakdown', {}) or {}),
+        'watchlist_priority_score': round(float(getattr(candidate, 'watchlist_priority_score', 0.0) or 0.0), 2),
+        'risk_off_score_weight': round(float(getattr(candidate, 'risk_off_score_weight', 1.0) or 1.0), 4),
+        'strong_trade_candidate': bool(getattr(candidate, 'strong_trade_candidate', False)),
         'state': candidate.state,
         'alert_tier': candidate.alert_tier,
         'loser_rank': candidate.loser_rank,
@@ -7591,8 +8177,6 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     external_signal_map = normalize_external_signal_map(external_signal_payload)
 
     square_symbols = list(explicit_square_symbols or load_manual_square_symbols(args))
-    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
-        square_symbols = square_symbols[:10]
     metas = fetch_exchange_meta(client)
     scan_seed_symbols = list(dict.fromkeys([*square_symbols, *list(external_signal_map.keys())]))
     fallback_symbols = scan_seed_symbols
@@ -7641,12 +8225,26 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     )
 
     rejected_events: List[Dict[str, Any]] = []
-    five_usdt_cooldown_map = build_symbol_loss_cooldown_map(store) if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1' else {}
+    five_usdt_cooldown_map = {}
     early_reject_stats: Dict[str, Any] = {'total': 0, 'by_reason': {}, 'by_side': {}}
     candidates: List[Candidate] = []
     built_candidates: List[Candidate] = []
     candidate_alerts: List[Dict[str, Any]] = []
     evaluated_symbols = merged_symbols[: max(max_candidates * prefilter_multiplier, max_candidates)]
+    scan_symbol_plan = resolve_expensive_scan_symbol_sets(
+        evaluated_symbols,
+        watchlist_symbols=parse_symbol_list(getattr(args, 'scan_watchlist_symbols', '')),
+        microstructure_limit=int(getattr(args, 'scan_microstructure_symbol_limit', 10) or 10),
+        funding_limit=int(getattr(args, 'scan_funding_symbol_limit', 8) or 8),
+        open_interest_limit=int(getattr(args, 'scan_open_interest_symbol_limit', 8) or 8),
+        cvd_limit=int(getattr(args, 'scan_cvd_symbol_limit', 8) or 8),
+    )
+    evaluated_symbols = scan_symbol_plan['priority_symbols'][: max(max_candidates * prefilter_multiplier, max_candidates)]
+    microstructure_symbols = set(scan_symbol_plan['microstructure_symbols'])
+    funding_symbols = set(scan_symbol_plan['funding_symbols'])
+    open_interest_symbols = set(scan_symbol_plan['open_interest_symbols'])
+    cvd_symbols = set(scan_symbol_plan['cvd_symbols'])
+    scan_budget_diagnostics = build_scan_budget_diagnostics(args, scan_symbol_plan)
     allowed_trade_sides = resolve_allowed_trade_sides(getattr(args, 'allowed_trade_sides', 'long,short'))
     evaluated_side_count = 0
     for symbol in evaluated_symbols:
@@ -7674,13 +8272,22 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         klines_15m = resolve_scan_klines(client, store, args, symbol, '15m', 40)
         klines_1h = resolve_scan_klines(client, store, args, symbol, '1h', 40)
         klines_4h = resolve_scan_klines(client, store, args, symbol, '4h', 40)
-        funding_rates = fetch_funding_rates(client, symbol, limit=3)
-        funding_rate = funding_rates[-1] if funding_rates else None
-        funding_rate_avg = sum(funding_rates) / len(funding_rates) if funding_rates else None
-        oi_history = fetch_open_interest_hist(client, symbol, period='5m', limit=30)
-        top_ratio = fetch_top_account_long_short_ratio(client, symbol, period='5m', limit=10)
-        order_book = resolve_scan_order_book(client, store, args, symbol, limit=20)
-        book_ticker_samples = collect_book_ticker_samples(client, symbol, sample_count=6, interval_ms=150, store=store, allow_rest_fallback=bool(getattr(args, 'book_ticker_rest_fallback', False)))
+        if symbol in microstructure_symbols:
+            funding_rates = fetch_funding_rates(client, symbol, limit=3) if symbol in funding_symbols else []
+            funding_rate = funding_rates[-1] if funding_rates else None
+            funding_rate_avg = sum(funding_rates) / len(funding_rates) if funding_rates else None
+            oi_history = fetch_open_interest_hist(client, symbol, period='5m', limit=30) if symbol in open_interest_symbols else []
+            top_ratio = fetch_top_account_long_short_ratio(client, symbol, period='5m', limit=10) if symbol in open_interest_symbols else []
+            order_book = resolve_scan_order_book(client, store, args, symbol, limit=20)
+            book_ticker_samples = collect_book_ticker_samples(client, symbol, sample_count=6, interval_ms=150, store=store, allow_rest_fallback=bool(getattr(args, 'book_ticker_rest_fallback', False))) if symbol in cvd_symbols else []
+        else:
+            funding_rates = []
+            funding_rate = None
+            funding_rate_avg = None
+            oi_history = []
+            top_ratio = []
+            order_book = {}
+            book_ticker_samples = []
         micro = derive_microstructure_inputs(
             oi_history=oi_history,
             taker_5m=klines_5m[-1] if klines_5m else [],
@@ -7781,13 +8388,8 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                     candidate.reasons.append(f"target_profit_reject:{candidate.target_profit_reject_reason}")
                     rejected_events.append(append_candidate_rejected_event(None, candidate, [candidate.target_profit_reject_reason]))
                     continue
-            if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
-                symbol_tier_reject = apply_five_usdt_candidate_selection_filter(candidate, args, store, five_usdt_cooldown_map)
-                if symbol_tier_reject:
-                    apply_candidate_diagnostics(candidate)
-                    candidate.reasons.append(symbol_tier_reject)
-                    rejected_events.append(append_candidate_rejected_event(None, candidate, [symbol_tier_reject]))
-                    continue
+            if bool(getattr(args, 'five_usdt_watchlist_scoring', False)):
+                apply_five_usdt_watchlist_scoring(candidate, regime_payload)
             apply_candidate_diagnostics(candidate)
             built_candidates.append(candidate)
             external_veto_reason = apply_external_signal_to_candidate(candidate, external_signal)
@@ -7817,44 +8419,50 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             candidate.reasons.append(f'side_risk_multiplier={side_multiplier:.2f}')
             for regime_reason in regime_payload.get('reasons', []):
                 candidate.reasons.append(f'market_regime:{regime_reason}')
-            candidate.alert_tier = classify_alert_tier(candidate)
-            external_tier = str(external_signal.get('external_signal_tier', '') or '').lower()
-            tier_order = {'blocked': 0, 'watch': 1, 'high': 2, 'critical': 3}
-            if tier_order.get(external_tier, -1) > tier_order.get(candidate.alert_tier, 0):
-                candidate.alert_tier = external_tier
-            candidate.reasons.append(f'alert_tier={candidate.alert_tier}')
-            external_position_size_pct = next(
-                (
-                    float(reason.split('=', 1)[1])
-                    for reason in reversed(candidate.reasons)
-                    if str(reason).startswith('external_position_size_pct=')
-                ),
-                None,
-            )
-            base_position_size_pct = recommended_position_size_pct(
-                candidate.score,
-                candidate.alert_tier,
-                candidate.regime_multiplier,
-                side_multiplier,
-            )
-            execution_quality = compute_execution_quality_size_adjustment(candidate)
-            effective_position_size_pct = round(base_position_size_pct * float(execution_quality['size_multiplier']), 4)
-            candidate.position_size_pct = round(external_position_size_pct, 4) if external_position_size_pct and external_position_size_pct > 0 else effective_position_size_pct
-            candidate.reasons.append(f'base_position_size_pct={base_position_size_pct}')
-            candidate.reasons.append(f"execution_quality_size_multiplier={execution_quality['size_multiplier']}")
-            candidate.reasons.append(f"execution_quality_size_bucket={execution_quality['size_bucket']}")
-            candidate.reasons.append(f'position_size_pct={candidate.position_size_pct}')
+            refresh_candidate_execution_sizing(candidate, external_signal)
             apply_candidate_diagnostics(candidate)
+            sector_payload = compute_sector_score(candidate.symbol, evaluated_symbols)
+            candidate.sector = sector_payload['sector']
+            candidate.sector_score = float(sector_payload['sector_score'])
+            if candidate.sector_score:
+                candidate.score = round(float(candidate.score or 0.0) + candidate.sector_score, 4)
+                candidate.reasons.append(f"sector_score={candidate.sector_score}")
+                refresh_candidate_execution_sizing(candidate, external_signal)
+            pool_grade = classify_candidate_pool_grade(
+                float(getattr(candidate, 'scalp_score', getattr(candidate, 'score', 0.0)) or getattr(candidate, 'score', 0.0)),
+                setup_ready=bool(getattr(candidate, 'setup_ready', False)),
+                trigger_fired=bool(getattr(candidate, 'trigger_fired', False)),
+            )
+            candidate.candidate_pool_grade = pool_grade['grade']
+            candidate.candidate_pool = bool(pool_grade['candidate_pool'])
+            if str(getattr(args, 'profile', '') or '') == 'five-usdt-scalp-v2':
+                candidate.scalp_score_breakdown = compute_micro_scalp_score_breakdown(candidate)
+                candidate.scalp_score = round(sum(float(value or 0.0) for value in candidate.scalp_score_breakdown.values()), 2)
+                micro_scalp_classification = classify_micro_scalp_score(candidate.scalp_score)
+                candidate.strong_trade_candidate = bool(micro_scalp_classification['strong_trade_candidate'])
+                candidate.score = max(float(candidate.score or 0.0), float(candidate.scalp_score or 0.0))
+                pool_grade = classify_candidate_pool_grade(
+                    float(candidate.scalp_score or candidate.score or 0.0),
+                    setup_ready=bool(getattr(candidate, 'setup_ready', False)),
+                    trigger_fired=bool(getattr(candidate, 'trigger_fired', False)),
+                )
+                candidate.candidate_pool_grade = pool_grade['grade']
+                candidate.candidate_pool = bool(pool_grade['candidate_pool'])
+                candidate.reasons.append(f"scalp_score={candidate.scalp_score}")
+                candidate.reasons.append(f"strong_trade_candidate={candidate.strong_trade_candidate}")
             candidates.append(candidate)
 
-    candidates.sort(key=lambda item: item.score, reverse=True)
-    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
-        candidates = sorted(
-            candidates,
-            key=lambda item: (-abs(float(getattr(item, 'expected_net_profit_usdt', 0.0) or 0.0) - 5.0), float(getattr(item, 'score', 0.0) or 0.0)),
-            reverse=True,
-        )[:5]
+    candidates.sort(key=lambda item: float(getattr(item, 'scalp_score', getattr(item, 'score', 0.0)) or getattr(item, 'score', 0.0)), reverse=True)
     candidate_alerts = [build_standardized_alert(item, regime_payload) for item in candidates]
+    if str(getattr(args, 'profile', '') or '') == 'five-usdt-scalp-v2':
+        try:
+            watchlist_db_path = Path(CANONICAL_RUNTIME_STATE_DIR) / 'watchlist.db'
+            upsert_watchlist_db(watchlist_db_path, candidate_alerts)
+            persisted_watchlist = load_watchlist_db(watchlist_db_path, ttl_hours=72.0)
+        except Exception:
+            persisted_watchlist = []
+    else:
+        persisted_watchlist = []
     execution_candidates = [item for item in candidates if bool(getattr(item, 'trigger_fired', False))]
     relaxed_candidates = [build_trigger_relax_candidate(item, args) for item in candidates if is_trigger_relax_eligible(item, args, regime_payload)]
     execution_priority = sorted(
@@ -7865,12 +8473,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         ),
         reverse=True,
     )
-    if str(getattr(args, 'profile', '') or '') == 'five-usdt-target-v1':
-        execution_priority = sorted(
-            execution_priority,
-            key=lambda item: (-abs(float(getattr(item, 'expected_net_profit_usdt', 0.0) or 0.0) - 5.0), float(getattr(item, 'score', 0.0) or 0.0)),
-            reverse=True,
-        )[:1]
+
     best = execution_priority[0] if execution_priority else None
     selected = build_standardized_alert(best, regime_payload) if best else None
     early_rejected_events = [item for item in list(early_reject_stats.get('samples', []) or []) if isinstance(item, dict)]
@@ -8010,8 +8613,26 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'top_setup_missing': dict(sorted(setup_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
         'top_trigger_missing': dict(sorted(trigger_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
         'top_trade_missing': dict(sorted(trade_missing_counts.items(), key=lambda item: item[1], reverse=True)[:8]),
+        'scan_budget_diagnostics': scan_budget_diagnostics,
     }
     blocked_tradeability = build_blocked_tradeability_rows(rejected_events)
+    micro_scalp_diagnostics = {}
+    if runtime_profile == 'five-usdt-scalp-v2':
+        micro_scalp_diagnostics = build_micro_scalp_cycle_diagnostics(
+            early_filter_pass_count=len(built_candidates),
+            early_filter_reject_reasons=dict(early_reject_stats.get('by_reason', {}) or {}),
+            candidate_alerts=candidate_alerts,
+            blocked_reasons={
+                'liquidity_failed': reject_by_label.get('execution_depth', 0),
+                'spread_failed': reject_by_label.get('execution_spread', 0),
+                'score_too_low': reject_by_reason.get('score_below_threshold', 0),
+                'trigger_missing': sum(trigger_missing_counts.values()),
+                'risk_blocked': reject_by_label.get('risk_guard', 0),
+                'execution_blocked': reject_by_label.get('execution_slippage', 0),
+                'watchlist_count': len(persisted_watchlist),
+                'rest_weight': int(ticker_cache_diagnostics.get('rest_used_weight_1m') or 0),
+            },
+        )
     summary_counters = {
         'raw_scan_symbol_count': funnel['raw_scan_symbol_count'],
         'profile': runtime_profile,
@@ -8067,6 +8688,9 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             'triggered_but_risk_rejected': triggered_but_risk_rejected,
         },
         'blocked_tradeability': blocked_tradeability,
+        'watchlist_count': len(persisted_watchlist),
+        'watchlist_top': persisted_watchlist[:10],
+        'micro_scalp_diagnostics': micro_scalp_diagnostics,
         'early_rejected_stats': early_reject_stats,
         'funnel': funnel,
         'summary_counters': summary_counters,
@@ -8187,7 +8811,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--diagnostic-trading-mode', action='store_true', help='Run live scanner/risk diagnostics while preventing live order execution.')
     parser.add_argument('--scan-only', action='store_true')
-    parser.add_argument('--profile', default='default')
+    parser.add_argument('--profile', default='five-usdt-scalp-v2')
     parser.add_argument('--allowed-trade-sides', default='long,short')
     parser.add_argument('--tp1-r', type=float, default=1.5)
     parser.add_argument('--tp1-close-pct', type=float, default=0.3)
@@ -8195,6 +8819,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tp2-r', type=float, default=2.0)
     parser.add_argument('--tp2-close-pct', type=float, default=0.4)
     parser.add_argument('--tp2-profit-usdt', type=float, default=0.0)
+    parser.add_argument('--tp3-r', type=float, default=0.0)
+    parser.add_argument('--tp3-close-pct', type=float, default=0.0)
+    parser.add_argument('--target-notional-usdt', type=float, default=0.0)
+    parser.add_argument('--probe-min-notional-usdt', type=float, default=20.0)
+    parser.add_argument('--probe-max-notional-usdt', type=float, default=30.0)
+    parser.add_argument('--consecutive-loss-pause-minutes', type=int, default=0)
     parser.add_argument('--breakeven-r', type=float, default=1.0)
     parser.add_argument('--breakeven-confirmation-mode', choices=['price_only', 'ema_support'], default='ema_support')
     parser.add_argument('--breakeven-min-buffer-pct', type=float, default=0.001)
@@ -8241,6 +8871,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--scanner-ticker-cache-max-age-seconds', type=float, default=10.0)
     parser.add_argument('--scanner-kline-cache-max-age-seconds', type=float, default=120.0)
     parser.add_argument('--scanner-order-book-cache-max-age-seconds', type=float, default=3.0)
+    parser.add_argument('--scan-microstructure-symbol-limit', type=int, default=10, help='Max symbols eligible for expensive microstructure fetches per scan.')
+    parser.add_argument('--scan-funding-symbol-limit', type=int, default=8, help='Max symbols eligible for funding-rate REST fetches per scan.')
+    parser.add_argument('--scan-open-interest-symbol-limit', type=int, default=8, help='Max symbols eligible for open-interest REST fetches per scan.')
+    parser.add_argument('--scan-cvd-symbol-limit', type=int, default=8, help='Max symbols eligible for CVD/orderflow REST-derived fetches per scan.')
+    parser.add_argument('--scan-watchlist-symbols', default='', help='Comma-separated symbols promoted to the front of the expensive scan budget.')
     parser.add_argument('--runtime-ttl-seconds', type=float, default=900.0, help='TTL for per-symbol runtime cache cleanup.')
     parser.add_argument('--runtime-queue-maxsize', type=int, default=128, help='Max queue depth for scanner/execution/manager isolation queues.')
     parser.add_argument('--supervisor-restart-limit', type=int, default=3, help='Consecutive auto-loop cycle failures before supervisor halts.')
@@ -8336,6 +8971,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'adaptive_read_only': False,
         'disable_adaptive_risk_upscale': False,
         'atr_stop_multiplier': 1.5,
+        'five_usdt_watchlist_scoring': False,
     }
     for key, value in defaults.items():
         if not hasattr(args, key):
@@ -8352,7 +8988,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'aggressive-fee-aware-scalp-long-short',
         'aggressive-fee-aware-scalp-long-only',
         'aggressive-fee-aware-scalp-short-only',
-        'five-usdt-target-v1',
+        'five-usdt-scalp-v2',
     }
     if profile not in valid_profiles:
         raise ValueError(f'Unknown profile: {profile}')
@@ -8443,45 +9079,60 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'atr_stop_multiplier': 1.5,
             'allowed_trade_sides': 'long,short',
         }
-    elif profile == 'five-usdt-target-v1':
+    elif profile == 'five-usdt-scalp-v2':
         profile_overrides = {
-            'target_net_profit_usdt': 5.0,
-            'min_target_net_profit_usdt': 4.2,
-            'max_loss_usdt': 2.5,
-            'min_expected_rr': 1.7,
-            'risk_usdt': 2.5,
+            'risk_usdt': 1.5,
+            'min_notional_usdt': 60.0,
+            'max_notional_usdt': 90.0,
+            'target_notional_usdt': 80.0,
+            'probe_min_notional_usdt': 20.0,
+            'probe_max_notional_usdt': 30.0,
             'leverage': 10,
-            'probe_max_leverage': 10,
-            'min_notional_usdt': 80.0,
-            'max_notional_usdt': 180.0,
+            'probe_max_leverage': 5,
             'max_open_positions': 1,
             'max_long_positions': 1,
             'max_short_positions': 1,
-            'daily_trade_limit': 3,
-            'daily_max_loss_usdt': 6.0,
+            'symbol_cooldown_minutes': 5,
+            'opposite_side_flip_cooldown_minutes': 15,
+            'daily_max_loss_usdt': 10.0,
             'max_consecutive_losses': 2,
-            'symbol_cooldown_minutes': 45,
-            'cooldown_after_loss_minutes': 45,
-            'pause_after_consecutive_losses_hours': 4,
-            'prefer_maker': True,
-            'taker_fee_worst_case': True,
-            'disable_tiny_tp': True,
-            'tp1_close_pct': 0.9,
-            'tp2_close_pct': 0.1,
-            'tp1_profit_usdt': 5.0,
-            'tp2_profit_usdt': 5.6,
-            'breakeven_r': 0.6,
-            'breakeven_min_buffer_pct': 0.003,
-            'breakeven_confirmation_mode': 'price_only',
-            'min_5m_change_pct': 0.45,
-            'min_volume_multiple': 1.1,
-            'top_gainers': 10,
-            'top_losers': 10,
-            'max_candidates': 5,
-            'scan_prefilter_multiplier': 2,
+            'consecutive_loss_pause_minutes': 120,
+            'daily_circuit_breaker': True,
+            'take_profit_pct': 0.012,
+            'stop_loss_pct': 0.01,
+            'tp1_close_pct': 0.4,
+            'tp2_r': 2.5,
+            'tp2_close_pct': 0.4,
+            'tp3_r': 4.0,
+            'tp3_close_pct': 0.2,
+            'breakeven_after_pct': 0.01,
+            'trailing_after_pct': 0.018,
+            'max_holding_minutes': 45,
+            'timeout_exit_enabled': True,
+            'min_score': 55.0,
+            'sim_probe_min_score': 55.0,
+            'trigger_min_confirmations': 1,
+            'min_quote_volume': 3_000_000,
+            'min_5m_change_pct': 0.08,
+            'min_volume_multiple': 0.4,
+            'top_gainers': 25,
+            'top_losers': 25,
+            'max_candidates': 10,
+            'scan_prefilter_multiplier': 3,
+            'scan_microstructure_symbol_limit': 10,
+            'scan_funding_symbol_limit': 6,
+            'scan_open_interest_symbol_limit': 6,
+            'scan_cvd_symbol_limit': 6,
+            'scan_watchlist_symbols': 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,1000PEPEUSDT,1000BONKUSDT',
+            'max_distance_from_ema_pct': 1.2,
+            'max_distance_from_vwap_pct': 1.2,
+            'watch_breakout_tolerance_pct': 1.2,
+            'setup_breakout_tolerance_pct': 1.2,
             'enable_symbol_quality_tier': True,
-            'allowed_trade_sides': 'long,short',
             'enable_fee_aware_edge_filter': True,
+            'execution_preflight_enabled': True,
+            'repair_missing_protection': True,
+            'allowed_trade_sides': 'long,short',
         }
     elif profile == '10u-active':
         profile_overrides = {
@@ -8753,6 +9404,62 @@ def load_risk_state(store: RuntimeStateStore) -> Dict[str, Any]:
         refresh_risk_state_heat_snapshot=refresh_risk_state_heat_snapshot,
         compute_positions_heat_snapshot=compute_positions_heat_snapshot,
     )
+
+
+def compute_position_order_reconcile_interval_seconds(args: argparse.Namespace) -> float:
+    value = float(getattr(args, 'position_order_reconcile_interval_seconds', 60.0) or 60.0)
+    return max(1.0, value)
+
+
+def evaluate_hard_max_loss_guard(exchange_positions: Sequence[Dict[str, Any]], store: RuntimeStateStore) -> Dict[str, Any]:
+    positions_state = migrate_positions_state(store.load_json('positions', {}))
+    breaches: List[str] = []
+    details: List[Dict[str, Any]] = []
+    for row in list(exchange_positions or []):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get('symbol') or '').upper()
+        if not symbol:
+            continue
+        side = position_side_from_exchange_position(row)
+        position_key, tracked = get_position_by_symbol_side(positions_state, symbol, side)
+        if not isinstance(tracked, dict):
+            continue
+        hard_max_loss = abs(_to_float(tracked.get('hard_max_loss_usdt') or tracked.get('max_loss_usdt') or tracked.get('symbol_tier_max_loss_usdt')))
+        if hard_max_loss <= 0:
+            continue
+        unrealized_pnl = _to_float(row.get('unRealizedProfit', row.get('unrealizedProfit', row.get('unrealized_pnl_usdt'))))
+        if unrealized_pnl <= -hard_max_loss:
+            breaches.append(position_key)
+            details.append({
+                'position_key': position_key,
+                'symbol': symbol,
+                'side': side,
+                'unrealized_pnl_usdt': unrealized_pnl,
+                'hard_max_loss_usdt': hard_max_loss,
+            })
+    result = {'ok': not breaches, 'hard_max_loss_breaches': breaches, 'details': details}
+    if breaches:
+        risk_state = load_risk_state(store)
+        risk_state['halted'] = True
+        risk_state['halt_reason'] = f"hard_max_loss:{','.join(breaches)}"
+        risk_state['halted_at'] = _isoformat_utc(_utc_now())
+        store.save_json('risk_state', risk_state)
+        store.append_event('hard_max_loss_guard', result)
+    return result
+
+
+def handle_okx_live_management_exception(store: RuntimeStateStore, operation: str, exc: Exception) -> Dict[str, Any]:
+    operation_name = str(operation or 'unknown').strip() or 'unknown'
+    halt_reason = f'okx_live_management_failure:{operation_name}'
+    risk_state = load_risk_state(store)
+    risk_state['halted'] = True
+    risk_state['halt_reason'] = halt_reason
+    risk_state['halted_at'] = _isoformat_utc(_utc_now())
+    store.save_json('risk_state', risk_state)
+    payload = {'ok': False, 'fatal': True, 'halt_reason': halt_reason, 'operation': operation_name, 'error': str(exc)}
+    store.append_event('okx_live_management_failure', payload)
+    return payload
 
 
 def log_runtime_event(event_type: str, payload: Dict[str, Any]) -> None:
@@ -9242,6 +9949,7 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
             positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
     sync_result = sync_tracked_positions_with_exchange(store, exchange_positions, protected_symbols=protected_symbols)
+    hard_max_loss_guard = evaluate_hard_max_loss_guard(exchange_positions, store)
     stale_protection_cleanup = []
     for closed_key in sync_result.get('closed_symbols', []) or []:
         closed_symbol, closed_side = split_position_key(closed_key)
@@ -9266,7 +9974,10 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         'position_count': len(exchange_positions),
         'closed_tracked_positions': sync_result.get('closed_symbols', []),
         'refreshed_tracked_positions': sync_result.get('refreshed_symbols', []),
+        'hard_max_loss_guard': hard_max_loss_guard,
     }
+    if not hard_max_loss_guard.get('ok', True):
+        result['ok'] = False
     if halt_on_orphan_position and orphan_positions:
         risk_state = load_risk_state(store)
         risk_state['halted'] = True
@@ -10224,8 +10935,12 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
     )
     if getattr(args, 'live', False) and not binance_simulated_trading:
         open_positions = fetch_open_positions(client)
+        pending_opening_orders = list(fetch_open_orders(client) or []) + list(fetch_open_algo_orders(client) or [])
+        projected_open_positions = list(projected_position_keys(open_positions, pending_opening_orders))
     else:
         open_positions = []
+        pending_opening_orders = []
+        projected_open_positions = []
     portfolio_risk_guard = evaluate_portfolio_risk_guards(
         open_positions=open_positions,
         candidate=best_candidate,
@@ -10313,9 +11028,11 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
             cycle['final_execution_gate_action'] = 'maker_confirm' if websocket_freshness.get('execution_degradation_mode') == 'maker_only' else 'watch'
             record_runtime_heartbeat(store, component='scanner', status='degraded', blocked_reason='', extra=websocket_freshness)
     max_open_positions = int(getattr(args, 'max_open_positions', 1) or 1)
-    if len(open_positions) >= max_open_positions:
+    if len(projected_open_positions) >= max_open_positions:
         cycle['live_skipped_due_to_existing_positions'] = open_positions
-        append_candidate_rejected_event(store, best_candidate, ['max_open_positions_reached'], {'open_positions': open_positions})
+        cycle['live_skipped_due_to_projected_positions'] = projected_open_positions
+        cycle['pending_opening_orders_count'] = len([order for order in pending_opening_orders if isinstance(order, dict) and is_opening_order(order)])
+        append_candidate_rejected_event(store, best_candidate, ['max_open_positions_reached'], {'open_positions': open_positions, 'projected_open_positions': projected_open_positions})
         persist_cycle_snapshot(cycle)
         return result
     probe_entry: Dict[str, Any] = {'allowed': False, 'reasons': ['not_evaluated']}
@@ -10569,7 +11286,7 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         return {'ok': True, 'cycle': cycle, 'scanner_degraded_wait': True, 'scan_delay_multiplier': max(3.0, float(blocked_payload['next_retry_after_seconds'] or 0) / max(1.0, float(getattr(args, 'poll_interval_sec', 60) or 60))), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'DEGRADED', 'reason': 'binance_rest_circuit_open'}}
     binance_simulated_trading = is_binance_simulated_trading(args)
     execution_exchange = execution_exchange_label(args)
-    reconcile_interval_seconds = max(900.0, float(getattr(args, 'position_order_reconcile_interval_seconds', 1200.0) or 1200.0))
+    reconcile_interval_seconds = compute_position_order_reconcile_interval_seconds(args)
     reconcile_cursor = store.load_json('scanner_reconcile_cursor', {})
     if not isinstance(reconcile_cursor, dict):
         reconcile_cursor = {}
@@ -10675,6 +11392,14 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
     event_updates: List[Dict[str, Any]] = [append_candidate_selected_event(None, best_candidate, regime_payload=scan_result.get('market_regime', {}) if isinstance(scan_result, dict) else {}, extra={'profile': getattr(args, 'profile', 'default'), 'live_requested': bool(getattr(args, 'live', False)), 'scan_only': bool(getattr(args, 'scan_only', False)), 'execution_exchange': execution_exchange})]
     risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''))
     open_positions = fetch_open_positions(client) if getattr(args, 'live', False) and not binance_simulated_trading else []
+    pending_opening_orders: List[Dict[str, Any]] = []
+    if getattr(args, 'live', False) and not binance_simulated_trading:
+        pending_opening_orders = [
+            order
+            for order in list(fetch_open_orders(client) or []) + list(fetch_open_algo_orders(client) or [])
+            if isinstance(order, dict) and is_opening_order(order)
+        ]
+    projected_open_positions = projected_position_keys(open_positions, pending_opening_orders)
     portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=open_positions, candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
     risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard, 'trigger_confidence': risk_guard.get('trigger_confidence', {'level': 'confirmed', 'score': 1.0, 'factors': []}), 'execution_mode': risk_guard.get('execution_mode', 'taker'), 'execution_size_multiplier': risk_guard.get('execution_size_multiplier', 1.0), 'trigger_state': risk_guard.get('trigger_state', 'confirmed'), 'trigger_gate_action': risk_guard.get('trigger_gate_action', 'execute')}
     if risk_guard['allowed'] and risk_guard.get('execution_mode') in {'maker_probe', 'maker_confirm'}:
@@ -10744,8 +11469,12 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
             best_candidate = build_websocket_degraded_candidate(best_candidate, freshness)
             cycle['delayed_execution_queue'] = {'kept_alive': True, 'reason': freshness.get('reason'), 'websocket_state': freshness.get('state'), 'stale_guard_decision_reason': freshness.get('stale_guard_decision_reason')}
             cycle['final_execution_gate_action'] = 'maker_confirm' if freshness.get('execution_degradation_mode') == 'maker_only' else 'watch'
-    if len(open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
+    if len(projected_open_positions) >= int(getattr(args, 'max_open_positions', 1) or 1):
         cycle['live_skipped_due_to_existing_positions'] = open_positions
+        cycle['live_skipped_due_to_projected_positions'] = sorted(projected_open_positions)
+        cycle['open_positions_count'] = len(open_positions)
+        cycle['pending_opening_orders_count'] = len(pending_opening_orders)
+        event_updates.append(append_candidate_rejected_event(None, best_candidate, ['max_open_positions_reached']))
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'max_open_positions_reached', 'reconcile': reconcile, 'event_updates': event_updates}}
     if not risk_guard['allowed']:
         cycle['live_skipped_due_to_risk_guard'] = risk_guard['reasons']
@@ -10780,7 +11509,16 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
             cycle['execution_degradation_mode'] = freshness.get('execution_degradation_mode', 'none')
             if freshness.get('state') == 'dead':
                 reason = str(freshness.get('reason') or 'stale_websocket')
-                return {'ok': True, 'cycle': dict(cycle, live_skipped_due_to_websocket_gate=[f'book_ticker_websocket_hard_veto:{reason}'], websocket_state=freshness.get('state'), websocket_gate_action=freshness.get('websocket_gate_action'), websocket_degradation_applied=False, final_execution_gate_action='veto', final_blocking_reason=f'websocket:{reason}'), 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': f'websocket_stale:{reason}'}}}
+                veto_cycle = dict(
+                    cycle,
+                    live_skipped_due_to_websocket_gate=[f'book_ticker_websocket_hard_veto:{reason}'],
+                    websocket_state=freshness.get('state'),
+                    websocket_gate_action=freshness.get('websocket_gate_action'),
+                    websocket_degradation_applied=False,
+                    final_execution_gate_action='veto',
+                    final_blocking_reason=f'websocket:{reason}',
+                )
+                return {'ok': True, 'cycle': veto_cycle, 'manager_update': {'kind': 'cycle', 'cycle': veto_cycle, 'state': 'SCAN', 'reason': f'websocket_stale:{reason}', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': f'websocket_stale:{reason}'}}}
             if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
                 candidate = build_websocket_degraded_candidate(candidate, freshness)
     state_transition = {'state': 'ENTERING', 'candidate_symbol': getattr(candidate, 'symbol', ''), 'reason': 'execution_gate_passed', 'risk_guard': execution_request.get('risk_guard'), 'reconcile': execution_request.get('reconcile')}
@@ -10956,7 +11694,7 @@ async def event_loop_latency_task(store: RuntimeStateStore, stop_event: asyncio.
 
 
 async def position_manager_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event) -> None:
-    full_reconcile_interval = max(900.0, float(getattr(args, 'position_order_reconcile_interval_seconds', 1200.0) or 1200.0))
+    full_reconcile_interval = compute_position_order_reconcile_interval_seconds(args)
     lightweight_reconcile_interval = 60.0
     last_full_reconcile_at = time.monotonic()
     last_lightweight_reconcile_at = 0.0
