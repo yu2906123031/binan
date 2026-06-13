@@ -87,24 +87,23 @@ python main.py --live --auto-loop --profile aggressive-fee-aware-scalp-short-onl
 python main.py --live --auto-loop --profile 10u-aggressive-v2
 ```
 
-## five-usdt-target-v1 profile
+## five-usdt-scalp-v2 profile
 
-- `five-usdt-target-v1` 面向单笔净利润约 `5 USDT` 的反推仓位模式，默认 `top_gainers=10`、`top_losers=10`、`max_candidates=5`、`scan_prefilter_multiplier=2`。
-- 选币分三层：A 层主流高流动性币种，B 层中等波动白名单，C 层热点/动量币种。
-- A/B/C 层分别使用更严格的 `expected_net_profit_usdt`、`expected_rr`、`expected_loss_usdt` 门槛；C 层额外要求放量、订单流确认与低滑点。
-- 最近亏损币种会进入冷却：单币最近大亏、当日累计亏损、最近 3 笔合计亏损都会触发 `symbol_recent_loss_cooldown` 或 `symbol_daily_loss_cooldown`。
-- `candidate_rejected`、`candidate_alerts`、`selected_alert` 会带上 `symbol_quality_tier`、`symbol_quality_reason`、`symbol_tier_min_expected_net_profit_usdt`、`symbol_tier_min_rr`、`symbol_tier_max_loss_usdt`，方便 recent diagnostics 复盘。
+- `five-usdt-scalp-v2` 是默认 profile，面向小仓位高频 scalp；profile 基线参数为 `risk_usdt=1.5`、`min_notional_usdt=20`、`max_notional_usdt=35`、`leverage=5`。
+- 当前 supervisor 实盘覆盖参数为 `risk_usdt=5.0`、`min_notional_usdt=60.0`、`max_notional_usdt=90.0`、`leverage=10`、`max_open_positions=2`、`max_long_positions=2`、`max_short_positions=1`、`margin_type=ISOLATED`。
+- 默认扫描多空两侧，启用费用感知、执行预检、缺失保护修复和 micro-scalp 评分。
+- 运行命令无需显式传 `--profile`；显式传入时也使用同一个 profile。
 
-扫描命令：
+Scan-only：
 
 ```powershell
-python main.py --scan-only --profile five-usdt-target-v1 --output-format json
+python main.py --scan-only --output-format json
 ```
 
-自动运行命令：
+Live auto-loop：
 
 ```powershell
-python main.py --live --auto-loop --profile five-usdt-target-v1
+python main.py --live --auto-loop
 ```
 
 ## 扫描输出补充字段

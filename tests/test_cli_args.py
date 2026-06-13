@@ -224,11 +224,16 @@ def test_parse_args_defaults_cover_run_loop_dependencies():
     assert args.square_symbols_file == ''
     assert args.external_signal_json == ''
     assert args.use_external_setup_relaxation is False
-    assert args.top_losers == 20
+    assert args.profile == 'five-usdt-scalp-v2'
+    assert args.top_gainers == 25
+    assert args.top_losers == 25
     assert args.lookback_bars == 12
     assert args.swing_bars == 6
     assert abs(args.stop_buffer_pct - 0.01) < 1e-9
     assert args.max_open_positions == 1
+    assert args.target_notional_usdt == 80.0
+    assert args.min_notional_usdt == 60.0
+    assert args.max_notional_usdt == 90.0
     assert args.notify_target == ''
     assert args.disable_notify is False
     assert args.telegram_bot_token_env == 'TELEGRAM_BOT_TOKEN'
@@ -237,9 +242,10 @@ def test_parse_args_defaults_cover_run_loop_dependencies():
     assert abs(args.breakeven_min_buffer_pct - 0.001) < 1e-9
     assert args.reconcile_only is False
     assert args.halt_on_orphan_position is False
-    assert abs(args.daily_max_loss_usdt - 0.0) < 1e-9
-    assert args.max_consecutive_losses == 0
-    assert args.symbol_cooldown_minutes == 0
+    assert abs(args.daily_max_loss_usdt - 10.0) < 1e-9
+    assert args.max_consecutive_losses == 2
+    assert args.consecutive_loss_pause_minutes == 120
+    assert args.symbol_cooldown_minutes == 5
     assert abs(args.gross_heat_cap_r - 0.0) < 1e-9
     assert abs(args.same_theme_heat_cap_r - 0.0) < 1e-9
     assert abs(args.same_correlation_heat_cap_r - 0.0) < 1e-9
@@ -783,6 +789,49 @@ def test_recommended_position_size_pct_applies_regime_and_side_multiplier():
     mod = load_module()
     assert abs(mod.recommended_position_size_pct('high', regime_multiplier=0.8, side_multiplier=1.15) - 2.76) < 1e-9
     assert abs(mod.recommended_position_size_pct('blocked', regime_multiplier=1.0, side_multiplier=1.15) - 0.0) < 1e-9
+
+
+def test_refresh_candidate_sizing_after_score_bonus_promotes_high_tier():
+    mod = load_module()
+    candidate = mod.Candidate(
+        symbol='HIGHUSDT',
+        last_price=1.0,
+        price_change_pct_24h=10.0,
+        quote_volume_24h=10_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.0,
+        acceleration_ratio_5m_vs_15m=2.0,
+        breakout_level=1.0,
+        recent_swing_low=0.9,
+        stop_price=0.9,
+        quantity=10.0,
+        risk_per_unit=0.1,
+        recommended_leverage=3,
+        rsi_5m=65.0,
+        volume_multiple=3.0,
+        distance_from_ema20_5m_pct=0.1,
+        distance_from_vwap_15m_pct=0.1,
+        higher_tf_summary={},
+        score=69.0,
+        reasons=[],
+        state='none',
+        regime_label='RANGE',
+        regime_multiplier=1.0,
+        side_risk_multiplier=1.0,
+    )
+
+    candidate.alert_tier = mod.classify_alert_tier(candidate)
+    assert candidate.alert_tier == 'watch'
+    candidate.score += 2.0
+    mod.refresh_candidate_execution_sizing(candidate)
+
+    assert candidate.alert_tier == 'high'
+    assert candidate.position_size_pct > 0.0
+    assert 'alert_tier=high' in candidate.reasons
+    assert any(reason.startswith('position_size_pct=') and not reason.endswith('=0.0') for reason in candidate.reasons)
 
 
 def test_main_rejects_legacy_runtime_state_real_directory_before_loading_env_or_credentials(tmp_path, monkeypatch):

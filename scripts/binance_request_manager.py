@@ -5,7 +5,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 
 class BinanceCircuitOpen(RuntimeError):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import itertools
 import threading
 from typing import Any, Callable, Dict, Optional
 
@@ -509,7 +510,6 @@ def place_live_trade(
         log_runtime_event('error', error_payload)
         emit_notification(args, 'error', error_payload)
         raise binance_api_error(error_payload['message'])
-    entry_order_error: Optional[Exception] = None
     entry_position_mode = 'HEDGE' if should_send_position_side(client) else 'ONE_WAY'
     requested_execution_mode = str(execution_quality.get('execution_mode') or 'maker_only').lower()
     allow_taker_entry = bool(getattr(args, 'allow_taker_entry', False))
@@ -578,7 +578,6 @@ def place_live_trade(
                 order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else order_id
                 client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else client_order_id
     except Exception as exc:
-        entry_order_error = exc
         error_message = str(exc)
         if is_position_side_mode_error(exc) and should_send_position_side(client):
             mark_one_way_position_mode(client)
@@ -964,12 +963,23 @@ def monitor_live_trade(
 
     active_stop_order = stop_order
     protection_status = protection_check.get('status') if isinstance(protection_check, dict) else None
-    max_cycles = max(int(getattr(args, 'max_monitor_cycles', 20) or 20), 1)
-    if getattr(args, 'monitor_poll_interval_sec', None) in (None, 0, 0.0, '0', '0.0') and getattr(args, 'max_monitor_cycles', None) is None:
-        max_cycles = max(max_cycles, 50)
+    raw_max_monitor_cycles = getattr(args, 'max_monitor_cycles', None)
+    monitor_poll_interval_raw = getattr(args, 'monitor_poll_interval_sec', 2)
+    monitor_poll_interval = float(monitor_poll_interval_raw or 0)
+    if raw_max_monitor_cycles is None:
+        cycle_iterable = itertools.count()
+        max_cycles_debug: Optional[int] = None
+    else:
+        parsed_max_monitor_cycles = int(raw_max_monitor_cycles or 0)
+        if parsed_max_monitor_cycles <= 0:
+            cycle_iterable = itertools.count()
+            max_cycles_debug = None
+        else:
+            max_cycles_debug = parsed_max_monitor_cycles
+            cycle_iterable = range(max_cycles_debug)
     trailing_buffer_pct = float(getattr(args, 'trailing_buffer_pct', 0.02) or 0.02)
-    book_ticker_cache_max_age_seconds = max(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2), 3.0)
-    for cycle_index in range(max_cycles):
+    book_ticker_cache_max_age_seconds = max(monitor_poll_interval if monitor_poll_interval > 0 else 2.0, 3.0)
+    for cycle_index in cycle_iterable:
         if record_runtime_heartbeat is not None:
             record_runtime_heartbeat(
                 store,
@@ -980,7 +990,7 @@ def monitor_live_trade(
                     'symbol': symbol,
                     'position_side': state.position_side,
                     'cycle_index': cycle_index,
-                    'max_cycles': max_cycles,
+                    'max_cycles': max_cycles_debug,
                     'remaining_quantity': state.remaining_quantity,
                 },
             )
@@ -1046,12 +1056,12 @@ def monitor_live_trade(
             'actions': actions,
             'remaining_quantity': state.remaining_quantity,
             'tracked': tracked,
-            'max_cycles': max_cycles,
+            'max_cycles': max_cycles_debug,
         }
         store.save_json('monitor_debug', debug_payload)
         if not actions:
             persist_position(status='monitoring', protection_status=protection_status, active_stop_order=active_stop_order)
-            time_module.sleep(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2))
+            time_module.sleep(monitor_poll_interval if monitor_poll_interval > 0 else 2.0)
             continue
         for action in actions:
             try:
@@ -1164,7 +1174,7 @@ def monitor_live_trade(
                 break
         if protection_status == 'flat':
             break
-        time_module.sleep(float(getattr(args, 'monitor_poll_interval_sec', 2) or 2))
+        time_module.sleep(monitor_poll_interval if monitor_poll_interval > 0 else 2.0)
 
     if record_runtime_heartbeat is not None:
         record_runtime_heartbeat(

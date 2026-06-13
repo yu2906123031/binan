@@ -238,7 +238,6 @@ def evaluate_risk_guards(
         effective_setup_ready = bool(must_pass_flags.get('setup_ready', getattr(candidate, 'setup_ready', False)))
         effective_trigger_fired = bool(must_pass_flags.get('trigger_fired', getattr(candidate, 'trigger_fired', False)))
         effective_probe_entry = bool(must_pass_flags.get('probe_entry', getattr(candidate, 'probe_entry', False)))
-        effective_high_vol_alt_mode = bool(must_pass_flags.get('high_vol_alt_mode', getattr(candidate, 'high_vol_alt_mode', False)))
         trigger_missing = set(getattr(candidate, 'trigger_missing', []) or [])
         trade_missing = set(getattr(candidate, 'trade_missing', []) or [])
         candidate_stage = str(getattr(candidate, 'candidate_stage', getattr(candidate, 'stage', '')) or '').strip()
@@ -338,7 +337,6 @@ def evaluate_risk_guards(
                 and _to_float(getattr(candidate, 'volume_multiple', 0.0)) >= 2.0
             ):
                 reasons.append('candidate_short_chase_risk')
-        liquidity_penalty_present = spread_bps > 0 or orderbook_slope > 0 or cancel_rate > 0
         explicit_liquidity_grade = str(getattr(candidate, 'liquidity_grade', '') or '').strip().upper()
         if execution_liquidity_grade == 'E':
             reasons.append('candidate_execution_liquidity_poor')

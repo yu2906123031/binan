@@ -290,7 +290,6 @@ def _append_tradeability_block_rows(lines: List[str], rows: Iterable[Dict[str, A
 
 
 def render_cn_scan_summary(summary: Dict[str, Any], format_num, format_pct) -> str:
-    market = summary.get('市场状态', {})
     overview = summary.get('扫描概览', {})
     selected = summary.get('首选标的')
     lines = [

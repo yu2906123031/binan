@@ -219,6 +219,26 @@ def test_kline_cache_missing_without_explicit_fallback_does_not_rest():
     assert diag['scanner_kline_rest_fallback_skipped_reason'] == 'scanner_kline_rest_fallback_disabled'
 
 
+def test_kline_rest_fallback_throttles_per_symbol_interval_not_globally():
+    store = GuardStore({'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 0})
+    args = argparse.Namespace(
+        scanner_rest_fallback=True,
+        scanner_kline_rest_fallback=True,
+        scanner_market_data_rest_fallback_max_used_weight_1m=700,
+        scanner_kline_rest_fallback_min_interval_seconds=300,
+    )
+    client = CountingClient()
+
+    btc_rows, btc_diag = m.resolve_scan_klines(client, store, args, 'BTCUSDT', '5m', 10, return_diagnostics=True)
+    eth_rows, eth_diag = m.resolve_scan_klines(client, store, args, 'ETHUSDT', '5m', 10, return_diagnostics=True)
+
+    assert btc_rows == [[1, 2, 3]]
+    assert eth_rows == [[1, 2, 3]]
+    assert [call[1]['symbol'] for call in client.calls] == ['BTCUSDT', 'ETHUSDT']
+    assert btc_diag['scanner_kline_rest_fallback_used'] is True
+    assert eth_diag['scanner_kline_rest_fallback_used'] is True
+
+
 def test_depth_cache_missing_without_explicit_fallback_does_not_rest():
     args = argparse.Namespace(scanner_rest_fallback=True, scanner_depth_rest_fallback=False)
     client = CountingClient()

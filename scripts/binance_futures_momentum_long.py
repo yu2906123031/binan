@@ -32,8 +32,8 @@ import portalocker
 
 _REAL_TIME_TIME = time.time
 
-import candidate_builder as candidate_builder_mod
 from execution_engine import cancel_stale_protection_orders_after_flat as execution_cancel_stale_protection_orders_after_flat, ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
+import candidate_builder as candidate_builder_mod  # noqa: F401 - re-exported for regression tests and helper compatibility
 from candidate_builder import build_candidate as build_candidate_impl
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
@@ -3396,9 +3396,6 @@ def classify_five_usdt_position_tier(candidate: Candidate, args: argparse.Namesp
     tp2_pct = _to_float(getattr(args, 'tp2_r', 2.5), 2.5) / 100.0
     tp3_pct = _to_float(getattr(args, 'tp3_r', 4.0), 4.0) / 100.0
     stop_pct = _to_float(getattr(args, 'stop_loss_pct', 0.01), 0.01)
-    tp1_close = _to_float(getattr(args, 'tp1_close_pct', 0.4), 0.4)
-    tp2_close = _to_float(getattr(args, 'tp2_close_pct', 0.4), 0.4)
-    tp3_close = _to_float(getattr(args, 'tp3_close_pct', 0.2), 0.2)
     expected_profit_at_tp1 = planned_notional * tp1_pct
     expected_profit_at_tp2 = planned_notional * tp2_pct
     expected_profit_at_tp3 = planned_notional * tp3_pct
@@ -4356,7 +4353,7 @@ def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeM
         state.current_stop_price = action['new_stop_price']
         state.moved_to_breakeven = True
         return state, new_stop_order, {**log_payload, 'new_stop_order': new_stop_order}
-    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit', 'stop_exit', 'micro_scalp_time_stop'}:
+    if action['type'] in {'take_profit_1', 'take_profit_2', 'runner_exit', 'stop_exit', 'hard_stop_loss', 'micro_scalp_time_stop'}:
         reduce_result = place_reduce_only_market(client, symbol, action['close_qty'], meta, side=side)
         state.remaining_quantity = round(max(state.remaining_quantity - action['close_qty'], 0.0), 10)
         if action['type'] == 'take_profit_1':
@@ -4368,7 +4365,12 @@ def apply_management_action(client, symbol: str, meta: SymbolMeta, state: TradeM
                 cancel_order(client, symbol, order_id=active_stop_order['orderId'])
             active_stop_order = place_stop_market_order(client, symbol, action['new_stop_price'], state.remaining_quantity, meta, side=side)
             state.current_stop_price = action['new_stop_price']
-        return state, active_stop_order, {**log_payload, 'reduce_order': reduce_result, 'new_stop_order': active_stop_order}
+        return state, active_stop_order, {
+            **log_payload,
+            'reduce_order': reduce_result,
+            'new_stop_order': active_stop_order,
+            'exit_reason': action.get('exit_reason'),
+        }
     return state, active_stop_order, log_payload
 
 
@@ -8225,7 +8227,6 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
     )
 
     rejected_events: List[Dict[str, Any]] = []
-    five_usdt_cooldown_map = {}
     early_reject_stats: Dict[str, Any] = {'total': 0, 'by_reason': {}, 'by_side': {}}
     candidates: List[Candidate] = []
     built_candidates: List[Candidate] = []
@@ -8832,6 +8833,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--auto-loop', action='store_true')
     parser.add_argument('--poll-interval-sec', type=int, default=60)
     parser.add_argument('--monitor-poll-interval-sec', type=int, default=15)
+    parser.add_argument('--max-monitor-cycles', type=int, default=20, help='Maximum foreground trade-management monitor cycles. Set 0 for unlimited monitoring.')
     parser.add_argument('--user-stream-refresh-interval-minutes', type=float, default=30.0, help='Refresh listen key after this many minutes.')
     parser.add_argument('--user-stream-disconnect-timeout-minutes', type=float, default=65.0, help='Mark user data stream disconnected when refresh heartbeat is older than this many minutes.')
     parser.add_argument('--base-url', default=os.getenv('BINANCE_FUTURES_BASE_URL', 'https://fapi.binance.com'))
@@ -9565,7 +9567,7 @@ def send_weixin_notification(chat_id: str, message: str, send_func=None) -> Dict
     if send_func is None:
         try:
             from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
-        except Exception as exc:
+        except Exception:
             hermes_agent_root = Path('/root/.hermes/hermes-agent')
             hermes_agent_root_text = str(hermes_agent_root)
             if hermes_agent_root.exists() and hermes_agent_root_text not in sys.path:
@@ -9777,7 +9779,9 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
     exchange_map = {
         build_position_key(row.get('symbol'), position_side_from_exchange_position(row)): row
         for row in list(exchange_positions or [])
-        if isinstance(row, dict) and row.get('symbol')
+        if isinstance(row, dict)
+        and row.get('symbol')
+        and abs(_to_float(row.get('positionAmt', row.get('position_amt', row.get('quantity'))))) > 0
     }
     closed_symbols: List[str] = []
     refreshed_symbols: List[str] = []
@@ -9800,11 +9804,6 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
         if exchange_row is None:
             live_quantity_value = abs(_to_float(tracked.get('quantity')))
             remaining_quantity_value = abs(_to_float(tracked.get('remaining_quantity')))
-            quantity_value = max(
-                live_quantity_value,
-                remaining_quantity_value,
-                abs(_to_float(tracked.get('filled_quantity'))),
-            )
             status_text = str(tracked.get('status') or '').lower()
             already_reconciled_closed = (
                 str(tracked.get('exchange_reconcile_reason') or '') == 'exchange_position_missing'
@@ -9851,6 +9850,14 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             continue
 
         tracked.update(exchange_position_runtime_fields(exchange_row))
+        if str(tracked.get('exchange_reconcile_reason') or '') == 'exchange_position_missing':
+            tracked.pop('exchange_reconcile_reason', None)
+            tracked.pop('closed_at', None)
+            if str(tracked.get('exit_reason') or '') == 'exchange_position_missing':
+                tracked.pop('exit_reason', None)
+            tracked['monitor_mode'] = 'trade_management'
+        if str(tracked.get('status') or '').lower() == 'closed':
+            tracked['status'] = 'monitoring'
         tracked['protection_status'] = 'protected' if position_key in protected_keys or symbol in protected_symbol_names else tracked.get('protection_status')
         if tracked.get('status') == 'orphan':
             orphan_symbols.append(report_key)
@@ -9887,11 +9894,16 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
     if not isinstance(positions_state, dict):
         positions_state = {}
     exchange_positions = fetch_open_positions(client)
+    active_exchange_positions = [
+        row
+        for row in list(exchange_positions or [])
+        if isinstance(row, dict) and abs(_to_float(row.get('positionAmt', row.get('position_amt', row.get('quantity'))))) > 0
+    ]
     orphan_positions = []
     positions_missing_protection = []
     protected_symbols = []
     protection_repairs = []
-    for row in exchange_positions:
+    for row in active_exchange_positions:
         symbol = row.get('symbol')
         if not symbol:
             continue
@@ -9944,12 +9956,12 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
                 positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
         else:
             tracked['protection_status'] = 'protected'
-            if tracked.get('status') == 'protected_recovery_pending':
+            if tracked.get('status') in {'protected_recovery_pending', 'recovery_pending'}:
                 tracked = recover_protected_position_trade_management_plan(tracked, protection, args)
             positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
-    sync_result = sync_tracked_positions_with_exchange(store, exchange_positions, protected_symbols=protected_symbols)
-    hard_max_loss_guard = evaluate_hard_max_loss_guard(exchange_positions, store)
+    sync_result = sync_tracked_positions_with_exchange(store, active_exchange_positions, protected_symbols=protected_symbols)
+    hard_max_loss_guard = evaluate_hard_max_loss_guard(active_exchange_positions, store)
     stale_protection_cleanup = []
     for closed_key in sync_result.get('closed_symbols', []) or []:
         closed_symbol, closed_side = split_position_key(closed_key)
@@ -9970,8 +9982,8 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         'positions_missing_protection': positions_missing_protection,
         'protection_repairs': protection_repairs,
         'stale_protection_cleanup': stale_protection_cleanup,
-        'exchange_position_count': len(exchange_positions),
-        'position_count': len(exchange_positions),
+        'exchange_position_count': len(active_exchange_positions),
+        'position_count': len(active_exchange_positions),
         'closed_tracked_positions': sync_result.get('closed_symbols', []),
         'refreshed_tracked_positions': sync_result.get('refreshed_symbols', []),
         'hard_max_loss_guard': hard_max_loss_guard,
@@ -10547,7 +10559,7 @@ def append_buy_fill_confirmed_event(store: RuntimeStateStore, symbol: str, posit
     user_data_stream = position.get('user_data_stream', {})
     if not isinstance(user_data_stream, dict):
         user_data_stream = {}
-    return store.append_event('buy_fill_confirmed', {
+    payload = {
         'symbol': symbol,
         'entry_price': position.get('entry_price'),
         'side': position.get('side'),
@@ -10565,7 +10577,10 @@ def append_buy_fill_confirmed_event(store: RuntimeStateStore, symbol: str, posit
         'monitor_mode': 'background_thread',
         'monitor_thread_name': position['monitor_thread_name'],
         'listen_key': user_data_stream.get('listen_key'),
-    })
+    }
+    store.append_event('entry_filled', dict(payload))
+    legacy_event = store.append_event('buy_fill_confirmed', dict(payload))
+    return legacy_event
 
 
 def build_auto_loop_state_payload(
@@ -11856,9 +11871,9 @@ async def manager_task(args: argparse.Namespace, store: RuntimeStateStore, queue
                     for event in list(update.get('events') or []):
                         if isinstance(event, dict):
                             append_runtime_event(store, str(event.get('event_type') or 'runtime_event'), event.get('payload') if isinstance(event.get('payload'), dict) else event)
-                    management_result = {'ok': True, 'event_updates': len(list(update.get('events') or []))}
+                    pass
                 else:
-                    management_result = management_cycle(args, update, store=store)
+                    management_cycle(args, update, store=store)
                 cycle = update.get('cycle') if isinstance(update.get('cycle'), dict) else None
                 if cycle is not None:
                     last_result = {'ok': True, 'cycles': [cycle], 'cycle_no': item.get('cycle_no'), 'auto_loop': True}

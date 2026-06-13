@@ -76,6 +76,7 @@ def make_args(**overrides):
         telegram_bot_token_env='TELEGRAM_BOT_TOKEN',
         output_format='json',
         require_book_ticker_ws=False,
+        max_monitor_cycles=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -916,6 +917,38 @@ def test_execution_cycle_refreshes_book_ticker_websocket_status_before_live_trad
     assert result['ok'] is True
     assert seen['meta']['book_ticker_websocket']['status'] == 'healthy'
     assert seen['meta']['book_ticker_websocket']['messages_processed'] == 10
+
+
+def test_execution_cycle_veto_manager_update_uses_refreshed_dead_websocket_status(monkeypatch):
+    mod = load_module()
+    args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
+    store = DummyStore()
+    dead_status = {
+        'status': 'disconnected',
+        'updated_at': mod._isoformat_utc(mod._utc_now()),
+        'last_message_at': mod._isoformat_utc(mod._utc_now()),
+        'messages_processed': 10,
+    }
+    store.save_json('book_ticker_ws_status', dead_status)
+    candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3)
+    req = {
+        'candidate': candidate,
+        'meta': {'symbol': 'DOGEUSDT', 'book_ticker_websocket': {'status': 'healthy', 'updated_at': '2000-01-01T00:00:00Z', 'messages_processed': 1}},
+        'risk_guard': {'allowed': True},
+        'reconcile': {'ok': True},
+        'cycle': {'cycle_no': 12},
+        'requested_leverage': 3,
+    }
+
+    monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: (_ for _ in ()).throw(AssertionError('dead websocket must veto execution')))
+
+    result = mod.execution_cycle(DummyClient(), args, req, store=store)
+
+    assert result['ok'] is True
+    assert result['cycle']['websocket_state'] == 'dead'
+    assert result['cycle']['live_skipped_due_to_websocket_gate'] == ['book_ticker_websocket_hard_veto:websocket_disconnected']
+    assert result['manager_update']['cycle']['websocket_state'] == 'dead'
+    assert result['manager_update']['cycle']['final_execution_gate_action'] == 'veto'
 
 
 
@@ -3301,6 +3334,7 @@ def test_monitor_live_trade_records_lifecycle_events_and_updates_position_state(
         profile='test-profile',
         trailing_buffer_pct=0.02,
         monitor_poll_interval_sec=0,
+        max_monitor_cycles=5,
         disable_notify=False,
         notify_target='telegram:demo',
     )
@@ -3455,6 +3489,84 @@ def test_monitor_live_trade_records_lifecycle_events_and_updates_position_state(
     assert monitor_heartbeat['status'] == 'flat'
     assert monitor_heartbeat['symbol'] == 'DOGEUSDT'
     assert monitor_heartbeat['remaining_quantity'] == 0.0
+
+
+def test_monitor_live_trade_runs_until_management_action_without_default_cycle_cap(monkeypatch, tmp_path):
+    mod = load_module()
+    store = mod.RuntimeStateStore(str(tmp_path))
+    args = make_args(
+        live=True,
+        auto_loop=False,
+        profile='test-profile',
+        trailing_buffer_pct=0.02,
+        monitor_poll_interval_sec=0,
+        max_monitor_cycles=None,
+        disable_notify=True,
+    )
+    meta = SimpleNamespace(step_size=0.01, quantity_precision=2, tick_size=0.01, price_precision=2)
+    plan = mod.build_trade_management_plan(
+        entry_price=100.0,
+        stop_price=95.0,
+        quantity=10.0,
+        tp1_r=1.0,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+    )
+    trade = {
+        'symbol': 'DOGEUSDT',
+        'entry_price': 100.0,
+        'side': 'LONG',
+        'stop_order': {'orderId': 777},
+        'trade_management_plan': mod.asdict(plan),
+        'protection_check': {'status': 'protected'},
+    }
+    store.save_json('positions', {
+        'DOGEUSDT:LONG': {
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'position_side': 'LONG',
+            'position_key': 'DOGEUSDT:LONG',
+            'status': 'monitoring',
+            'quantity': 10.0,
+            'remaining_quantity': 10.0,
+            'entry_price': 100.0,
+            'current_stop_price': 95.0,
+            'stop_order_id': 777,
+            'protection_status': 'protected',
+            'trade_management_plan': mod.asdict(plan),
+        }
+    })
+    cycle_count = {'value': 0}
+    applied_actions = []
+
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    def fake_fetch_klines(client, symbol, interval='5m', limit=21):
+        cycle_count['value'] += 1
+        return [[0, 0, 100.0, 100.0, 100.0, 0, 0, 0, 0, 0, 0, 0] for _ in range(limit)]
+
+    def fake_evaluate_management_actions(state, plan, current_price, ema5m, trailing_reference, trailing_buffer_pct, allow_runner_exit=False):
+        if cycle_count['value'] < 25:
+            return []
+        return [{'type': 'runner_exit', 'close_qty': state.remaining_quantity, 'trailing_floor': 100.0}]
+
+    def fake_apply_management_action(client, symbol, meta, state, action, active_stop_order):
+        applied_actions.append(action['type'])
+        state = dataclasses.replace(state, remaining_quantity=0.0)
+        return state, None, {'action': action['type'], 'reduce_order': {'status': 'FILLED'}}
+
+    monkeypatch.setattr(mod, 'fetch_klines', fake_fetch_klines)
+    monkeypatch.setattr(mod, 'evaluate_management_actions', fake_evaluate_management_actions)
+    monkeypatch.setattr(mod, 'apply_management_action', fake_apply_management_action)
+
+    result = mod.monitor_live_trade(client=DummyClient(), symbol='DOGEUSDT', meta=meta, args=args, trade=trade, store=store)
+
+    assert result['ok'] is True
+    assert result['status'] == 'closed'
+    assert cycle_count['value'] == 25
+    assert applied_actions == ['runner_exit']
 
 
 def test_monitor_live_trade_restores_checkpoint_state_before_evaluating_actions(monkeypatch, tmp_path):
@@ -4066,7 +4178,7 @@ def test_reconcile_positions_and_orders_cancels_opening_orders_when_position_cap
             if path == '/fapi/v1/openAlgoOrders':
                 return []
             raise AssertionError(path)
-        def signed_post(self, path, params):
+        def signed_delete(self, path, params):
             self.deleted.append((path, params))
             return {'ok': True, 'params': params}
 
@@ -4076,10 +4188,30 @@ def test_reconcile_positions_and_orders_cancels_opening_orders_when_position_cap
     assert result['ok'] is True
     assert result['cap_opening_order_detected'] == 1
     assert result['cap_opening_order_cancelled'] == 1
-    assert client.deleted == [('/fapi/v1/order/cancel', {'symbol': 'GENIUSUSDT', 'orderId': 11, 'origClientOrderId': 'entry_short'})]
+    assert client.deleted == [('/fapi/v1/order', {'symbol': 'GENIUSUSDT', 'orderId': 11, 'origClientOrderId': 'entry_short'})]
     event_types = [row['event_type'] for row in store.events]
     assert 'position_cap_opening_order_detected' in event_types
     assert 'position_cap_opening_order_cancelled' in event_types
+
+
+def test_raise_for_status_sanitizes_404_html_response():
+    mod = load_module()
+
+    class Response:
+        status_code = 404
+        text = '<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><script>alert(1)</script></body></html>'
+        headers = {'content-type': 'text/html'}
+        def json(self):
+            raise ValueError('not json')
+
+    with pytest.raises(mod.BinanceAPIError) as exc_info:
+        mod.BinanceFuturesClient._raise_for_status(Response())
+
+    message = str(exc_info.value)
+    assert 'Binance API error 404' in message
+    assert 'non_json_response' in message
+    assert '<html>' not in message
+    assert '<script>' not in message
 
 
 def test_reconcile_positions_and_orders_cancels_orphan_algo_orders():

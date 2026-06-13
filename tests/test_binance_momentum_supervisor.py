@@ -1,6 +1,5 @@
 import importlib.util
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -173,6 +172,17 @@ def test_build_command_uses_live_entry_relaxation_thresholds(monkeypatch, isolat
     assert cmd[cmd.index('--trigger-relax-min-points') + 1] == '2'
     assert cmd[cmd.index('--execution-slippage-hard-veto-r') + 1] == '450'
     assert cmd[cmd.index('--execution-slippage-risk-threshold-r') + 1] == '450'
+
+
+def test_build_command_uses_current_five_usdt_runtime_defaults(monkeypatch, isolated_supervisor_files):
+    cmd = supervisor.build_command()
+
+    assert cmd[cmd.index('--profile') + 1] == 'five-usdt-scalp-v2'
+    assert cmd[cmd.index('--min-notional-usdt') + 1] == '60.0'
+    assert cmd[cmd.index('--max-notional-usdt') + 1] == '90.0'
+    assert cmd[cmd.index('--max-open-positions') + 1] == '2'
+    assert cmd[cmd.index('--leverage') + 1] == '10'
+    assert cmd[cmd.index('--margin-type') + 1] == 'ISOLATED'
 
 
 def test_build_command_gives_live_execution_enough_deadman_budget(monkeypatch, isolated_supervisor_files):

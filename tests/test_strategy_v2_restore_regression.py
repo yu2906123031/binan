@@ -3593,6 +3593,34 @@ def test_apply_management_action_uses_position_side_for_short_reduce_and_stop(mo
     assert payload['reduce_order']['orderId'] == 88
 
 
+def test_apply_management_action_executes_hard_stop_loss_reduce_only_market(monkeypatch):
+    state = mod.TradeManagementState(
+        symbol='TESTUSDT',
+        initial_quantity=1.0,
+        remaining_quantity=0.7,
+        current_stop_price=95.0,
+    )
+    meta = make_meta()
+    calls = []
+
+    monkeypatch.setattr(mod, 'place_reduce_only_market', lambda client, symbol, quantity, meta, side=None: calls.append(('reduce', symbol, quantity, side)) or {'orderId': 44})
+
+    new_state, active_stop, payload = mod.apply_management_action(
+        client=object(),
+        symbol='TESTUSDT',
+        meta=meta,
+        state=state,
+        action={'type': 'hard_stop_loss', 'close_qty': 0.7, 'stop_price': 95.0, 'exit_reason': 'hard_stop_loss'},
+        active_stop_order={'orderId': 77},
+    )
+
+    assert calls == [('reduce', 'TESTUSDT', 0.7, 'LONG')]
+    assert new_state.remaining_quantity == 0.0
+    assert active_stop['orderId'] == 77
+    assert payload['reduce_order']['orderId'] == 44
+    assert payload['exit_reason'] == 'hard_stop_loss'
+
+
 def test_apply_management_action_confirms_breakeven_stop_replacement(monkeypatch):
     state = mod.TradeManagementState(symbol='TESTUSDT', initial_quantity=1.0, remaining_quantity=1.0, current_stop_price=95.0)
     meta = make_meta()
@@ -4163,6 +4191,62 @@ def test_sync_tracked_positions_with_exchange_marks_missing_exchange_position_cl
     assert positions['BTCUSDT:LONG']['protection_status'] == 'protected'
 
 
+def test_sync_tracked_positions_with_exchange_treats_zero_exchange_position_as_closed(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'CHZUSDT:LONG': {
+            'symbol': 'CHZUSDT',
+            'side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 1975.0,
+            'remaining_quantity': 1975.0,
+            'stop_order_id': 123,
+            'protection_status': 'protected',
+        },
+    })
+
+    result = mod.sync_tracked_positions_with_exchange(
+        store,
+        exchange_positions=[{'symbol': 'CHZUSDT', 'positionAmt': '0', 'positionSide': 'LONG'}],
+        protected_symbols=[],
+    )
+
+    positions = store.load_json('positions', {})
+    assert result['closed_symbols'] == ['CHZUSDT']
+    assert positions['CHZUSDT:LONG']['status'] == 'closed'
+    assert positions['CHZUSDT:LONG']['quantity'] == 0.0
+    assert positions['CHZUSDT:LONG']['remaining_quantity'] == 0.0
+    assert positions['CHZUSDT:LONG']['protection_status'] == 'flat'
+    assert positions['CHZUSDT:LONG']['exchange_position_amt'] == 0.0
+
+
+def test_reconcile_runtime_state_ignores_zero_exchange_rows_before_protection_repair(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'SEIUSDT:LONG': {
+            'symbol': 'SEIUSDT',
+            'side': 'LONG',
+            'status': 'open',
+            'quantity': 1214.0,
+            'remaining_quantity': 1214.0,
+            'stop_order_id': 123,
+            'protection_status': 'protected',
+        },
+    })
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'SEIUSDT', 'positionAmt': '0', 'positionSide': 'LONG'}])
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: (_ for _ in ()).throw(AssertionError('zero exchange rows must not enter protection repair')))
+
+    result = mod.reconcile_runtime_state(client=object(), store=store, halt_on_orphan_position=False)
+
+    positions = store.load_json('positions', {})
+    assert result['closed_tracked_positions'] == ['SEIUSDT']
+    assert result['exchange_position_count'] == 0
+    assert positions['SEIUSDT:LONG']['status'] == 'closed'
+    assert positions['SEIUSDT:LONG']['quantity'] == 0.0
+    assert positions['SEIUSDT:LONG']['remaining_quantity'] == 0.0
+    assert positions['SEIUSDT:LONG']['protection_status'] == 'flat'
+
+
 def test_reconcile_runtime_state_reports_closed_tracked_positions(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     store.save_json('positions', {
@@ -4243,6 +4327,91 @@ def test_sync_tracked_positions_with_exchange_clears_recovery_flags_when_positio
     assert rows[-1]['score'] == 82.6
     assert rows[-1]['state'] == 'launch'
     assert rows[-1]['alert_tier'] == 'critical'
+
+
+def test_append_buy_fill_confirmed_event_also_writes_entry_filled(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    position_key = 'TESTUSDT:SHORT'
+    positions_state = {
+        position_key: {
+            'symbol': 'TESTUSDT',
+            'side': 'SHORT',
+            'position_key': position_key,
+            'quantity': 12.0,
+            'filled_quantity': 12.0,
+            'entry_price': 1.23,
+            'stop_price': 1.27,
+            'stop_order_id': 99,
+            'protection_status': 'protected',
+            'entry_order_id': 88,
+            'entry_client_order_id': 'entry-88',
+            'entry_order_status': 'FILLED',
+            'entry_cum_quote': 14.76,
+            'entry_update_time': 123456789,
+            'monitor_thread_name': 'monitor-TESTUSDT',
+            'user_data_stream': {'listen_key': 'listen-1'},
+        }
+    }
+
+    result = mod.append_buy_fill_confirmed_event(store, 'TESTUSDT', positions_state, position_key)
+    events = [mod.json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+
+    assert result['event_type'] == 'buy_fill_confirmed'
+    assert [event['event_type'] for event in events] == ['entry_filled', 'buy_fill_confirmed']
+    assert events[0]['symbol'] == 'TESTUSDT'
+    assert events[0]['side'] == 'SHORT'
+    assert events[0]['position_key'] == position_key
+    assert events[0]['quantity'] == 12.0
+    assert events[0]['protection_status'] == 'protected'
+
+
+def test_sync_tracked_positions_with_exchange_reopens_previously_closed_record_when_exchange_position_returns(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'COSUSDT:LONG': {
+            'symbol': 'COSUSDT',
+            'side': 'long',
+            'position_side': 'LONG',
+            'status': 'monitoring',
+            'quantity': 0.0,
+            'remaining_quantity': 0.0,
+            'exchange_position_amt': 0.0,
+            'protection_status': 'flat',
+            'monitor_mode': 'closed',
+            'exchange_reconcile_reason': 'exchange_position_missing',
+            'closed_at': '2026-06-05T02:24:39.335215Z',
+            'exit_reason': 'exchange_position_missing',
+        },
+    })
+
+    result = mod.sync_tracked_positions_with_exchange(
+        store,
+        exchange_positions=[{
+            'symbol': 'COSUSDT',
+            'positionSide': 'LONG',
+            'positionAmt': '94311',
+            'entryPrice': '0.000668',
+            'markPrice': '0.000706',
+            'notional': '66.583566',
+            'unRealizedProfit': '3.583818',
+            'leverage': '10',
+        }],
+        protected_symbols=['COSUSDT:LONG'],
+    )
+    positions = store.load_json('positions', {})
+
+    assert result['closed_symbols'] == []
+    assert result['refreshed_symbols'] == ['COSUSDT']
+    assert positions['COSUSDT:LONG']['status'] == 'protected_recovery_pending'
+    assert positions['COSUSDT:LONG']['monitor_mode'] == 'trade_management'
+    assert positions['COSUSDT:LONG']['quantity'] == 94311.0
+    assert positions['COSUSDT:LONG']['remaining_quantity'] == 94311.0
+    assert positions['COSUSDT:LONG']['protection_status'] == 'protected'
+    assert positions['COSUSDT:LONG']['recovery_incomplete'] is True
+    assert positions['COSUSDT:LONG']['recovery_reason'] == 'missing_valid_stop_distance'
+    assert 'exchange_reconcile_reason' not in positions['COSUSDT:LONG']
+    assert 'closed_at' not in positions['COSUSDT:LONG']
+    assert 'exit_reason' not in positions['COSUSDT:LONG']
 
 
 def test_sync_tracked_positions_with_exchange_does_not_repeat_reconcile_close_events_for_already_closed_position(tmp_path):
@@ -4660,6 +4829,76 @@ def test_reconcile_runtime_state_rebuilds_plan_for_protected_recovered_short(mon
     assert 'recovery_incomplete' not in tracked
     assert 'recovery_reason' not in tracked
 
+
+def test_reconcile_runtime_state_rebuilds_plan_for_protected_recovered_long_from_recovery_pending(monkeypatch, tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'NILUSDT:LONG': {
+            'symbol': 'NILUSDT',
+            'side': 'LONG',
+            'status': 'recovery_pending',
+            'quantity': 1619.1,
+            'remaining_quantity': 1619.1,
+            'entry_price': 0.03891,
+            'stop_price': 0.03891,
+            'current_stop_price': 0.03891,
+            'protection_status': None,
+            'trade_management_plan': None,
+            'recovery_incomplete': True,
+            'recovery_reason': 'missing_valid_stop_distance',
+        },
+    })
+
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{
+        'symbol': 'NILUSDT',
+        'positionAmt': '1619.1',
+        'positionSide': 'LONG',
+        'entryPrice': '0.03891',
+        'markPrice': '0.04023',
+        'unRealizedProfit': '2.15',
+        'notional': '65.15',
+        'leverage': '10',
+    }])
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *args, **kwargs: {
+        'status': 'protected',
+        'active_position': {'symbol': 'NILUSDT', 'positionAmt': '1619.1', 'positionSide': 'LONG'},
+        'expected_order_id': None,
+        'open_orders': [{'algoId': 1000001901193255, 'orderType': 'STOP_MARKET', 'triggerPrice': '0.03813'}],
+    })
+
+    result = mod.reconcile_runtime_state(
+        client=object(),
+        store=store,
+        halt_on_orphan_position=False,
+        repair_missing_protection_enabled=True,
+        args=argparse.Namespace(
+            tp1_r=1.5,
+            tp1_close_pct=0.3,
+            tp1_profit_usdt=0.0,
+            tp2_r=2.0,
+            tp2_close_pct=0.4,
+            breakeven_r=1.0,
+            breakeven_confirmation_mode='ema_support',
+            breakeven_min_buffer_pct=0.001,
+            micro_scalp_time_stop_sec=0,
+            micro_scalp_min_profit_r=0.0,
+        ),
+    )
+
+    positions = store.load_json('positions', {})
+    tracked = positions['NILUSDT:LONG']
+    assert result['positions_missing_protection'] == []
+    assert tracked['protection_status'] == 'protected'
+    assert tracked['status'] == 'monitoring'
+    assert tracked['protected_recovery_pending'] is False
+    assert tracked['current_stop_price'] == 0.03813
+    assert tracked['stop_price'] == 0.03813
+    assert tracked['trade_management_plan']['side'] == 'long'
+    assert tracked['trade_management_plan']['position_side'] == 'LONG'
+    assert tracked['trade_management_plan']['stop_price'] == 0.03813
+    assert tracked['trade_management_plan']['initial_risk_per_unit'] > 0
+    assert 'recovery_incomplete' not in tracked
+    assert 'recovery_reason' not in tracked
 
 def test_reconcile_runtime_state_recovers_plan_from_protection_open_order_stop(monkeypatch, tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
