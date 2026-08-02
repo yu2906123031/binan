@@ -147,8 +147,11 @@ def test_five_usdt_profile_classifies_symbol_quality_tiers():
     assert mod.classify_five_usdt_symbol_quality_tier('NEARUSDT')['symbol_quality_tier'] == 'B'
     tier_c = mod.classify_five_usdt_symbol_quality_tier('1000BONKUSDT')
     assert tier_c['symbol_quality_tier'] == 'C'
-    assert tier_c['symbol_tier_min_expected_net_profit_usdt'] == 5.0
-    assert tier_c['symbol_tier_min_rr'] == 2.0
+    assert tier_c['symbol_tier_min_expected_net_profit_usdt'] == 5.8
+    assert tier_c['symbol_tier_min_rr'] == 2.5
+    underperformer = mod.classify_five_usdt_symbol_quality_tier('NOTUSDT')
+    assert underperformer['symbol_quality_tier'] == 'C'
+    assert underperformer['symbol_quality_reason'] == 'recent_30d_underperformer_deweighted'
 
 
 def test_five_usdt_symbol_loss_cooldown_map_uses_recent_closed_losses():
@@ -162,18 +165,61 @@ def test_five_usdt_symbol_loss_cooldown_map_uses_recent_closed_losses():
     assert cooldowns['ZECUSDT']['reasons'] == ['symbol_recent_loss_cooldown']
 
 
+def test_five_usdt_symbol_loss_cooldown_map_blocks_two_consecutive_losses_for_six_hours():
+    mod = load_strategy()
+    now = mod._utc_now()
+    store = DummyStore([
+        {'event_type': 'trade_closed', 'symbol': 'HYPEUSDT', 'net_pnl_usdt': -0.4, 'closed_at': mod._isoformat_utc(now - mod.datetime.timedelta(hours=2))},
+        {'event_type': 'trade_closed', 'symbol': 'HYPEUSDT', 'net_pnl_usdt': -0.5, 'closed_at': mod._isoformat_utc(now - mod.datetime.timedelta(hours=1))},
+    ])
+    cooldown = mod.build_symbol_loss_cooldown_map(store)['HYPEUSDT']
+    assert 'symbol_consecutive_loss_cooldown' in cooldown['reasons']
+    assert cooldown['consecutive_losses'] == 2
+    assert mod._parse_iso8601_utc(cooldown['cooldown_until']) >= now + mod.datetime.timedelta(hours=4, minutes=59)
+
+
+def test_five_usdt_symbol_loss_cooldown_map_blocks_recent_profit_factor_below_point_seven():
+    mod = load_strategy()
+    now = mod._utc_now()
+    rows = []
+    pnls = [0.2, -1.0, 0.2, -1.0, 0.2, -1.0, 0.2, -1.0, 0.2, -1.0]
+    for index, pnl in enumerate(pnls):
+        rows.append({'event_type': 'trade_closed', 'symbol': 'WLDUSDT', 'net_pnl_usdt': pnl, 'closed_at': mod._isoformat_utc(now - mod.datetime.timedelta(hours=10 - index))})
+    cooldown = mod.build_symbol_loss_cooldown_map(DummyStore(rows))['WLDUSDT']
+    assert 'symbol_low_profit_factor_cooldown' in cooldown['reasons']
+    assert cooldown['recent10_profit_factor'] == 0.2
+
+
 def test_five_usdt_candidate_selection_filter_applies_tier_thresholds_and_fields():
     mod = load_strategy()
     candidate = make_candidate(mod, expected_net_profit_usdt=4.8, oi_change_pct_5m=1.0, cvd_delta=1.0)
     reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
     assert reason == 'symbol_tier_expected_profit_too_low'
     assert candidate.symbol_quality_tier == 'C'
-    assert candidate.symbol_tier_min_expected_net_profit_usdt == 5.0
+    assert candidate.symbol_tier_min_expected_net_profit_usdt == 5.8
+
+
+def test_five_usdt_candidate_selection_filter_blocks_recent_underperformers():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        symbol='NOTUSDT',
+        expected_net_profit_usdt=99.0,
+        expected_rr=99.0,
+        expected_loss_usdt=0.1,
+        oi_change_pct_5m=1.0,
+        cvd_delta=1.0,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason == 'recent_30d_underperformer_blacklist'
+    assert 'recent_30d_underperformer_deweighted' in candidate.reasons
 
 
 def test_five_usdt_candidate_selection_filter_rejects_c_tier_without_orderflow_confirmation():
     mod = load_strategy()
-    candidate = make_candidate(mod)
+    candidate = make_candidate(mod, expected_net_profit_usdt=6.2, expected_rr=2.8, expected_loss_usdt=1.0)
     reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
     assert reason == 'c_tier_missing_orderflow_confirmation'
 
@@ -266,6 +312,8 @@ def test_micro_scalp_profile_defaults_are_safe_and_small():
     assert args.trailing_after_pct == 0.018
     assert args.max_holding_minutes >= 30
     assert args.timeout_exit_enabled is True
+    assert args.micro_scalp_time_stop_sec == 2700
+    assert args.micro_scalp_min_profit_r == 0.0
     assert args.execution_preflight_enabled is True
     assert args.repair_missing_protection is True
 

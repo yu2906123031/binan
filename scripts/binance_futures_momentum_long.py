@@ -1830,14 +1830,16 @@ def evaluate_websocket_freshness(health: Any, *, max_age_seconds: float = 30.0, 
     now_dt = now.astimezone(datetime.timezone.utc) if isinstance(now, datetime.datetime) and now.tzinfo else (now.replace(tzinfo=datetime.timezone.utc) if isinstance(now, datetime.datetime) else _utc_now())
     status = str(health.get('status') or health.get('connected_state') or '').lower()
     health_age = _websocket_age_seconds(health.get('updated_at'), now_dt)
-    message_age = _websocket_age_seconds(health.get('last_message_at') or health.get('last_event_at') or health.get('last_received_at') or health.get('updated_at'), now_dt)
-    sample_age = _websocket_age_seconds(health.get('last_sample_at') or health.get('last_sample_write_at') or health.get('last_written_at') or health.get('updated_at'), now_dt)
+    message_age = _websocket_age_seconds(health.get('last_message_at') or health.get('last_event_at') or health.get('last_received_at'), now_dt)
+    sample_age = _websocket_age_seconds(health.get('last_sample_at') or health.get('last_sample_write_at') or health.get('last_written_at'), now_dt)
     reconnect_age = _websocket_age_seconds(health.get('last_reconnect_at') or health.get('reconnected_at') or health.get('last_connect_at'), now_dt)
     messages = int(health.get('messages_processed', 0) or 0)
     samples = int(health.get('samples_written', 0) or 0)
     subscription_count = int(health.get('symbol_count', health.get('subscription_count', health.get('subscriptions', 0))) or 0)
-    ages = [age for age in (health_age, message_age, sample_age) if age is not None]
-    flow_age = min(ages) if ages else None
+    flow_ages = [age for age in (message_age, sample_age) if age is not None]
+    # Heartbeat writes are not market-data flow. Use the oldest available flow
+    # timestamp so one fresh field cannot conceal a stale message/sample path.
+    flow_age = max(flow_ages) if flow_ages else None
     hard_stale_seconds = max(float(max_age_seconds or 30.0), 30.0) * 3.0
     if status in {'dead', 'failed', 'unavailable', 'disconnected', 'closed'}:
         state, mode, reason = 'dead', 'blocked', f'websocket_{status}'
@@ -2642,12 +2644,17 @@ def _book_ticker_websocket_supervisor_target(
             symbol_provider=symbol_provider,
             ws_module=ws_module,
             max_supervisor_cycles=0,
+            generation_id=generation_id,
         )
         with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
             current_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
         if current_generation != int(generation_id):
             append_runtime_event(store, 'book_ticker_ws_supervisor_generation_exit', {'generation_id': generation_id, 'current_generation_id': current_generation, 'stage': 'after_return'})
     except Exception as exc:
+        with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+            current_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        if current_generation != int(generation_id):
+            return
         append_runtime_event(store, 'book_ticker_ws_supervisor_crashed', {
             'event_source': 'book_ticker_websocket',
             'error': str(exc),
@@ -2659,6 +2666,7 @@ def _book_ticker_websocket_supervisor_target(
             reconnect_count=int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('reconnect_count', 0) or 0),
             subscription_version=int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('subscription_version', 0) or 0),
             last_error=str(exc),
+            generation_id=generation_id,
         )
 
 
@@ -2778,7 +2786,12 @@ def run_auto_loop_book_ticker_websocket_monitor_unavailable_branch(
     summary = unavailable_summary_builder(config.unavailable_reason)
     unavailable_event_emitter = resolve_auto_loop_book_ticker_unavailable_event_emitter(store=store, config=config)
     unavailable_event_emitter(summary)
-    return build_auto_loop_book_ticker_unavailable_result(summary=summary)
+    health = update_book_ticker_ws_health_state(
+        store, status='unavailable', symbols=[], reconnect_count=0,
+        subscription_version=0, last_error=config.unavailable_reason,
+        extra={'active': False, 'thread_count': 0},
+    )
+    return dict(build_auto_loop_book_ticker_unavailable_result(summary=summary), health=health)
 
 
 def build_auto_loop_book_ticker_unavailable_result(*, summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -2830,6 +2843,7 @@ def build_auto_loop_book_ticker_supervisor_summary(
     symbol_provider: Callable[[], Sequence[str]],
     ws_module: Any,
     max_supervisor_cycles: Optional[int],
+    generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     initial_symbols = list(symbol_provider())
     target_sample_count = 6
@@ -2841,6 +2855,7 @@ def build_auto_loop_book_ticker_supervisor_summary(
         ws_module=ws_module,
         max_supervisor_cycles=max_supervisor_cycles,
         max_messages_per_cycle=max_messages_per_cycle,
+        generation_id=generation_id,
     )
 
 
@@ -2978,7 +2993,21 @@ REJECT_REASON_LABELS = {
     'extended_chase_veto': 'price_extension_chase',
     'control_risk_veto': 'control_risk',
     'external_signal_veto': 'external_signal_blocked',
+    'tradfi_perps_agreement_required': 'tradfi_perps_agreement_required',
 }
+
+
+TRADFI_PERPS_SYMBOLS = frozenset({
+    'MRVLUSDT',
+    'XAUUSDT',
+    'XAGUSDT',
+    'SKHYNIXUSDT',
+})
+
+
+def is_tradfi_perps_symbol(symbol: Any) -> bool:
+    normalized = str(symbol or '').strip().upper()
+    return normalized in TRADFI_PERPS_SYMBOLS
 
 
 def classify_execution_liquidity_grade(
@@ -4007,8 +4036,10 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
             return
         now_dt = now.astimezone(datetime.timezone.utc) if isinstance(now, datetime.datetime) and now.tzinfo else (now.replace(tzinfo=datetime.timezone.utc) if isinstance(now, datetime.datetime) else _utc_now())
         held_seconds = max((now_dt - opened_at).total_seconds(), 0.0)
-        realized_r = float(getattr(state, 'realized_r', 0.0) or 0.0)
-        if held_seconds < time_stop_sec or realized_r < min_profit_r:
+        risk_per_unit = max(float(getattr(plan, 'initial_risk_per_unit', 0.0) or 0.0), 0.0)
+        direction = -1.0 if is_short else 1.0
+        unrealized_r = direction * (float(current_price) - float(plan.entry_price)) / risk_per_unit if risk_per_unit > 0 else 0.0
+        if held_seconds < time_stop_sec or unrealized_r < min_profit_r:
             return
         actions.append({
             'type': 'micro_scalp_time_stop',
@@ -4016,7 +4047,7 @@ def evaluate_management_actions(state: TradeManagementState, plan: TradeManageme
             'exit_reason': 'micro_scalp_time_stop',
             'held_seconds': round(held_seconds, 2),
             'min_profit_r': min_profit_r,
-            'realized_r': realized_r,
+            'unrealized_r': round(unrealized_r, 6),
         })
 
     if is_short:
@@ -6870,12 +6901,21 @@ def update_book_ticker_ws_health_state(
     active_streams: Optional[Sequence[str]] = None,
     last_error: str = '',
     extra: Optional[Dict[str, Any]] = None,
+    generation_id: Optional[int] = None,
+    last_message_at: Optional[str] = None,
+    last_sample_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     normalized_symbols = []
     for raw_symbol in list(symbols or []):
         symbol = str(raw_symbol or '').strip().upper()
         if symbol and symbol not in normalized_symbols:
             normalized_symbols.append(symbol)
+    if store is not None and hasattr(store, 'load_json'):
+        previous = store.load_json('book_ticker_ws_status', {})
+    else:
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
     payload = {
         'status': str(status or '').strip() or 'unknown',
         'updated_at': _isoformat_utc(_utc_now()),
@@ -6887,11 +6927,23 @@ def update_book_ticker_ws_health_state(
         'samples_written': int(samples_written or 0),
         'active_streams': list(active_streams or []),
         'last_error': str(last_error or ''),
+        'owner_pid': os.getpid(),
+        'thread_name': threading.current_thread().name,
+        'thread_count': 1,
+        'active': str(status or '').lower() not in {'dead', 'failed', 'unavailable', 'disconnected', 'closed', 'error'},
+        'last_message_at': last_message_at or previous.get('last_message_at'),
+        'last_sample_at': last_sample_at or previous.get('last_sample_at'),
     }
     if isinstance(extra, dict):
         payload.update(extra)
-    if store is not None:
-        store.save_json('book_ticker_ws_status', payload)
+    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        current_generation = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        payload['generation_id'] = current_generation if generation_id is None else int(generation_id)
+        if generation_id is not None and current_generation != int(generation_id):
+            payload['persisted'] = False
+            return payload
+        if store is not None:
+            store.save_json('book_ticker_ws_status', payload)
     return payload
 
 
@@ -6904,6 +6956,7 @@ def refresh_book_ticker_websocket_subscription(
     base_ws_url: str,
     connect_timeout_seconds: float,
     sslopt: Optional[Dict[str, Any]] = None,
+    generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     current_symbols = [str(row).strip().upper() for row in list(state.get('symbols') or []) if str(row).strip()]
     next_symbols = [row.split('@')[0].upper() for row in build_book_ticker_stream_names(requested_symbols)]
@@ -6912,7 +6965,15 @@ def refresh_book_ticker_websocket_subscription(
     ws = state.get('ws')
     if ws is not None and hasattr(ws, 'close'):
         ws.close()
-    state['ws'] = open_websocket_fn(next_symbols, ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+    opened_ws = open_websocket_fn(next_symbols, ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+        current = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+        if generation_id is not None and current != int(generation_id):
+            if hasattr(opened_ws, 'close'):
+                opened_ws.close()
+            return {'reopened': False, 'symbols': current_symbols, 'subscription_version': int(state.get('subscription_version', 0) or 0), 'superseded': True}
+        state['ws'] = opened_ws
+        _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = opened_ws
     state['symbols'] = next_symbols
     state['streams'] = build_book_ticker_stream_names(next_symbols)
     state['subscription_version'] = int(state.get('subscription_version', 0) or 0) + 1
@@ -6941,6 +7002,9 @@ def refresh_book_ticker_websocket_subscription(
         samples_written=previous_samples_written,
         active_streams=state['streams'],
         last_error=str(previous_health.get('last_error') or ''),
+        generation_id=generation_id,
+        last_message_at=previous_health.get('last_message_at'),
+        last_sample_at=previous_health.get('last_sample_at'),
     )
     return {'reopened': True, 'symbols': next_symbols, 'subscription_version': state['subscription_version']}
 
@@ -6964,7 +7028,25 @@ def run_book_ticker_websocket_supervisor(
     reconnect_backoff_cap_seconds: float = 30.0,
     zero_message_timeout_reconnect_threshold: int = 3,
     sslopt: Optional[Dict[str, Any]] = None,
+    generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
+    def generation_is_current() -> bool:
+        if generation_id is None:
+            return True
+        with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+            return int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0) == int(generation_id)
+
+    def open_and_register(symbols: Sequence[Any]):
+        opened_ws = open_websocket_fn(symbols, ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
+        with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
+            current = int(_BOOK_TICKER_WS_SUPERVISOR_STATE.get('generation_id', 0) or 0)
+            if generation_id is not None and current != int(generation_id):
+                if hasattr(opened_ws, 'close'):
+                    opened_ws.close()
+                return None
+            _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = opened_ws
+            return opened_ws
+
     requested_symbols = list(initial_symbols or [])
     if callable(symbol_provider):
         provider_symbols = symbol_provider()
@@ -6973,15 +7055,17 @@ def run_book_ticker_websocket_supervisor(
     normalized_symbols = [row.split('@')[0].upper() for row in build_book_ticker_stream_names(requested_symbols)]
     if not normalized_symbols:
         raise ValueError('at least one symbol is required for bookTicker websocket supervisor')
+    if not generation_is_current():
+        return {'cycles_completed': 0, 'stopped': True, 'stop_reason': 'superseded_generation'}
     state: Dict[str, Any] = {
         'symbols': normalized_symbols,
         'streams': build_book_ticker_stream_names(normalized_symbols),
         'reconnect_count': 0,
         'subscription_version': 1,
     }
-    state['ws'] = open_websocket_fn(normalized_symbols, ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
-    with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
-        _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
+    state['ws'] = open_and_register(normalized_symbols)
+    if state['ws'] is None:
+        return {'cycles_completed': 0, 'stopped': True, 'stop_reason': 'superseded_generation'}
     update_book_ticker_ws_health_state(
         store,
         status='connecting',
@@ -6989,13 +7073,14 @@ def run_book_ticker_websocket_supervisor(
         reconnect_count=state['reconnect_count'],
         subscription_version=state['subscription_version'],
         active_streams=state['streams'],
+        generation_id=generation_id,
     )
     cycles_completed = 0
     messages_processed_total = 0
     samples_written_total = 0
     backoff_seconds = max(float(reconnect_backoff_seconds or 0.0), 0.0)
     zero_message_timeouts = 0
-    while True:
+    while generation_is_current():
         try:
             result = monitor_cycle_fn(
                 store,
@@ -7007,6 +7092,8 @@ def run_book_ticker_websocket_supervisor(
             )
         except Exception as exc:
             cycles_completed += 1
+            if not generation_is_current():
+                break
             result = {
                 'status': 'disconnected',
                 'messages_processed': 0,
@@ -7030,6 +7117,7 @@ def run_book_ticker_websocket_supervisor(
                 samples_written=samples_written_total,
                 active_streams=state['streams'],
                 last_error=str(exc),
+                generation_id=generation_id,
             )
             refresh_result = {'reopened': False, 'symbols': list(state['symbols']), 'subscription_version': state['subscription_version']}
             refreshed_symbols = state['symbols']
@@ -7042,9 +7130,11 @@ def run_book_ticker_websocket_supervisor(
                 state['streams'] = build_book_ticker_stream_names(state['symbols'])
             if backoff_seconds > 0:
                 sleep_fn(backoff_seconds)
-            state['ws'] = open_websocket_fn(state['symbols'], ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
-            with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
-                _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
+            if not generation_is_current():
+                break
+            state['ws'] = open_and_register(state['symbols'])
+            if state['ws'] is None:
+                break
             state['reconnect_count'] = int(state.get('reconnect_count', 0) or 0) + 1
             append_rate_limited_runtime_event(store, 'book_ticker_ws_reconnected', {
                 'event_source': 'book_ticker_websocket',
@@ -7065,6 +7155,7 @@ def run_book_ticker_websocket_supervisor(
                 samples_written=samples_written_total,
                 active_streams=state['streams'],
                 last_error=str(exc),
+                generation_id=generation_id,
             )
             if backoff_seconds > 0:
                 backoff_seconds = min(max(float(reconnect_backoff_cap_seconds or 0.0), 0.0), max(backoff_seconds * float(reconnect_backoff_multiplier or 1.0), backoff_seconds))
@@ -7075,6 +7166,8 @@ def run_book_ticker_websocket_supervisor(
         messages_processed_total += int(result.get('messages_processed', 0) or 0)
         samples_written_total += int(result.get('samples_written', 0) or 0)
         status = str(result.get('status') or 'unknown')
+        if not generation_is_current():
+            break
         if bool(result.get('zero_message_timeout')) or (status == 'idle_timeout' and int(result.get('messages_processed', 0) or 0) <= 0):
             zero_message_timeouts += 1
             if zero_message_timeouts >= max(int(zero_message_timeout_reconnect_threshold or 1), 1):
@@ -7089,6 +7182,8 @@ def run_book_ticker_websocket_supervisor(
                 zero_message_timeouts = 0
         else:
             zero_message_timeouts = 0
+        cycle_message_at = _isoformat_utc(_utc_now()) if int(result.get('messages_processed', 0) or 0) > 0 else None
+        cycle_sample_at = _isoformat_utc(_utc_now()) if int(result.get('samples_written', 0) or 0) > 0 else None
         update_book_ticker_ws_health_state(
             store,
             status=status,
@@ -7099,6 +7194,9 @@ def run_book_ticker_websocket_supervisor(
             samples_written=samples_written_total,
             active_streams=state['streams'],
             last_error=str(result.get('error') or ''),
+            generation_id=generation_id,
+            last_message_at=cycle_message_at,
+            last_sample_at=cycle_sample_at,
         )
         refresh_result = {'reopened': False, 'symbols': list(state['symbols']), 'subscription_version': state['subscription_version']}
         refreshed_symbols = state['symbols']
@@ -7116,6 +7214,7 @@ def run_book_ticker_websocket_supervisor(
                 base_ws_url=base_ws_url,
                 connect_timeout_seconds=connect_timeout_seconds,
                 sslopt=sslopt,
+                generation_id=generation_id,
             )
         elif build_book_ticker_stream_names(refreshed_symbols) != build_book_ticker_stream_names(state['symbols']):
             state['symbols'] = [row.split('@')[0].upper() for row in build_book_ticker_stream_names(refreshed_symbols)]
@@ -7123,9 +7222,11 @@ def run_book_ticker_websocket_supervisor(
         if status == 'disconnected' and not refresh_result['reopened']:
             if backoff_seconds > 0:
                 sleep_fn(backoff_seconds)
-            state['ws'] = open_websocket_fn(state['symbols'], ws_module=ws_module, base_ws_url=base_ws_url, connect_timeout_seconds=connect_timeout_seconds, sslopt=sslopt)
-            with _BOOK_TICKER_WS_SUPERVISOR_LOCK:
-                _BOOK_TICKER_WS_SUPERVISOR_STATE['ws'] = state['ws']
+            if not generation_is_current():
+                break
+            state['ws'] = open_and_register(state['symbols'])
+            if state['ws'] is None:
+                break
             state['reconnect_count'] = int(state.get('reconnect_count', 0) or 0) + 1
             append_rate_limited_runtime_event(store, 'book_ticker_ws_reconnected', {
                 'event_source': 'book_ticker_websocket',
@@ -7145,6 +7246,7 @@ def run_book_ticker_websocket_supervisor(
                 samples_written=samples_written_total,
                 active_streams=state['streams'],
                 last_error=str(result.get('error') or ''),
+                generation_id=generation_id,
             )
             if backoff_seconds > 0:
                 backoff_seconds = min(max(float(reconnect_backoff_cap_seconds or 0.0), 0.0), max(backoff_seconds * float(reconnect_backoff_multiplier or 1.0), backoff_seconds))
@@ -7240,16 +7342,21 @@ FIVE_USDT_TIER_A_SYMBOLS = {
 FIVE_USDT_TIER_B_SYMBOLS = {
     'NEARUSDT', 'ONDOUSDT', 'APTUSDT', 'SEIUSDT', 'TIAUSDT', 'INJUSDT', 'WIFUSDT', 'PEPEUSDT', 'FETUSDT', 'LDOUSDT',
 }
+FIVE_USDT_RECENT_UNDERPERFORMER_SYMBOLS = {
+    'NOTUSDT', 'HYPEUSDT', 'WLDUSDT', 'ZROUSDT', 'BASUSDT', 'CLOUSDT', 'UBUSDT',
+}
 FIVE_USDT_TIER_RULES = {
-    'A': {'min_profit': 4.2, 'min_rr': 1.7, 'max_loss': 2.5},
-    'B': {'min_profit': 4.5, 'min_rr': 1.8, 'max_loss': 2.5},
-    'C': {'min_profit': 5.0, 'min_rr': 2.0, 'max_loss': 2.2},
+    'A': {'min_profit': 4.8, 'min_rr': 2.0, 'max_loss': 1.8},
+    'B': {'min_profit': 5.2, 'min_rr': 2.2, 'max_loss': 1.6},
+    'C': {'min_profit': 5.8, 'min_rr': 2.5, 'max_loss': 1.4},
 }
 
 
 def classify_five_usdt_symbol_quality_tier(symbol: str) -> Dict[str, Any]:
     normalized = normalize_symbol(symbol)
-    if normalized in FIVE_USDT_TIER_A_SYMBOLS:
+    if normalized in FIVE_USDT_RECENT_UNDERPERFORMER_SYMBOLS:
+        tier = 'C'; reason = 'recent_30d_underperformer_deweighted'
+    elif normalized in FIVE_USDT_TIER_A_SYMBOLS:
         tier = 'A'; reason = 'high_liquidity_whitelist'
     elif normalized in FIVE_USDT_TIER_B_SYMBOLS:
         tier = 'B'; reason = 'medium_volatility_whitelist'
@@ -7301,6 +7408,15 @@ def build_symbol_loss_cooldown_map(store: Optional[RuntimeStateStore], *, limit:
         last = trades[-1]
         today_loss = sum(item['pnl'] for item in trades if item['ts'].date() == now.date() and item['pnl'] < 0)
         recent3 = trades[-3:]
+        recent10 = trades[-10:]
+        consecutive_losses = 0
+        for trade in reversed(trades):
+            if float(trade['pnl']) >= 0:
+                break
+            consecutive_losses += 1
+        gross_profit_10 = sum(float(item['pnl']) for item in recent10 if float(item['pnl']) > 0)
+        gross_loss_10 = abs(sum(float(item['pnl']) for item in recent10 if float(item['pnl']) < 0))
+        profit_factor_10 = gross_profit_10 / gross_loss_10 if gross_loss_10 > 0 else None
         reasons: List[str] = []
         until: Optional[datetime] = None
         if float(last['pnl']) <= -2.5 and (now - last['ts']).total_seconds() < 24 * 3600:
@@ -7312,8 +7428,17 @@ def build_symbol_loss_cooldown_map(store: Optional[RuntimeStateStore], *, limit:
         if len(recent3) >= 3 and sum(item['pnl'] for item in recent3) < 0:
             reasons.append('symbol_recent_loss_cooldown')
             until = max(until or now, last['ts'] + datetime.timedelta(hours=48))
+        if consecutive_losses >= 3:
+            reasons.append('symbol_consecutive_loss_cooldown')
+            until = max(until or now, last['ts'] + datetime.timedelta(hours=24))
+        elif consecutive_losses >= 2:
+            reasons.append('symbol_consecutive_loss_cooldown')
+            until = max(until or now, last['ts'] + datetime.timedelta(hours=6))
+        if len(recent10) >= 10 and profit_factor_10 is not None and profit_factor_10 < 0.7:
+            reasons.append('symbol_low_profit_factor_cooldown')
+            until = max(until or now, last['ts'] + datetime.timedelta(hours=24))
         if reasons:
-            cooldowns[symbol] = {'reasons': list(dict.fromkeys(reasons)), 'cooldown_until': _isoformat_utc(until or now), 'last_trade_net_pnl_usdt': round(float(last['pnl']), 4), 'today_loss_usdt': round(float(today_loss), 4)}
+            cooldowns[symbol] = {'reasons': list(dict.fromkeys(reasons)), 'cooldown_until': _isoformat_utc(until or now), 'last_trade_net_pnl_usdt': round(float(last['pnl']), 4), 'today_loss_usdt': round(float(today_loss), 4), 'consecutive_losses': consecutive_losses, 'recent10_profit_factor': round(float(profit_factor_10), 4) if profit_factor_10 is not None else None}
     return cooldowns
 
 
@@ -7351,6 +7476,9 @@ def apply_five_usdt_watchlist_scoring(candidate: Candidate, regime_payload: Opti
 
 def apply_five_usdt_candidate_selection_filter(candidate: Candidate, args: argparse.Namespace, store: Optional[RuntimeStateStore], cooldown_map: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:
     apply_five_usdt_symbol_quality_fields(candidate)
+    if normalize_symbol(candidate.symbol) in FIVE_USDT_RECENT_UNDERPERFORMER_SYMBOLS:
+        candidate.reasons.append('recent_30d_underperformer_deweighted')
+        return 'recent_30d_underperformer_blacklist'
     tier = str(candidate.symbol_quality_tier or 'C')
     if float(getattr(candidate, 'expected_net_profit_usdt', 0.0) or 0.0) < float(candidate.symbol_tier_min_expected_net_profit_usdt or 0.0):
         return 'symbol_tier_expected_profit_too_low'
@@ -7412,6 +7540,8 @@ def merged_candidate_symbols(**kwargs) -> Tuple[List[str], Dict[str, int], Dict[
 
 
 def apply_hard_veto_filters(candidate: Candidate) -> Optional[str]:
+    if is_tradfi_perps_symbol(getattr(candidate, 'symbol', '')):
+        return 'tradfi_perps_agreement_required'
     execution_slippage_r = compute_expected_slippage_r(candidate)
     execution_liquidity_grade = classify_execution_liquidity_grade(candidate.book_depth_fill_ratio, execution_slippage_r)
     if candidate.smart_money_veto:
@@ -8822,6 +8952,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tp2-profit-usdt', type=float, default=0.0)
     parser.add_argument('--tp3-r', type=float, default=0.0)
     parser.add_argument('--tp3-close-pct', type=float, default=0.0)
+    parser.add_argument('--micro-scalp-time-stop-sec', type=int, default=0, help='Close stale micro-scalp positions after this many seconds when the minimum profit R condition is met.')
+    parser.add_argument('--micro-scalp-min-profit-r', type=float, default=0.0, help='Minimum realized R required for the micro-scalp time stop action.')
     parser.add_argument('--target-notional-usdt', type=float, default=0.0)
     parser.add_argument('--probe-min-notional-usdt', type=float, default=20.0)
     parser.add_argument('--probe-max-notional-usdt', type=float, default=30.0)
@@ -8974,6 +9106,8 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         'disable_adaptive_risk_upscale': False,
         'atr_stop_multiplier': 1.5,
         'five_usdt_watchlist_scoring': False,
+        'micro_scalp_time_stop_sec': 0,
+        'micro_scalp_min_profit_r': 0.0,
     }
     for key, value in defaults.items():
         if not hasattr(args, key):
@@ -9111,6 +9245,8 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'trailing_after_pct': 0.018,
             'max_holding_minutes': 45,
             'timeout_exit_enabled': True,
+            'micro_scalp_time_stop_sec': 2700,
+            'micro_scalp_min_profit_r': 0.0,
             'min_score': 55.0,
             'sim_probe_min_score': 55.0,
             'trigger_min_confirmations': 1,
@@ -11514,6 +11650,10 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
     execution_timeout_seconds = float(getattr(args, 'execution_timeout_seconds', 30.0) or 30.0)
     if getattr(args, 'require_book_ticker_ws', False):
         fresh_websocket_status = store.load_json('book_ticker_ws_status', {})
+        if not isinstance(fresh_websocket_status, dict) or not fresh_websocket_status:
+            freshness = evaluate_websocket_freshness(None)
+            veto_cycle = dict(cycle, book_ticker_websocket_freshness=freshness, final_execution_gate_action='veto', final_blocking_reason='websocket:missing_health')
+            return {'ok': True, 'cycle': veto_cycle, 'manager_update': {'kind': 'cycle', 'cycle': veto_cycle, 'state': 'SCAN', 'reason': 'websocket_stale:missing_health', 'state_transition': {'state': 'SCAN', 'reason': 'websocket_dead', 'blocked_reason': 'websocket_stale:missing_health'}}}
         if isinstance(fresh_websocket_status, dict) and fresh_websocket_status:
             fresh_websocket_status = choose_latest_websocket_health(meta.get('book_ticker_websocket') if isinstance(meta, dict) else {}, fresh_websocket_status)
             meta = dict(meta)
@@ -11537,14 +11677,26 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
             if freshness.get('execution_degradation_mode') in {'reduced_aggression', 'maker_only'}:
                 candidate = build_websocket_degraded_candidate(candidate, freshness)
     state_transition = {'state': 'ENTERING', 'candidate_symbol': getattr(candidate, 'symbol', ''), 'reason': 'execution_gate_passed', 'risk_guard': execution_request.get('risk_guard'), 'reconcile': execution_request.get('reconcile')}
+    execution_events = [{
+        'event_type': 'execution_deadman_started',
+        'symbol': getattr(candidate, 'symbol', ''),
+        'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')),
+        'position_key': build_position_key(getattr(candidate, 'symbol', ''), getattr(candidate, 'side', getattr(candidate, 'position_side', POSITION_SIDE_LONG))),
+        'operation': 'place_live_trade',
+        'phase': 'preflight_margin_leverage_entry_stop',
+        'timeout_seconds': float(execution_timeout_seconds or 0.0),
+        'execution_mode_override': str(getattr(candidate, 'execution_mode_override', '') or ''),
+        'execution_degradation_mode': str(getattr(candidate, 'execution_degradation_mode', '') or ''),
+        'candidate_stage': str(getattr(candidate, 'candidate_stage', '') or ''),
+    }]
     try:
         live_execution = run_with_deadman_timeout(place_live_trade, client, candidate, int(execution_request.get('requested_leverage') or 1), meta, args, timeout_seconds=execution_timeout_seconds, store=store, component='execution', operation='place_live_trade')
     except BinanceAPIError as exc:
         error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': str(exc)}
-        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error}}
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error, 'event_updates': execution_events}}
     if isinstance(live_execution, dict) and live_execution.get('reason') == 'deadman_timeout':
         error = {'exchange': 'Binance', 'simulated': bool(is_binance_simulated_trading(args)), 'symbol': candidate.symbol, 'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')), 'error': 'execution_timeout', 'deadman': live_execution}
-        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error, 'state_transition': {'state': 'SCAN', 'reason': 'execution_timeout', 'blocked_reason': 'execution_timeout'}}}
+        return {'ok': False, 'live_execution_error': error, 'cycle': dict(cycle, live_execution_error=error), 'manager_update': {'kind': 'execution_error', 'cycle': dict(cycle, live_execution_error=error), 'error': error, 'event_updates': execution_events, 'state_transition': {'state': 'SCAN', 'reason': 'execution_timeout', 'blocked_reason': 'execution_timeout'}}}
     cycle['live_execution'] = live_execution
     position_side = getattr(candidate, 'position_side', getattr(candidate, 'side', POSITION_SIDE_LONG))
     position_key = build_position_key(candidate.symbol, position_side)
@@ -11560,7 +11712,7 @@ def execution_cycle(client: Any, args: argparse.Namespace, execution_request: Di
         'reconcile': execution_request.get('reconcile'),
         'cycle': cycle,
     }
-    return {'ok': True, 'live_execution': live_execution, 'cycle': cycle, 'position_manager_request': position_manager_request, 'manager_update': {'kind': 'execution_result', 'cycle': cycle, 'position_key': position_key, 'state_transition': state_transition}}
+    return {'ok': True, 'live_execution': live_execution, 'cycle': cycle, 'position_manager_request': position_manager_request, 'manager_update': {'kind': 'execution_result', 'cycle': cycle, 'position_key': position_key, 'event_updates': execution_events, 'state_transition': state_transition}}
 
 
 def management_cycle(args: argparse.Namespace, manager_update: Dict[str, Any], *, store: Optional[RuntimeStateStore] = None) -> Dict[str, Any]:

@@ -18,6 +18,21 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload), encoding='utf-8')
 
 
+def test_process_rows_counts_live_owned_scanner_as_active(monkeypatch):
+    class FakeResult:
+        stdout = '\n'.join([
+            '101 1 100 /venv/bin/python3 -u /root/.hermes/scripts/binance_momentum_supervisor.py',
+            '202 101 90 /venv/bin/python -u /root/binan/scripts/binance_futures_momentum_long.py --live --auto-loop',
+            '303 202 10 /venv/bin/python -u /root/binan/scripts/binance_futures_momentum_long.py --live --auto-loop',
+        ])
+
+    monkeypatch.setattr(ctl.subprocess, 'run', lambda *args, **kwargs: FakeResult())
+
+    rows = ctl.process_rows()
+    assert [r['kind'] for r in rows] == ['supervisor', 'live_child', 'scanner_active']
+    assert ctl.pids('scanner_deadman') == []
+
+
 def test_doctor_accepts_single_websocket_owner_with_multiple_symbol_streams(tmp_path):
     runtime_state_dir = tmp_path / 'state'
     _write_json(runtime_state_dir / 'book_ticker_ws_status.json', {

@@ -168,8 +168,8 @@ def test_main_blocks_when_runtime_state_cannot_recover_account_position(monkeypa
 def test_build_command_uses_live_entry_relaxation_thresholds(monkeypatch, isolated_supervisor_files):
     cmd = supervisor.build_command()
 
-    assert cmd[cmd.index('--trigger-relax-min-score') + 1] == '64'
-    assert cmd[cmd.index('--trigger-relax-min-points') + 1] == '2'
+    assert cmd[cmd.index('--trigger-relax-min-score') + 1] == '72'
+    assert cmd[cmd.index('--trigger-relax-min-points') + 1] == '3'
     assert cmd[cmd.index('--execution-slippage-hard-veto-r') + 1] == '450'
     assert cmd[cmd.index('--execution-slippage-risk-threshold-r') + 1] == '450'
 
@@ -178,9 +178,19 @@ def test_build_command_uses_current_five_usdt_runtime_defaults(monkeypatch, isol
     cmd = supervisor.build_command()
 
     assert cmd[cmd.index('--profile') + 1] == 'five-usdt-scalp-v2'
-    assert cmd[cmd.index('--min-notional-usdt') + 1] == '60.0'
-    assert cmd[cmd.index('--max-notional-usdt') + 1] == '90.0'
-    assert cmd[cmd.index('--max-open-positions') + 1] == '2'
+    assert cmd[cmd.index('--target-notional-usdt') + 1] == '110.0'
+    assert cmd[cmd.index('--min-notional-usdt') + 1] == '100.0'
+    assert cmd[cmd.index('--max-notional-usdt') + 1] == '120.0'
+    assert cmd[cmd.index('--tp1-profit-usdt') + 1] == '6.0'
+    assert cmd[cmd.index('--tp2-profit-usdt') + 1] == '0.0'
+    assert cmd[cmd.index('--tp1-close-pct') + 1] == '1.0'
+    assert cmd[cmd.index('--tp2-close-pct') + 1] == '0.0'
+    assert cmd[cmd.index('--max-open-positions') + 1] == '3'
+    assert cmd[cmd.index('--min-target-net-profit-usdt') + 1] == '4.0'
+    assert cmd[cmd.index('--max-loss-usdt') + 1] == '1.8'
+    assert cmd[cmd.index('--min-expected-rr') + 1] == '2.0'
+    assert cmd[cmd.index('--trigger-min-confirmations') + 1] == '3'
+    assert cmd[cmd.index('--micro-scalp-time-stop-sec') + 1] == '2700'
     assert cmd[cmd.index('--leverage') + 1] == '10'
     assert cmd[cmd.index('--margin-type') + 1] == 'ISOLATED'
 

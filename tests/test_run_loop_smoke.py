@@ -892,7 +892,8 @@ def test_execution_cycle_refreshes_book_ticker_websocket_status_before_live_trad
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
     store = DummyStore()
-    fresh_status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now()), 'messages_processed': 10}
+    now = mod._utc_now()
+    fresh_status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(now), 'last_message_at': mod._isoformat_utc(now), 'messages_processed': 10}
     store.save_json('book_ticker_ws_status', fresh_status)
     candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3)
     req = {
@@ -1914,10 +1915,9 @@ def test_run_loop_auto_loop_records_book_ticker_unavailable_when_dependency_miss
     result = mod.run_loop(DummyClient(), make_args(auto_loop=True, live=False, runtime_state_dir=str(tmp_path)))
 
     cycle = result['cycles'][0]
-    assert cycle['book_ticker_websocket'] == {
-        'status': 'unavailable',
-        'reason': 'websocket_client_missing',
-    }
+    assert cycle['book_ticker_websocket']['status'] == 'unavailable'
+    assert cycle['book_ticker_websocket']['reason'] == 'websocket_client_missing'
+    assert cycle['book_ticker_websocket']['health']['status'] == 'unavailable'
     events = store.read_events(limit=10)
     assert any(row['event_type'] == 'book_ticker_ws_unavailable' for row in events)
 
@@ -1969,10 +1969,9 @@ def test_run_loop_auto_loop_hard_gates_live_trade_when_book_ticker_websocket_una
 
     cycle = result['cycles'][0]
     assert placed == []
-    assert cycle['book_ticker_websocket'] == {
-        'status': 'unavailable',
-        'reason': 'websocket_client_missing',
-    }
+    assert cycle['book_ticker_websocket']['status'] == 'unavailable'
+    assert cycle['book_ticker_websocket']['reason'] == 'websocket_client_missing'
+    assert cycle['book_ticker_websocket']['health']['status'] == 'unavailable'
     assert cycle['live_skipped_due_to_websocket_gate'] == ['book_ticker_websocket_unavailable:websocket_client_missing']
 
 
@@ -2011,6 +2010,8 @@ def test_run_loop_auto_loop_refreshes_stale_book_ticker_gate_from_runtime_store(
     store.save_json('book_ticker_ws_status', {
         'status': 'healthy',
         'updated_at': mod._isoformat_utc(fresh),
+        'last_message_at': mod._isoformat_utc(fresh),
+        'last_sample_at': mod._isoformat_utc(fresh),
         'messages_processed': 100,
         'samples_written': 100,
         'symbol_count': 108,
@@ -2025,7 +2026,7 @@ def test_run_loop_auto_loop_refreshes_stale_book_ticker_gate_from_runtime_store(
     monkeypatch.setattr(mod, 'run_scan_once', lambda *args, **kwargs: ({'ok': True, 'candidate_count': 1, 'candidates': [{'symbol': 'DOGEUSDT'}]}, candidate, {'DOGEUSDT': {'score': candidate.score, 'quote_volume_24h': candidate.quote_volume_24h}}))
     monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
     monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
-    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', lambda **kwargs: {'summary': {'status': 'healthy'}, 'health': {'status': 'healthy', 'updated_at': mod._isoformat_utc(old), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}})
+    monkeypatch.setattr(mod, 'run_auto_loop_book_ticker_websocket_monitor', lambda **kwargs: {'summary': {'status': 'healthy'}, 'health': {'status': 'healthy', 'updated_at': mod._isoformat_utc(old), 'last_message_at': mod._isoformat_utc(old), 'last_sample_at': mod._isoformat_utc(old), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}})
     monkeypatch.setattr(mod, 'place_live_trade', lambda *a, **k: placed.append(True) or {'symbol': 'DOGEUSDT', 'quantity': 100.0})
     monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
 
@@ -4439,7 +4440,8 @@ def test_resident_marks_running_after_initial_runtime_tasks_start(monkeypatch):
 def test_websocket_jitter_degrades_execution_without_veto():
     mod = load_module()
     now = mod._utc_now()
-    status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(now - datetime.timedelta(seconds=4)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    event_at = mod._isoformat_utc(now - datetime.timedelta(seconds=4))
+    status = {'status': 'healthy', 'updated_at': event_at, 'last_message_at': event_at, 'last_sample_at': event_at, 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
 
     freshness = mod.evaluate_websocket_freshness(status, now=now)
 
@@ -4451,7 +4453,8 @@ def test_websocket_jitter_degrades_execution_without_veto():
 def test_reconnecting_websocket_allows_maker_only_degradation():
     mod = load_module()
     now = mod._utc_now()
-    status = {'status': 'reconnecting', 'updated_at': mod._isoformat_utc(now - datetime.timedelta(seconds=12)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    event_at = mod._isoformat_utc(now - datetime.timedelta(seconds=12))
+    status = {'status': 'reconnecting', 'updated_at': event_at, 'last_message_at': event_at, 'last_sample_at': event_at, 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
     candidate = SimpleNamespace(symbol='DOGEUSDT', quantity=10.0, position_size_pct=1.0, reasons=[])
 
     freshness = mod.evaluate_websocket_freshness(status, now=now)
@@ -4551,12 +4554,13 @@ def test_execution_cycle_refresh_recovered_websocket_continues_execution(monkeyp
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
     store = DummyStore()
-    fresh = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now()), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    now = mod._utc_now()
+    fresh = {'status': 'healthy', 'updated_at': mod._isoformat_utc(now), 'last_message_at': mod._isoformat_utc(now), 'last_sample_at': mod._isoformat_utc(now), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
     store.save_json('book_ticker_ws_status', fresh)
     candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
     req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT', 'book_ticker_websocket': {'status': 'dead'}}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 13}, 'requested_leverage': 3}
     seen = {}
-    monkeypatch.setattr(mod, 'place_live_trade', lambda client, cand, lev, meta, passed_args: seen.setdefault('meta', meta) or {'symbol': cand.symbol, 'quantity': cand.quantity})
+    monkeypatch.setattr(mod, 'place_live_trade', lambda client, cand, lev, meta, passed_args: seen.__setitem__('meta', meta) or {'symbol': cand.symbol, 'quantity': cand.quantity})
     monkeypatch.setattr(mod, 'run_with_deadman_timeout', lambda fn, *a, **k: fn(*a))
 
     result = mod.execution_cycle(DummyClient(), args, req, store=store)
@@ -4570,7 +4574,8 @@ def test_stale_guard_metrics_written_in_meta_and_cycle(monkeypatch):
     mod = load_module()
     args = make_args(auto_loop=True, live=True, require_book_ticker_ws=True)
     store = DummyStore()
-    status = {'status': 'healthy', 'updated_at': mod._isoformat_utc(mod._utc_now() - datetime.timedelta(seconds=5)), 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
+    event_at = mod._isoformat_utc(mod._utc_now() - datetime.timedelta(seconds=5))
+    status = {'status': 'healthy', 'updated_at': event_at, 'last_message_at': event_at, 'last_sample_at': event_at, 'messages_processed': 100, 'samples_written': 100, 'symbol_count': 108}
     store.save_json('book_ticker_ws_status', status)
     candidate = SimpleNamespace(symbol='DOGEUSDT', side='LONG', position_side='LONG', recommended_leverage=3, quantity=10.0, position_size_pct=1.0, reasons=[])
     req = {'candidate': candidate, 'meta': {'symbol': 'DOGEUSDT'}, 'risk_guard': {'allowed': True}, 'reconcile': {'ok': True}, 'cycle': {'cycle_no': 14}, 'requested_leverage': 3}

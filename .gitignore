@@ -6,6 +6,7 @@ __pycache__/
 # Runtime state and local artifacts
 runtime-state/
 runtime-state-binance-futures-testnet/
+analysis/
 *.log
 *.sqlite
 *.db

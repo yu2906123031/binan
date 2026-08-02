@@ -461,6 +461,24 @@ def place_live_trade(
         raise binance_api_error('preflight hard gate: existing_open_orders')
 
     margin_type_check = ensure_symbol_margin_type_fn(client, candidate.symbol, margin_type=requested_margin_type)
+    actual_margin_type = str((margin_type_check or {}).get('actual') or '').strip().upper()
+    margin_type_applied = bool((margin_type_check or {}).get('ok')) and actual_margin_type == requested_margin_type
+    if not margin_type_applied:
+        error_payload = {
+            'symbol': candidate.symbol,
+            'side': position_side,
+            'position_key': position_key,
+            'profile': profile,
+            'preflight_reason': 'margin_type_mismatch',
+            'requested_margin_type': requested_margin_type,
+            'actual_margin_type': actual_margin_type or 'UNKNOWN',
+            'multi_assets_mode': bool((margin_type_check or {}).get('multi_assets_mode')),
+            'fallback_reason': str((margin_type_check or {}).get('fallback_reason') or ''),
+            'message': f'preflight hard gate: margin_type_mismatch requested={requested_margin_type} actual={actual_margin_type or "UNKNOWN"}',
+        }
+        log_runtime_event('error', error_payload)
+        emit_notification(args, 'error', error_payload)
+        raise binance_api_error(error_payload['message'])
     leverage_response = client.signed_post('/fapi/v1/leverage', {'symbol': candidate.symbol, 'leverage': requested_leverage})
     actual_leverage = int(_to_float(leverage_response.get('leverage'), default=requested_leverage)) if isinstance(leverage_response, dict) else requested_leverage
     if actual_leverage != requested_leverage:
@@ -489,12 +507,13 @@ def place_live_trade(
     step_size = float(getattr(meta, 'step_size', 0.0) or 0.0)
     quantity_precision = int(getattr(meta, 'quantity_precision', 0) or 0)
     min_qty = float(getattr(meta, 'min_qty', 0.0) or 0.0)
-    base_quantity = round_step(candidate.quantity, step_size, quantity_precision)
+    raw_quantity = float(getattr(candidate, 'quantity', 0.0) or 0.0)
+    base_quantity = round_step(raw_quantity, step_size, quantity_precision)
     scaled_quantity = round_step(base_quantity * float(execution_quality['size_multiplier']), step_size, quantity_precision)
-    quantity = scaled_quantity if scaled_quantity >= min_qty else scaled_quantity
+    quantity = scaled_quantity
     if getattr(candidate, 'probe_entry', False):
         probe_size_ratio = float(getattr(args, 'sim_probe_size_ratio', 0.2) or 0.2)
-        quantity = max(quantity * probe_size_ratio, min_qty)
+        quantity = round_step(quantity * probe_size_ratio, step_size, quantity_precision)
     if quantity < min_qty:
         error_payload = {
             'symbol': candidate.symbol,
@@ -538,6 +557,7 @@ def place_live_trade(
     if should_send_position_side(client):
         entry_params['positionSide'] = position_side
     started_at = time_module.time()
+    post_only_rejection = False
     try:
         entry_order = client.signed_post('/fapi/v1/order', entry_params)
         if execution_mode == 'maker_only':
@@ -598,7 +618,38 @@ def place_live_trade(
                 emit_notification(args, 'error', error_payload)
                 raise binance_api_error(message) from recovery_exc
         else:
-            raise
+            is_post_only_reject = '-5022' in error_message or 'Post Only order will be rejected' in error_message
+            high_confidence_candidate = (
+                str(getattr(candidate, 'candidate_stage', '') or '').lower() == 'trade_candidate'
+                and not bool(getattr(candidate, 'pretrigger_watch', False))
+                and float(getattr(candidate, 'score', 0.0) or 0.0) >= float(getattr(args, 'maker_post_only_fallback_min_score', 70.0) or 70.0)
+            )
+            websocket_degraded = str(getattr(candidate, 'execution_degradation_mode', '') or '').lower() in {'reduced_aggression', 'maker_only'}
+            allow_post_only_taker_fallback = bool(getattr(args, 'allow_post_only_taker_fallback', False))
+            liquidity_grade = str(execution_quality.get('execution_liquidity_grade') or '').upper()
+            expected_slippage_r = float(execution_quality.get('expected_slippage_r', getattr(candidate, 'expected_slippage_r', 0.0)) or 0.0)
+            fallback_slippage_limit_r = max(float(getattr(args, 'maker_post_only_fallback_max_slippage_r', 0.05) or 0.05), 0.0)
+            fallback_execution_safe = liquidity_grade in {'A+', 'A'} and expected_slippage_r <= fallback_slippage_limit_r
+            if execution_mode == 'maker_only' and is_post_only_reject and high_confidence_candidate and allow_post_only_taker_fallback and not websocket_degraded and fallback_execution_safe:
+                post_only_rejection = True
+                fallback_params = dict(entry_params)
+                fallback_params.pop('timeInForce', None)
+                fallback_params.pop('price', None)
+                fallback_params['type'] = 'MARKET'
+                log_runtime_event('post_only_taker_fallback', {
+                    'symbol': candidate.symbol,
+                    'side': position_side,
+                    'position_key': position_key,
+                    'reason': 'post_only_rejected',
+                    'candidate_stage': str(getattr(candidate, 'candidate_stage', '') or ''),
+                    'score': float(getattr(candidate, 'score', 0.0) or 0.0),
+                    'websocket_degraded': websocket_degraded,
+                })
+                entry_order = client.signed_post('/fapi/v1/order', fallback_params)
+                execution_mode = 'taker'
+                entry_params = fallback_params
+            else:
+                raise
     entry_price = _to_float(entry_order.get('avgPrice')) or float(candidate.last_price)
     filled_quantity = _to_float(entry_order.get('executedQty'), default=0.0)
     if filled_quantity <= 0 or str(entry_order.get('status') or '').upper() not in {'FILLED', 'PARTIALLY_FILLED'}:
@@ -642,6 +693,7 @@ def place_live_trade(
         'fill_ratio': round(filled_quantity / quantity, 6) if quantity > 0 else 0.0,
         'liquidity_grade_at_entry': execution_quality.get('execution_liquidity_grade'),
         'liquidity_grade_reason': execution_quality.get('liquidity_grade_reason'),
+        'post_only_taker_fallback': post_only_rejection,
     }
     plan = build_trade_management_plan(
         entry_price=entry_price,
@@ -658,6 +710,8 @@ def place_live_trade(
         breakeven_min_buffer_pct=float(getattr(args, 'breakeven_min_buffer_pct', 0.001) or 0.0),
         tp1_profit_usdt=float(getattr(args, 'tp1_profit_usdt', 0.0) or 0.0),
         tp2_profit_usdt=float(getattr(args, 'tp2_profit_usdt', 0.0) or 0.0),
+        micro_scalp_time_stop_sec=int(getattr(args, 'micro_scalp_time_stop_sec', 0) or 0),
+        micro_scalp_min_profit_r=float(getattr(args, 'micro_scalp_min_profit_r', 0.0) or 0.0),
     )
     payload = {
         'symbol': candidate.symbol,

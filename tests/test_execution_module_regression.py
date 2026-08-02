@@ -330,6 +330,35 @@ def test_execution_module_ensure_symbol_margin_type_falls_back_to_crossed_under_
     ]
 
 
+def test_place_live_trade_blocks_margin_type_mismatch_before_leverage_or_entry(monkeypatch):
+    candidate = make_candidate()
+    client = Client()
+    events = []
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'ensure_symbol_margin_type', lambda *a, **k: {
+        'ok': True,
+        'requested': 'ISOLATED',
+        'actual': 'CROSSED',
+        'multi_assets_mode': True,
+        'fallback_reason': 'binance_multi_assets_mode_blocks_isolated',
+    })
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: events.append((event_type, payload)))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: {'ok': True})
+
+    try:
+        mod.place_live_trade(client, candidate, leverage=5, meta=make_meta(), args=make_args())
+    except mod.BinanceAPIError as exc:
+        assert 'margin_type_mismatch' in str(exc)
+    else:
+        raise AssertionError('expected margin type hard gate')
+
+    assert all(path not in {'/fapi/v1/leverage', '/fapi/v1/order'} for path, _ in client.calls)
+    assert events[-1][1]['preflight_reason'] == 'margin_type_mismatch'
+    assert events[-1][1]['actual_margin_type'] == 'CROSSED'
+
+
 def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     candidate = make_candidate()
     meta = make_meta()

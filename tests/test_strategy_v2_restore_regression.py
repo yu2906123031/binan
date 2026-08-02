@@ -1745,11 +1745,11 @@ def test_run_auto_loop_book_ticker_websocket_monitor_marks_unavailable_without_w
 
     result = mod.run_auto_loop_book_ticker_websocket_monitor(client=object(), store=store, args=args)
 
-    assert result == {
-        'status': 'unavailable',
-        'summary': {'status': 'unavailable', 'reason': 'websocket_client_missing'},
-        'health': {},
-    }
+    assert result['status'] == 'unavailable'
+    assert result['summary'] == {'status': 'unavailable', 'reason': 'websocket_client_missing'}
+    assert result['health']['status'] == 'unavailable'
+    assert result['health']['last_error'] == 'websocket_client_missing'
+    assert store.load_json('book_ticker_ws_status', {}) == result['health']
     assert events == [{
         'store': store,
         'event_type': 'book_ticker_ws_unavailable',
@@ -2796,11 +2796,11 @@ def test_run_auto_loop_book_ticker_websocket_monitor_unavailable_branch_uses_sum
     assert summary_calls == ['missing_ws']
     assert events == [{'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}]
     assert result_calls == [{'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}]
-    assert result == {
-        'status': 'unavailable',
-        'summary': {'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'},
-        'health': {'source': 'result-builder'},
-    }
+    assert result['status'] == 'unavailable'
+    assert result['summary'] == {'status': 'unavailable', 'reason': 'missing_ws', 'source': 'test'}
+    assert result['health']['status'] == 'unavailable'
+    assert result['health']['last_error'] == 'missing_ws'
+    assert store.load_json('book_ticker_ws_status', {}) == result['health']
 
 
 def test_build_auto_loop_book_ticker_unavailable_result_returns_default_payload():
@@ -3135,15 +3135,15 @@ def test_run_auto_loop_book_ticker_websocket_monitor_uses_explicit_unavailable_a
         'source': 'explicit-builder',
     }]
     assert append_calls == []
-    assert result == {
-        'status': 'unavailable',
-        'summary': {
-            'status': 'custom-unavailable',
-            'reason': 'custom_reason',
-            'source': 'explicit-builder',
-        },
-        'health': {},
+    assert result['status'] == 'unavailable'
+    assert result['summary'] == {
+        'status': 'custom-unavailable',
+        'reason': 'custom_reason',
+        'source': 'explicit-builder',
     }
+    assert result['health']['status'] == 'unavailable'
+    assert result['health']['last_error'] == 'custom_reason'
+    assert store.load_json('book_ticker_ws_status', {}) == result['health']
 
 
 def test_build_local_open_positions_for_risk_emits_rate_limited_event_on_malformed_positions_json(tmp_path):
@@ -3708,7 +3708,7 @@ def test_evaluate_management_actions_triggers_micro_scalp_time_stop_after_min_pr
     actions = mod.evaluate_management_actions(
         state,
         plan,
-        current_price=101.0,
+        current_price=101.5,
         ema5m=100.8,
         trailing_reference=101.2,
         trailing_buffer_pct=0.02,
@@ -5342,6 +5342,246 @@ def test_place_live_trade_uses_gtx_limit_for_liquidity_grade_d_and_records_fill_
     assert result['entry_order_feedback']['fill_ratio'] == 1.0
     assert result['entry_order_feedback']['liquidity_grade_at_entry'] == 'D'
     assert 'grade=D' in result['entry_order_feedback']['liquidity_grade_reason']
+
+
+def test_place_live_trade_rejects_small_nonzero_quantity_below_exchange_min_qty(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='BTCUSDT',
+        last_price=60500.0,
+        price_change_pct_24h=2.0,
+        quote_volume_24h=1_000_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=0.5,
+        acceleration_ratio_5m_vs_15m=1.2,
+        breakout_level=60400.0,
+        recent_swing_low=60300.0,
+        stop_price=60350.0,
+        quantity=0.0005,
+        risk_per_unit=150.0,
+        recommended_leverage=10,
+        rsi_5m=62.0,
+        volume_multiple=1.0,
+        distance_from_ema20_5m_pct=0.2,
+        distance_from_vwap_15m_pct=0.2,
+        higher_tf_summary={},
+        score=100.0,
+        reasons=['test'],
+        side='LONG',
+        state='launch',
+        alert_tier='critical',
+        candidate_stage='trade_candidate',
+    )
+    candidate.best_bid_price = 60499.9
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+        profile='test',
+        maker_only_timeout_seconds=1.0,
+        maker_only_max_retries=0,
+    )
+    meta = make_meta()
+    meta.symbol = 'BTCUSDT'
+    meta.price_precision = 1
+    meta.tick_size = 0.1
+    meta.quantity_precision = 3
+    meta.step_size = 0.001
+    meta.min_qty = 0.001
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                assert params['quantity'] == '0.001'
+                return {'orderId': 12345, 'clientOrderId': 'entry-1', 'status': 'NEW', 'avgPrice': '0', 'executedQty': '0', 'cumQuote': '0', 'updateTime': 1710000000123}
+            raise AssertionError(path)
+
+    client = FakeClient()
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 999, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 1001, 'clientOrderId': 'tp-1'})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 999})
+    monkeypatch.setattr(mod, 'query_order', lambda client, symbol, order_id=None, client_order_id=None: {
+        'orderId': 12345,
+        'clientOrderId': client_order_id or 'entry-1',
+        'status': 'FILLED',
+        'avgPrice': '60500.0',
+        'executedQty': '0.001',
+        'cumQuote': '60.5',
+        'updateTime': 1710000000123,
+        'symbol': symbol,
+        'positionSide': 'LONG',
+    })
+
+    with pytest.raises(mod.BinanceAPIError, match='quantity_below_min_qty'):
+        mod.place_live_trade(client, candidate, leverage=10, meta=meta, args=args)
+
+    assert not any(path == '/fapi/v1/order' for path, _ in client.calls)
+
+
+def test_hard_veto_filters_tradfi_perps_symbols_before_execution():
+    candidate = mod.Candidate(
+        symbol='MRVLUSDT',
+        last_price=10.0,
+        price_change_pct_24h=1.0,
+        quote_volume_24h=1_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0,
+        funding_rate_avg=0.0,
+        recent_5m_change_pct=1.0,
+        acceleration_ratio_5m_vs_15m=1.0,
+        breakout_level=9.0,
+        recent_swing_low=8.0,
+        stop_price=8.0,
+        quantity=1.0,
+        risk_per_unit=1.0,
+        recommended_leverage=3,
+        rsi_5m=55.0,
+        volume_multiple=1.0,
+        distance_from_ema20_5m_pct=0.1,
+        distance_from_vwap_15m_pct=0.1,
+        higher_tf_summary={},
+        score=90.0,
+        reasons=[],
+        side='LONG',
+    )
+
+    assert mod.apply_hard_veto_filters(candidate) == 'tradfi_perps_agreement_required'
+
+
+def test_place_live_trade_falls_back_to_taker_after_post_only_rejection_for_trade_candidate(monkeypatch):
+    candidate = mod.Candidate(
+        symbol='TESTUSDT',
+        last_price=132.0,
+        price_change_pct_24h=18.0,
+        quote_volume_24h=80_000_000.0,
+        hot_rank=1,
+        gainer_rank=1,
+        funding_rate=0.0003,
+        funding_rate_avg=0.0002,
+        recent_5m_change_pct=2.4,
+        acceleration_ratio_5m_vs_15m=1.6,
+        breakout_level=128.0,
+        recent_swing_low=124.0,
+        stop_price=126.0,
+        quantity=1.25,
+        risk_per_unit=6.0,
+        recommended_leverage=3,
+        rsi_5m=74.0,
+        volume_multiple=2.1,
+        distance_from_ema20_5m_pct=5.2,
+        distance_from_vwap_15m_pct=4.4,
+        higher_tf_summary={'1h': 'up', '4h': 'up'},
+        score=90.0,
+        reasons=['test'],
+        side='LONG',
+        state='launch',
+        state_reasons=['launch_short_squeeze'],
+        alert_tier='critical',
+        position_size_pct=3.3,
+        smart_money_veto=False,
+        atr_stop_distance=6.0,
+        expected_slippage_pct=0.0022,
+        book_depth_fill_ratio=0.35,
+        spread_bps=7.5,
+        candidate_stage='trade_candidate',
+    )
+    candidate.top_depth_usdt = 180.0
+    candidate.estimated_impact_pct = 0.05
+    candidate.best_bid_price = 131.9
+    args = argparse.Namespace(
+        tp1_r=1.5,
+        tp1_close_pct=0.3,
+        tp2_r=2.0,
+        tp2_close_pct=0.4,
+        breakeven_r=1.0,
+        profile='test',
+        maker_only_timeout_seconds=1.0,
+        maker_only_max_retries=0,
+        allow_post_only_taker_fallback=True,
+        maker_post_only_fallback_min_score=70.0,
+        maker_post_only_fallback_max_slippage_r=0.05,
+    )
+    meta = make_meta()
+    events = []
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append((path, dict(params)))
+            if path == '/fapi/v1/marginType':
+                return {'code': 200, 'msg': 'success'}
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order' and params['type'] == 'LIMIT':
+                raise mod.BinanceAPIError("Binance API error 400: {'code': -5022, 'msg': 'Due to the order could not be executed as maker, the Post Only order will be rejected. The order will not be recorded in the order history'}")
+            if path == '/fapi/v1/order' and params['type'] == 'MARKET':
+                return {
+                    'orderId': 12346,
+                    'clientOrderId': 'entry-2',
+                    'status': 'FILLED',
+                    'avgPrice': '132.1',
+                    'executedQty': '0.937',
+                    'cumQuote': '123.7777',
+                    'updateTime': 1710000000124,
+                }
+            raise AssertionError((path, params))
+
+    client = FakeClient()
+    monkeypatch.setattr(mod, 'compute_execution_quality_size_adjustment', lambda candidate: {
+        'size_multiplier': 0.75,
+        'execution_liquidity_grade': 'A',
+        'expected_slippage_r': 0.02,
+    })
+    monkeypatch.setattr(mod, 'log_runtime_event', lambda event_type, payload: events.append((event_type, payload)))
+    monkeypatch.setattr(mod, 'emit_notification', lambda *a, **k: None)
+    monkeypatch.setattr(mod, 'place_stop_market_order', lambda *a, **k: {'orderId': 999, 'clientOrderId': 'stop-1'})
+    monkeypatch.setattr(mod, 'place_take_profit_market_order', lambda *a, **k: {'orderId': 1001, 'clientOrderId': 'tp-1'})
+    monkeypatch.setattr(mod, 'resolve_position_protection_status', lambda *a, **k: {'status': 'protected', 'expected_order_id': 999})
+
+    result = mod.place_live_trade(client, candidate, leverage=3, meta=meta, args=args)
+
+    assert any(params.get('type') == 'LIMIT' and params.get('timeInForce') == 'GTX' for _, params in client.calls)
+    assert any(params.get('type') == 'MARKET' for _, params in client.calls)
+    assert result['entry_order_feedback']['execution_mode'] == 'taker'
+    assert result['entry_order_feedback']['maker_or_taker'] == 'taker'
+    assert result['entry_order_feedback']['post_only_taker_fallback'] is True
+    assert any(event_type == 'post_only_taker_fallback' for event_type, _ in events)
+
+
+def test_evaluate_websocket_freshness_uses_maker_only_during_event_loop_lag():
+    now = datetime.datetime(2026, 1, 1, 0, 0, 20, tzinfo=datetime.timezone.utc)
+    health = {
+        'status': 'healthy',
+        'updated_at': '2026-01-01T00:00:08Z',
+        'last_message_at': '2026-01-01T00:00:08Z',
+        'last_sample_at': '2026-01-01T00:00:08Z',
+        'messages_processed': 10,
+        'samples_written': 10,
+        'recent_forced_restart_count': 0,
+    }
+
+    freshness = mod.evaluate_websocket_freshness(health, max_age_seconds=30.0, now=now)
+
+    assert freshness['state'] == 'reconnecting'
+    assert freshness['execution_degradation_mode'] == 'maker_only'
+    assert freshness['websocket_gate_action'] == 'maker_confirm'
 
 
 def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unknown(monkeypatch):
