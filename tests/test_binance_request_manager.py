@@ -74,7 +74,7 @@ async def test_retry_manager_has_bounded_budget_and_jittered_backoff():
 
 
 @pytest.mark.asyncio
-async def test_request_manager_tracks_retry_count():
+async def test_request_manager_tracks_retry_count_for_safe_gets():
     attempts = 0
 
     async def transport(req: BinanceRequest):
@@ -93,6 +93,48 @@ async def test_request_manager_tracks_retry_count():
     await manager.shutdown()
     assert attempts == 3
     assert manager.metrics.retry_count == 2
+
+
+@pytest.mark.asyncio
+async def test_post_transport_timeout_is_not_blindly_retried():
+    attempts = 0
+
+    async def transport(req: BinanceRequest):
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError("ambiguous order write")
+
+    manager = BinanceRequestManager(
+        transport=transport,
+        limiter=GlobalRateLimiter(max_requests_per_second=50, max_weight_per_minute=100),
+        retry_manager=RetryManager(max_attempts=3, base_delay=0.001, max_delay=0.002, jitter=0.0),
+    )
+    with pytest.raises(TimeoutError, match="ambiguous order write"):
+        await manager.request("POST", "/fapi/v1/order", timeout=1.0)
+    await manager.shutdown()
+    assert attempts == 1
+    assert manager.metrics.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_transport_failure_is_not_blindly_retried():
+    attempts = 0
+
+    async def transport(req: BinanceRequest):
+        nonlocal attempts
+        attempts += 1
+        raise ConnectionError("ambiguous cancel write")
+
+    manager = BinanceRequestManager(
+        transport=transport,
+        limiter=GlobalRateLimiter(max_requests_per_second=50, max_weight_per_minute=100),
+        retry_manager=RetryManager(max_attempts=3, base_delay=0.001, max_delay=0.002, jitter=0.0),
+    )
+    with pytest.raises(ConnectionError, match="ambiguous cancel write"):
+        await manager.request("DELETE", "/fapi/v1/order", timeout=1.0)
+    await manager.shutdown()
+    assert attempts == 1
+    assert manager.metrics.retry_count == 0
 
 
 @pytest.mark.asyncio
