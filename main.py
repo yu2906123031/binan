@@ -9,7 +9,9 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 strategy_module = __import__('binance_futures_momentum_long')
 install_lifecycle_snapshot_hooks = __import__('lifecycle_snapshot').install_lifecycle_snapshot_hooks
+install_slippage_calibration_hooks = __import__('slippage_calibration_policy').install_slippage_calibration_hooks
 install_lifecycle_snapshot_hooks(strategy_module)
+install_slippage_calibration_hooks(strategy_module)
 strategy_main = strategy_module.main
 
 
