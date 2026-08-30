@@ -156,6 +156,8 @@ class RetryManager:
 
 
 class BinanceRequestManager:
+    IDEMPOTENT_METHODS = frozenset({'GET', 'HEAD', 'OPTIONS'})
+
     def __init__(
         self,
         *,
@@ -234,7 +236,7 @@ class BinanceRequestManager:
                 started = time.monotonic()
                 result = await self.retry_manager.run(
                     lambda: self.transport(item.request),
-                    is_retryable=self._is_retryable,
+                    is_retryable=lambda exc: self._is_retryable_request(item.request, exc),
                     on_retry=self._record_retry,
                 )
                 self.metrics.last_latency_ms = (time.monotonic() - started) * 1000.0
@@ -273,6 +275,21 @@ class BinanceRequestManager:
         if isinstance(exc, BinanceAPIThrottled):
             return exc.status_code == 429
         return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+    @classmethod
+    def _is_retryable_request(cls, request: BinanceRequest, exc: BaseException) -> bool:
+        """Retry transport failures only when replaying the HTTP method is safe.
+
+        Binance order creation/cancel/margin/leverage endpoints are generally
+        POST/DELETE writes. A transport timeout is ambiguous: the exchange may
+        already have committed the write even though the client did not receive
+        the response. Blindly replaying such a request can duplicate orders or
+        mutate account state twice, so write reconciliation belongs at the
+        execution layer rather than in this generic transport retry loop.
+        """
+        if str(request.method or '').upper() not in cls.IDEMPOTENT_METHODS:
+            return False
+        return cls._is_retryable(exc)
 
     def _observe_headers(self, result: Any) -> None:
         headers: Dict[str, Any] = {}
