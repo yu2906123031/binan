@@ -38,14 +38,7 @@ def evaluate_breakout_quality(
     min_close_location: float = 0.55,
     hard_oi_contradiction_pct: float = 0.35,
 ) -> Dict[str, Any]:
-    """Return quality/confirmation flags for an actual breakout candle.
-
-    ``quality_pass`` requires adequate breakout distance, acceptable rejection
-    wick/close position, and credible volume. Optional order-flow data does not
-    fail a candidate merely because it is missing. Explicitly contradictory OI
-    plus CVD, however, is a hard veto because that pattern commonly represents
-    price moving without fresh directional participation.
-    """
+    """Return quality/confirmation flags for an actual breakout candle."""
     direction = str(side or '').lower()
     is_long = direction == 'long'
     if direction not in {'long', 'short'}:
@@ -68,11 +61,7 @@ def evaluate_breakout_quality(
             'reasons': ['invalid_breakout_price'],
         }
 
-    breakout_distance_pct = (
-        ((last / level) - 1.0) * 100.0
-        if is_long
-        else ((level / last) - 1.0) * 100.0
-    )
+    breakout_distance_pct = ((last / level) - 1.0) * 100.0 if is_long else ((level / last) - 1.0) * 100.0
     distance_ok = breakout_distance_pct >= max(float(min_breakout_distance_pct or 0.0), 0.0)
 
     bar_open = float(current_open or last)
@@ -118,6 +107,8 @@ def evaluate_breakout_quality(
         'breakout_wick_ok': wick_ok,
         'breakout_volume_ok': volume_ok,
         'breakout_flow_confirmed': flow_confirmation_count > 0,
+        'breakout_flow_confirmation_count': flow_confirmation_count,
+        'breakout_min_volume_multiple': required_volume,
         'breakout_oi_contradiction': oi_contradiction,
         'breakout_cvd_contradiction': cvd_contradiction,
     }
