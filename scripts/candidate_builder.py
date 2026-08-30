@@ -101,7 +101,6 @@ def detect_pullback_short_setup(
     return True
 
 
-
 def finalize_candidate_construction(
     *,
     Candidate,
@@ -131,7 +130,7 @@ def finalize_candidate_construction(
     reasons: List[str],
     trade_side: str,
     position_side: str,
-    trigger_type: str,
+    trigger_type: str = 'breakout',
     higher_timeframe_bias: str,
     oi_features: Dict[str, Any],
     microstructure_inputs: Dict[str, Any],
@@ -816,9 +815,6 @@ def build_candidate(
             hard_oi_contradiction_pct=_to_float(legacy_kwargs.get('breakout_hard_oi_contradiction_pct'), default=0.35),
         )
         reasons.extend(breakout_quality_payload['reasons'])
-        if not breakout_quality_payload['quality_pass']:
-            early_reject('breakout_quality_rejected')
-            return None
 
     squeeze_payload = compute_squeeze_signal(
         funding_rate=funding_rate,
@@ -910,6 +906,15 @@ def build_candidate(
     )
     if breakout_quality_payload:
         trigger_confirmation['flags'].update(breakout_quality_payload['flags'])
+        quality_pass = bool(breakout_quality_payload['quality_pass'])
+        trigger_confirmation['flags']['breakout_quality_pass'] = quality_pass
+        if not quality_pass:
+            trigger_confirmation['trigger_fired'] = False
+            if bool(breakout_quality_payload.get('hard_reject')):
+                trigger_confirmation['setup_ready'] = False
+                trigger_confirmation['flags']['breakout_quality_hard_reject'] = True
+            else:
+                trigger_confirmation['flags']['breakout_quality_watch_only'] = True
     if pullback_setup:
         trigger_confirmation['flags']['pullback_reversal_confirmed'] = True
         trigger_confirmation['confirmation_count'] = int(trigger_confirmation['confirmation_count']) + 1
