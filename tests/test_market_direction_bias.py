@@ -160,3 +160,39 @@ def test_neutral_bias_does_not_change_score():
     mod.apply_market_direction_bias(candidate, {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5, 'sample_size': 50})
     assert candidate.score == 77.0
     assert candidate.market_direction_score_multiplier == 1.0
+
+
+def test_clean_launch_pullback_gets_edge_ranking_boost():
+    mod = load_module()
+    candidate = SimpleNamespace(
+        side='LONG', score=100.0, reasons=[], trigger_type='pullback', state='launch',
+        expected_edge=1.0, stop_distance_pct=1.0, overextension_flag=False,
+        volume_multiple=2.0, expected_slippage_pct=0.04, book_depth_fill_ratio=0.95,
+        top_depth_usdt=10000.0, available_depth_usdt=20000.0,
+        expected_total_fee_pct=0.10, execution_slippage_buffer_pct=0.05,
+        min_profit_buffer_pct=0.10, trigger_confirmation_flags={'pullback_reversal_confirmed': True},
+    )
+    mod.apply_market_direction_bias(candidate, {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5})
+    assert candidate.realizable_reward_r > 1.2
+    assert candidate.expected_edge > candidate.base_expected_edge
+    assert candidate.realizable_edge_score_multiplier > 1.0
+    assert candidate.score > 100.0
+
+
+def test_extended_high_slippage_breakout_is_deweighted():
+    mod = load_module()
+    candidate = SimpleNamespace(
+        side='LONG', score=100.0, reasons=[], trigger_type='breakout', state='overheated',
+        expected_edge=1.0, stop_distance_pct=1.0, overextension_flag=True,
+        volume_multiple=1.0, expected_slippage_pct=0.25, book_depth_fill_ratio=0.55,
+        top_depth_usdt=20.0, available_depth_usdt=50.0,
+        expected_total_fee_pct=0.16, execution_slippage_buffer_pct=0.25,
+        min_profit_buffer_pct=0.12,
+        trigger_confirmation_flags={'breakout_quality_pass': True, 'breakout_flow_confirmed': False},
+    )
+    mod.apply_market_direction_bias(candidate, {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5})
+    assert candidate.realizable_reward_r < 0.6
+    assert candidate.expected_edge < candidate.base_expected_edge
+    assert candidate.realizable_edge_score_multiplier < 1.0
+    assert candidate.score < 100.0
+    assert any('realizable_edge=' in reason for reason in candidate.reasons)
