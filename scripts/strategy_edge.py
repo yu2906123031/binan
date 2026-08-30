@@ -29,8 +29,9 @@ def estimate_realizable_reward_r(
 
     The model deliberately estimates *realizable* reward instead of assuming every
     candidate can achieve the same configured R multiple. Missing optional orderbook
-    data is neutral; observed poor depth/slippage is penalized. Unconfirmed/watch
-    candidates are also discounted so raw heat cannot outrank fully fired setups.
+    data is neutral; observed poor depth/slippage is penalized. Setup/trigger readiness
+    is authoritative; a stale/default stage label never discounts an already-fired
+    trigger.
     """
     base = _clamp(float(base_reward_r or 1.0), 0.25, 4.0)
     trigger = str(trigger_type or 'breakout').strip().lower()
@@ -54,8 +55,6 @@ def estimate_realizable_reward_r(
         stage_multiplier = 0.62
     elif not trigger_fired:
         stage_multiplier = 0.78 if stage_name in {'pre_trigger_watch', 'watch_candidate', ''} else 0.82
-    elif stage_name in {'pre_trigger_watch', 'watch_candidate'}:
-        stage_multiplier = 0.90
     else:
         stage_multiplier = 1.0
 
