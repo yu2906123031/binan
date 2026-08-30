@@ -37,19 +37,21 @@ def _capped_liquidity_weights(rows: Sequence[tuple[float, float]]) -> list[float
 
 
 def _directional_conviction(changes: Sequence[float]) -> float:
-    """Measure whether the median move is meaningful relative to dispersion.
+    """Measure directional drift relative to the cross-sectional move size.
 
-    A market can have slightly more advancers than decliners while still being
-    noisy and directionless. Comparing the signed median to the median absolute
-    move suppresses tiny directional skews in otherwise volatile cross-sections.
+    The signed median captures the typical direction while the mean absolute
+    move keeps a few large counter-moves visible. This is intentionally more
+    conservative than dividing by median absolute change: a market with many
+    tiny winners and a few violent losers should not be treated as a clean
+    bullish impulse merely because advancing breadth is above 50%.
     """
     if not changes:
         return 0.0
     median_change = statistics.median(changes)
-    median_abs_change = statistics.median(abs(change) for change in changes)
-    if median_abs_change <= 1e-12:
+    mean_abs_change = sum(abs(change) for change in changes) / len(changes)
+    if mean_abs_change <= 1e-12:
         return 0.0
-    return min(abs(median_change) / median_abs_change, 1.0)
+    return min(abs(median_change) / mean_abs_change, 1.0)
 
 
 def compute_market_direction_bias(
