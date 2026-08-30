@@ -153,8 +153,8 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
 
     Candidate builder already provides a base expected edge using configured TP R.
     Here we conservatively discount/boost that edge using the actual setup state,
-    extension, volume, observed depth and slippage. Candidates lacking the explicit
-    edge contract keep a neutral multiplier for backwards compatibility.
+    confirmation stage, extension, volume, observed depth and slippage. Candidates
+    lacking the explicit edge contract keep a neutral multiplier for compatibility.
     """
     if not hasattr(candidate, 'expected_edge') or not hasattr(candidate, 'stop_distance_pct'):
         candidate.realizable_edge_score_multiplier = 1.0
@@ -184,6 +184,9 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
         base_reward_r=base_reward_r,
         trigger_type=trigger_type,
         state=str(getattr(candidate, 'state', 'watch') or 'watch'),
+        candidate_stage=str(getattr(candidate, 'candidate_stage', '') or ''),
+        setup_ready=bool(getattr(candidate, 'setup_ready', True)),
+        trigger_fired=bool(getattr(candidate, 'trigger_fired', True)),
         overextension_flag=bool(getattr(candidate, 'overextension_flag', False)),
         breakout_quality=breakout_quality,
         volume_multiple=float(getattr(candidate, 'volume_multiple', 0.0) or 0.0),
