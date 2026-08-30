@@ -36,21 +36,41 @@ def _capped_liquidity_weights(rows: Sequence[tuple[float, float]]) -> list[float
     return [min(weight, cap) if weight > 0 else 0.0 for weight in raw]
 
 
+def _directional_conviction(changes: Sequence[float]) -> float:
+    """Measure whether the median move is meaningful relative to dispersion.
+
+    A market can have slightly more advancers than decliners while still being
+    noisy and directionless. Comparing the signed median to the median absolute
+    move suppresses tiny directional skews in otherwise volatile cross-sections.
+    """
+    if not changes:
+        return 0.0
+    median_change = statistics.median(changes)
+    median_abs_change = statistics.median(abs(change) for change in changes)
+    if median_abs_change <= 1e-12:
+        return 0.0
+    return min(abs(median_change) / median_abs_change, 1.0)
+
+
 def compute_market_direction_bias(
     tickers: Sequence[Dict[str, Any]] | None,
     regime: Dict[str, Any] | None,
     *,
     min_sample_size: int = 5,
     min_quote_volume: float = 100_000.0,
+    min_directional_conviction: float = 0.20,
 ) -> Dict[str, Any]:
     """Combine robust USDT breadth with the existing BTC/SOL regime.
 
-    Direction is confirmed by three independent views:
+    Direction is confirmed by four independent views:
     1. raw symbol breadth, so the move is genuinely broad;
     2. liquidity-weighted breadth, so illiquid noise cannot dominate;
-    3. median 24h change, so a few extreme movers cannot flip the result.
+    3. median 24h change, so a few extreme movers cannot flip the result;
+    4. directional conviction, so tiny median drift in a choppy market does not
+       boost breakout candidates.
 
-    Sparse, stale, conflicted, or low-liquidity inputs safely remain NEUTRAL.
+    Sparse, stale, conflicted, low-liquidity, or low-conviction inputs safely
+    remain NEUTRAL.
     """
     rows: list[tuple[float, float]] = []
     ignored_low_liquidity = 0
@@ -75,6 +95,7 @@ def compute_market_direction_bias(
     declining = sum(change < 0 for change in changes)
     breadth_ratio = advancing / sample_size if sample_size else 0.5
     median_change_pct = statistics.median(changes) if changes else 0.0
+    directional_conviction = _directional_conviction(changes)
 
     weights = _capped_liquidity_weights(rows)
     total_weight = sum(weights)
@@ -84,9 +105,6 @@ def compute_market_direction_bias(
     else:
         weighted_breadth_ratio = breadth_ratio
 
-    # Blend robust weighted breadth with raw breadth. The weighted view gets a
-    # little more influence because it rejects micro-cap noise, but raw breadth
-    # still prevents a handful of liquid names from defining the whole market.
     robust_breadth_ratio = (0.65 * weighted_breadth_ratio) + (0.35 * breadth_ratio)
     breadth_signal = (robust_breadth_ratio - 0.5) * 2.0
 
@@ -96,15 +114,20 @@ def compute_market_direction_bias(
 
     bias = 'NEUTRAL'
     enough_data = sample_size >= max(int(min_sample_size), 1)
+    conviction_floor = max(min(float(min_directional_conviction or 0.0), 1.0), 0.0)
+    conviction_confirmed = directional_conviction >= conviction_floor
     long_breadth_confirmed = breadth_ratio >= 0.55 and weighted_breadth_ratio >= 0.60 and median_change_pct > 0
     short_breadth_confirmed = breadth_ratio <= 0.45 and weighted_breadth_ratio <= 0.40 and median_change_pct < 0
-    if enough_data:
+    if enough_data and conviction_confirmed:
         if long_breadth_confirmed and regime_signal >= 0 and combined >= 0.25:
             bias = 'LONG'
         elif short_breadth_confirmed and regime_signal <= 0 and combined <= -0.25:
             bias = 'SHORT'
 
-    strength = min(abs(combined), 1.0) if bias != 'NEUTRAL' else 0.0
+    # Confidence scales the score tilt as well as the direction decision. This
+    # prevents a barely directional cross-section from receiving the same boost
+    # as a clean market-wide impulse.
+    strength = min(abs(combined) * directional_conviction, 1.0) if bias != 'NEUTRAL' else 0.0
     return {
         'bias': bias,
         'strength': round(strength, 4),
@@ -112,6 +135,7 @@ def compute_market_direction_bias(
         'weighted_breadth_ratio': round(weighted_breadth_ratio, 4),
         'robust_breadth_ratio': round(robust_breadth_ratio, 4),
         'median_change_pct': round(median_change_pct, 4),
+        'directional_conviction': round(directional_conviction, 4),
         'advancing': advancing,
         'declining': declining,
         'sample_size': sample_size,
@@ -136,9 +160,11 @@ def apply_market_direction_bias(candidate: Any, payload: Dict[str, Any] | None, 
     candidate.market_breadth_ratio = float(data.get('breadth_ratio', 0.5) or 0.5)
     candidate.market_weighted_breadth_ratio = float(data.get('weighted_breadth_ratio', candidate.market_breadth_ratio) or candidate.market_breadth_ratio)
     candidate.market_median_change_pct = float(data.get('median_change_pct', 0.0) or 0.0)
+    candidate.market_directional_conviction = float(data.get('directional_conviction', 0.0) or 0.0)
     candidate.reasons = list(getattr(candidate, 'reasons', []) or [])
     candidate.reasons.append(
         f"market_direction_bias={bias}:strength={strength:.2f}:breadth={candidate.market_breadth_ratio:.2f}:"
-        f"weighted={candidate.market_weighted_breadth_ratio:.2f}:median={candidate.market_median_change_pct:.2f}:multiplier={multiplier:.4f}"
+        f"weighted={candidate.market_weighted_breadth_ratio:.2f}:median={candidate.market_median_change_pct:.2f}:"
+        f"conviction={candidate.market_directional_conviction:.2f}:multiplier={multiplier:.4f}"
     )
     return candidate
