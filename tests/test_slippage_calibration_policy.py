@@ -139,3 +139,33 @@ def test_execution_mode_normalization_matches_maker_bucket():
     assert result['source'] == 'segmented'
     assert result['multiplier'] == 1.15
     assert result['matched'][0]['dimension'] == 'maker_or_taker'
+
+
+def test_runtime_calibration_refresh_is_throttled_even_when_events_change(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    events_path = runtime_dir / 'events.jsonl'
+    events_path.write_text('{}\n', encoding='utf-8')
+    calls = {'load': 0, 'build': 0}
+
+    def fake_load_events(path, limit=5000):
+        assert path == events_path
+        calls['load'] += 1
+        return []
+
+    def fake_build(rows):
+        calls['build'] += 1
+        return {'generation': calls['build']}
+
+    monkeypatch.setattr(mod, 'load_events', fake_load_events)
+    monkeypatch.setattr(mod, 'build_trade_bucket_analysis_payload', fake_build)
+    mod.reset_calibration_cache()
+    first = mod.load_calibration_payload(runtime_state_dir=runtime_dir, refresh_seconds=300.0, now_monotonic=100.0)
+    mod._POLICY_CACHE['events_mtime_ns'] = -1
+    second = mod.load_calibration_payload(runtime_state_dir=runtime_dir, refresh_seconds=300.0, now_monotonic=101.0)
+    third = mod.load_calibration_payload(runtime_state_dir=runtime_dir, refresh_seconds=300.0, now_monotonic=401.0)
+
+    assert first == {'generation': 1}
+    assert second == first
+    assert third == {'generation': 2}
+    assert calls == {'load': 2, 'build': 2}
