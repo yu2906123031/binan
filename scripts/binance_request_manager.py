@@ -70,6 +70,10 @@ class GlobalRateLimiter:
 
     async def acquire(self, *, weight: int = 1) -> None:
         weight = max(1, int(weight))
+        if weight > self.max_weight_per_minute:
+            raise ValueError(
+                f"request weight {weight} exceeds configured per-minute limit {self.max_weight_per_minute}"
+            )
         async with self._semaphore:
             while True:
                 async with self._lock:
@@ -126,15 +130,25 @@ class RetryManager:
         self.max_delay = max(self.base_delay, float(max_delay))
         self.jitter = max(0.0, float(jitter))
 
-    async def run(self, op: Callable[[], Awaitable[Any]], *, is_retryable: Callable[[BaseException], bool]) -> Any:
+    async def run(
+        self,
+        op: Callable[[], Awaitable[Any]],
+        *,
+        is_retryable: Callable[[BaseException], bool],
+        on_retry: Optional[Callable[[BaseException, int], None]] = None,
+    ) -> Any:
         attempt = 0
         while True:
             attempt += 1
             try:
                 return await op()
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 if attempt >= self.max_attempts or not is_retryable(exc):
                     raise
+                if on_retry is not None:
+                    on_retry(exc, attempt)
                 delay = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
                 if self.jitter:
                     delay += random.uniform(0.0, self.jitter * delay)
@@ -175,10 +189,13 @@ class BinanceRequestManager:
                 await self._worker
             except asyncio.CancelledError:
                 pass
+            self._worker = None
 
     async def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, *, signed: bool = False, weight: int = 1, priority: int = 10, timeout: float = 15.0) -> Any:
         if self._stopping:
             raise RuntimeError("BinanceRequestManager is shutting down")
+        if timeout <= 0:
+            raise ValueError("request timeout must be positive")
         self.circuit_breaker.ensure_allows()
         await self.start()
         loop = asyncio.get_running_loop()
@@ -193,7 +210,16 @@ class BinanceRequestManager:
             raise RuntimeError("Binance request queue full")
         self.metrics.enqueued_requests += 1
         self.metrics.queue_size = self.queue.qsize()
-        return await future
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=request.timeout)
+        except asyncio.TimeoutError as exc:
+            if not future.done():
+                future.cancel()
+            raise TimeoutError(f"Binance request timed out after {request.timeout:.3f}s: {request.method} {request.path}") from exc
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            raise
 
     async def _run_worker(self) -> None:
         while True:
@@ -203,13 +229,23 @@ class BinanceRequestManager:
                     continue
                 self.circuit_breaker.ensure_allows()
                 await self.limiter.acquire(weight=item.request.weight)
+                if item.future.cancelled():
+                    continue
                 started = time.monotonic()
-                result = await self.retry_manager.run(lambda: self.transport(item.request), is_retryable=self._is_retryable)
+                result = await self.retry_manager.run(
+                    lambda: self.transport(item.request),
+                    is_retryable=self._is_retryable,
+                    on_retry=self._record_retry,
+                )
                 self.metrics.last_latency_ms = (time.monotonic() - started) * 1000.0
                 self._observe_headers(result)
                 self.metrics.completed_requests += 1
                 if not item.future.done():
                     item.future.set_result(result)
+            except asyncio.CancelledError:
+                if not item.future.done():
+                    item.future.cancel()
+                raise
             except BinanceAPIThrottled as exc:
                 self.metrics.failed_requests += 1
                 self.metrics.last_error = str(exc)
@@ -219,7 +255,7 @@ class BinanceRequestManager:
                     self.circuit_breaker.open(reason="binance_429_rate_limit", retry_after_ms=exc.retry_after_ms)
                 if not item.future.done():
                     item.future.set_exception(exc)
-            except BaseException as exc:
+            except Exception as exc:
                 self.metrics.failed_requests += 1
                 self.metrics.last_error = str(exc)
                 if not item.future.done():
@@ -227,6 +263,10 @@ class BinanceRequestManager:
             finally:
                 self.metrics.queue_size = self.queue.qsize()
                 self.queue.task_done()
+
+    def _record_retry(self, exc: BaseException, attempt: int) -> None:
+        self.metrics.retry_count += 1
+        self.metrics.last_error = str(exc)
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
