@@ -224,10 +224,26 @@ class BinanceRequestManager:
             raise
 
     async def _run_transport(self, request: BinanceRequest) -> Any:
+        """Bound transport time without confusing a transport-raised TimeoutError with our deadline."""
+        task = asyncio.create_task(self.transport(request))
         try:
-            return await asyncio.wait_for(self.transport(request), timeout=request.timeout)
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(f"Binance transport timed out after {request.timeout:.3f}s: {request.method} {request.path}") from exc
+            done, _pending = await asyncio.wait({task}, timeout=request.timeout, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise TimeoutError(f"Binance transport timed out after {request.timeout:.3f}s: {request.method} {request.path}")
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            raise
 
     async def _run_worker(self) -> None:
         while True:
@@ -242,7 +258,7 @@ class BinanceRequestManager:
                 started = time.monotonic()
                 result = await self.retry_manager.run(
                     lambda: self._run_transport(item.request),
-                    is_retryable=lambda exc: self._is_retryable_request(item.request, exc),
+                    is_retryable=lambda exc: not item.future.cancelled() and self._is_retryable_request(item.request, exc),
                     on_retry=self._record_retry,
                 )
                 self.metrics.last_latency_ms = (time.monotonic() - started) * 1000.0
