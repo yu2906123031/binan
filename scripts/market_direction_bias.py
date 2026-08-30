@@ -23,12 +23,7 @@ def _number(value: Any) -> float | None:
 
 
 def _capped_liquidity_weights(rows: Sequence[tuple[float, float]]) -> list[float]:
-    """Return robust liquidity weights without letting one mega-cap dominate.
-
-    Square-root volume compresses the enormous spread between large and small
-    contracts, then a median-based cap prevents BTC/ETH-sized symbols from
-    becoming the market breadth signal by themselves.
-    """
+    """Return robust liquidity weights without letting one mega-cap dominate."""
     if not rows:
         return []
     raw = [math.sqrt(max(volume, 0.0)) for _, volume in rows]
@@ -41,14 +36,7 @@ def _capped_liquidity_weights(rows: Sequence[tuple[float, float]]) -> list[float
 
 
 def _directional_conviction(changes: Sequence[float]) -> float:
-    """Measure directional drift relative to the cross-sectional move size.
-
-    The signed median captures the typical direction while the mean absolute
-    move keeps a few large counter-moves visible. This is intentionally more
-    conservative than dividing by median absolute change: a market with many
-    tiny winners and a few violent losers should not be treated as a clean
-    bullish impulse merely because advancing breadth is above 50%.
-    """
+    """Measure directional drift relative to the cross-sectional move size."""
     if not changes:
         return 0.0
     median_change = statistics.median(changes)
@@ -66,18 +54,7 @@ def compute_market_direction_bias(
     min_quote_volume: float = 100_000.0,
     min_directional_conviction: float = 0.20,
 ) -> Dict[str, Any]:
-    """Combine robust USDT breadth with the existing BTC/SOL regime.
-
-    Direction is confirmed by four independent views:
-    1. raw symbol breadth, so the move is genuinely broad;
-    2. liquidity-weighted breadth, so illiquid noise cannot dominate;
-    3. median 24h change, so a few extreme movers cannot flip the result;
-    4. directional conviction, so tiny median drift in a choppy market does not
-       boost breakout candidates.
-
-    Sparse, stale, conflicted, low-liquidity, or low-conviction inputs safely
-    remain NEUTRAL.
-    """
+    """Combine robust USDT breadth with the existing BTC/SOL regime."""
     rows: list[tuple[float, float]] = []
     ignored_low_liquidity = 0
     minimum_volume = max(float(min_quote_volume or 0.0), 0.0)
@@ -149,13 +126,7 @@ def compute_market_direction_bias(
 
 
 def _apply_realizable_edge_adjustment(candidate: Any) -> float:
-    """Feed realizable reward/cost quality into ranking and downstream edge gates.
-
-    Candidate builder already provides a base expected edge using configured TP R.
-    Here we conservatively discount/boost that edge using the actual setup state,
-    confirmation stage, extension, volume, observed depth and slippage. Candidates
-    lacking the explicit edge contract keep a neutral multiplier for compatibility.
-    """
+    """Feed realizable reward/cost quality into ranking and downstream edge gates."""
     if not hasattr(candidate, 'expected_edge') or not hasattr(candidate, 'stop_distance_pct'):
         candidate.realizable_edge_score_multiplier = 1.0
         return 1.0
@@ -177,6 +148,8 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
             'confirmation_count': 1 if bool(flags.get('breakout_flow_confirmed', False)) else 0,
         }
 
+    setup_ready = bool(getattr(candidate, 'setup_ready', True))
+    trigger_fired = bool(getattr(candidate, 'trigger_fired', True))
     top_depth = max(float(getattr(candidate, 'top_depth_usdt', 0.0) or 0.0), 0.0)
     available_depth = max(float(getattr(candidate, 'available_depth_usdt', 0.0) or 0.0), 0.0)
     has_depth = top_depth > 0 or available_depth > 0
@@ -185,8 +158,8 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
         trigger_type=trigger_type,
         state=str(getattr(candidate, 'state', 'watch') or 'watch'),
         candidate_stage=str(getattr(candidate, 'candidate_stage', '') or ''),
-        setup_ready=bool(getattr(candidate, 'setup_ready', True)),
-        trigger_fired=bool(getattr(candidate, 'trigger_fired', True)),
+        setup_ready=setup_ready,
+        trigger_fired=trigger_fired,
         overextension_flag=bool(getattr(candidate, 'overextension_flag', False)),
         breakout_quality=breakout_quality,
         volume_multiple=float(getattr(candidate, 'volume_multiple', 0.0) or 0.0),
@@ -221,6 +194,15 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
         score_multiplier = 1.03
     else:
         score_multiplier = 1.0
+
+    # Readiness is a direct ranking constraint, not merely an edge-model input.
+    # A very hot symbol that has not fired must not outrank an equally strong,
+    # fully confirmed setup just because rank/momentum points are large.
+    if not setup_ready:
+        score_multiplier = min(score_multiplier, 0.78)
+    elif not trigger_fired:
+        score_multiplier = min(score_multiplier, 0.88)
+
     candidate.realizable_edge_margin_pct = round(edge_margin, 4)
     candidate.realizable_edge_margin_r = round(edge_margin_r, 4)
     candidate.realizable_edge_score_multiplier = round(score_multiplier, 4)
