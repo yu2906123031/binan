@@ -152,6 +152,42 @@ def test_entry_fill_calibrates_predicted_vs_actual_slippage():
     assert coverage['actual_slippage_coverage_pct'] == 100.0
 
 
+def test_slippage_calibration_is_segmented_by_execution_context():
+    rows = [
+        {
+            'event_type': 'candidate_selected', 'symbol': 'AUSDT', 'side': 'LONG',
+            'expected_slippage_pct': 0.05, 'shadow_entry_price': 100.0,
+            'market_regime_label': 'risk_on', 'execution_liquidity_grade': 'A',
+        },
+        {
+            'event_type': 'entry_filled', 'symbol': 'AUSDT', 'side': 'LONG', 'entry_price': 100.08,
+            'maker_or_taker': 'maker', 'liquidity_grade_at_entry': 'A',
+        },
+        {'event_type': 'trade_invalidated', 'symbol': 'AUSDT', 'side': 'LONG', 'realized_r': 0.2},
+        {
+            'event_type': 'candidate_selected', 'symbol': 'BUSDT', 'side': 'SHORT',
+            'expected_slippage_pct': 0.10, 'shadow_entry_price': 200.0,
+            'market_regime_label': 'risk_off', 'execution_liquidity_grade': 'B',
+        },
+        {
+            'event_type': 'entry_filled', 'symbol': 'BUSDT', 'side': 'SHORT', 'entry_price': 199.6,
+            'maker_or_taker': 'taker', 'liquidity_grade_at_entry': 'B',
+        },
+        {'event_type': 'trade_invalidated', 'symbol': 'BUSDT', 'side': 'SHORT', 'realized_r': -0.1},
+    ]
+    payload = mod.build_trade_bucket_analysis_payload(rows)
+    assert payload['slippage_calibration_by_side'][0]['sample_count'] == 1
+    assert {row['side'] for row in payload['slippage_calibration_by_side']} == {'LONG', 'SHORT'}
+    maker = next(row for row in payload['slippage_calibration_by_maker_or_taker'] if row['maker_or_taker'] == 'maker')
+    taker = next(row for row in payload['slippage_calibration_by_maker_or_taker'] if row['maker_or_taker'] == 'taker')
+    assert maker['avg_predicted_slippage_bps'] == 5.0
+    assert maker['avg_actual_slippage_bps'] == 8.0
+    assert taker['avg_predicted_slippage_bps'] == 10.0
+    assert taker['avg_actual_slippage_bps'] == 20.0
+    assert {row['liquidity_grade'] for row in payload['slippage_calibration_by_liquidity_grade']} == {'A', 'B'}
+    assert {row['market_regime_label'] for row in payload['slippage_calibration_by_market_regime']} == {'risk_on', 'risk_off'}
+
+
 def test_entry_fill_slippage_backfill_prefers_same_side_and_clears_after_close():
     rows = [
         {'event_type': 'candidate_selected', 'symbol': 'SUIUSDT', 'side': 'LONG', 'expected_slippage_pct': 0.05, 'shadow_entry_price': 100.0},
@@ -197,6 +233,8 @@ def test_run_filters_symbol_and_writes_report_files(tmp_path):
     assert '# Trade Bucket Analysis' in markdown
     assert '## Edge calibration' in markdown
     assert '## Slippage calibration' in markdown
+    assert '## Slippage by side' in markdown
+    assert '## Slippage by maker or taker' in markdown
     assert '## Prediction coverage' in markdown
     assert 'DOGEUSDT' in markdown
     assert 'SUIUSDT' not in markdown
