@@ -1,13 +1,17 @@
 """Conservative whole-market directional bias for the futures scanner.
 
-This module intentionally changes ranking scores only; it never vetoes a side or
-alters position/risk/protection decisions.
+This module changes ranking scores only; it never directly vetoes a side or alters
+position/protection decisions. It also applies a small economics-aware ranking
+adjustment after the market-direction tilt so expensive/extended candidates do
+not outrank cleaner setups merely because their raw momentum score is high.
 """
 from __future__ import annotations
 
 import math
 import statistics
 from typing import Any, Dict, Sequence
+
+from strategy_edge import estimate_realizable_reward_r
 
 
 def _number(value: Any) -> float | None:
@@ -126,9 +130,6 @@ def compute_market_direction_bias(
         elif short_breadth_confirmed and regime_signal <= 0 and combined <= -0.25:
             bias = 'SHORT'
 
-    # Confidence scales the score tilt as well as the direction decision. This
-    # prevents a barely directional cross-section from receiving the same boost
-    # as a clean market-wide impulse.
     strength = min(abs(combined) * directional_conviction, 1.0) if bias != 'NEUTRAL' else 0.0
     return {
         'bias': bias,
@@ -147,8 +148,84 @@ def compute_market_direction_bias(
     }
 
 
+def _apply_realizable_edge_adjustment(candidate: Any) -> float:
+    """Feed realizable reward/cost quality into ranking and downstream edge gates.
+
+    Candidate builder already provides a base expected edge using configured TP R.
+    Here we conservatively discount/boost that edge using the actual setup state,
+    extension, volume, observed depth and slippage. Candidates lacking the explicit
+    edge contract keep a neutral multiplier for backwards compatibility.
+    """
+    if not hasattr(candidate, 'expected_edge') or not hasattr(candidate, 'stop_distance_pct'):
+        candidate.realizable_edge_score_multiplier = 1.0
+        return 1.0
+
+    stop_distance_pct = max(float(getattr(candidate, 'stop_distance_pct', 0.0) or 0.0), 0.0)
+    base_expected_edge = max(float(getattr(candidate, 'expected_edge', 0.0) or 0.0), 0.0)
+    if stop_distance_pct <= 1e-12 or base_expected_edge <= 0:
+        candidate.realizable_edge_score_multiplier = 1.0
+        return 1.0
+
+    base_reward_r = base_expected_edge / stop_distance_pct
+    flags = dict(getattr(candidate, 'trigger_confirmation_flags', {}) or {})
+    trigger_type = str(getattr(candidate, 'trigger_type', 'breakout') or 'breakout').lower()
+    breakout_quality = None
+    if trigger_type == 'breakout':
+        breakout_quality = {
+            'quality_pass': bool(flags.get('breakout_quality_pass', True)),
+            'hard_reject': bool(flags.get('breakout_quality_hard_reject', False)),
+            'confirmation_count': 1 if bool(flags.get('breakout_flow_confirmed', False)) else 0,
+        }
+
+    top_depth = max(float(getattr(candidate, 'top_depth_usdt', 0.0) or 0.0), 0.0)
+    available_depth = max(float(getattr(candidate, 'available_depth_usdt', 0.0) or 0.0), 0.0)
+    has_depth = top_depth > 0 or available_depth > 0
+    edge_model = estimate_realizable_reward_r(
+        base_reward_r=base_reward_r,
+        trigger_type=trigger_type,
+        state=str(getattr(candidate, 'state', 'watch') or 'watch'),
+        overextension_flag=bool(getattr(candidate, 'overextension_flag', False)),
+        breakout_quality=breakout_quality,
+        volume_multiple=float(getattr(candidate, 'volume_multiple', 0.0) or 0.0),
+        min_volume_multiple=1.0,
+        stop_distance_pct=stop_distance_pct,
+        expected_slippage_pct=max(float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0), 0.0),
+        book_depth_fill_ratio=float(getattr(candidate, 'book_depth_fill_ratio', 0.0) or 0.0),
+        has_orderbook_depth=has_depth,
+    )
+    realizable_reward_r = float(edge_model['reward_r'])
+    realizable_edge = round(stop_distance_pct * realizable_reward_r, 4)
+    candidate.base_expected_edge = round(base_expected_edge, 4)
+    candidate.realizable_reward_r = realizable_reward_r
+    candidate.realizable_expected_edge = realizable_edge
+    candidate.realizable_edge_model = edge_model
+    candidate.expected_edge = realizable_edge
+
+    total_cost_floor = (
+        max(float(getattr(candidate, 'expected_total_fee_pct', 0.0) or 0.0), 0.0)
+        + max(float(getattr(candidate, 'execution_slippage_buffer_pct', 0.0) or 0.0), 0.0)
+        + max(float(getattr(candidate, 'min_profit_buffer_pct', 0.0) or 0.0), 0.0)
+    )
+    edge_margin = realizable_edge - total_cost_floor
+    edge_margin_r = edge_margin / stop_distance_pct if stop_distance_pct > 0 else 0.0
+    if edge_margin <= 0:
+        score_multiplier = 0.82
+    elif edge_margin_r < 0.20:
+        score_multiplier = 0.92
+    elif edge_margin_r >= 0.90:
+        score_multiplier = 1.06
+    elif edge_margin_r >= 0.55:
+        score_multiplier = 1.03
+    else:
+        score_multiplier = 1.0
+    candidate.realizable_edge_margin_pct = round(edge_margin, 4)
+    candidate.realizable_edge_margin_r = round(edge_margin_r, 4)
+    candidate.realizable_edge_score_multiplier = round(score_multiplier, 4)
+    return score_multiplier
+
+
 def apply_market_direction_bias(candidate: Any, payload: Dict[str, Any] | None, *, max_score_tilt: float = 0.04) -> Any:
-    """Apply at most +/-4% score tilt; never reject the counter-trend side."""
+    """Apply soft market tilt, then a bounded economics-aware ranking adjustment."""
     data = payload or {}
     bias = str(data.get('bias') or 'NEUTRAL').upper()
     side = str(getattr(candidate, 'side', getattr(candidate, 'position_side', 'LONG')) or 'LONG').upper()
@@ -169,4 +246,15 @@ def apply_market_direction_bias(candidate: Any, payload: Dict[str, Any] | None, 
         f"weighted={candidate.market_weighted_breadth_ratio:.2f}:median={candidate.market_median_change_pct:.2f}:"
         f"conviction={candidate.market_directional_conviction:.2f}:multiplier={multiplier:.4f}"
     )
+
+    edge_multiplier = _apply_realizable_edge_adjustment(candidate)
+    if edge_multiplier != 1.0:
+        candidate.score = round(float(candidate.score or 0.0) * edge_multiplier, 4)
+    if hasattr(candidate, 'realizable_reward_r'):
+        candidate.reasons.append(
+            f"realizable_edge=reward_r={candidate.realizable_reward_r:.3f}:"
+            f"edge_pct={candidate.realizable_expected_edge:.3f}:"
+            f"margin_r={candidate.realizable_edge_margin_r:.3f}:"
+            f"score_multiplier={candidate.realizable_edge_score_multiplier:.3f}"
+        )
     return candidate
