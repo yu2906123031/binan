@@ -34,6 +34,7 @@ def test_build_trade_bucket_analysis_payload_aggregates_expectancy_and_mfe_mae_b
     assert first_bucket['avg_time_to_1r_minutes'] == 12.0
     assert first_bucket['avg_time_in_trade_minutes'] == 26.5
     assert payload['edge_calibration']['sample_count'] == 0
+    assert payload['slippage_calibration']['sample_count'] == 0
     assert payload['prediction_coverage']['edge_prediction_coverage_pct'] == 0.0
     assert payload['by_exit_reason'] == [{'exit_reason': 'runner', 'count': 1}, {'exit_reason': 'stop', 'count': 1}, {'exit_reason': 'tp2', 'count': 1}]
     assert {'symbol': 'DOGEUSDT', 'count': 2} in payload['by_symbol']
@@ -108,6 +109,63 @@ def test_candidate_selected_prediction_is_backfilled_into_closed_trade():
     assert coverage['flow_confirmation_coverage_pct'] == 100.0
 
 
+def test_entry_fill_calibrates_predicted_vs_actual_slippage():
+    rows = [
+        {
+            'event_type': 'candidate_selected',
+            'recorded_at': '2026-08-30T01:00:00Z',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'expected_edge': 1.2,
+            'stop_distance_pct': 0.6,
+            'expected_slippage_pct': 0.08,
+            'shadow_entry_price': 100.0,
+        },
+        {
+            'event_type': 'entry_filled',
+            'recorded_at': '2026-08-30T01:01:00Z',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'entry_price': 100.1,
+        },
+        {
+            'event_type': 'trade_invalidated',
+            'recorded_at': '2026-08-30T01:20:00Z',
+            'symbol': 'DOGEUSDT',
+            'side': 'LONG',
+            'realized_r': 0.5,
+        },
+    ]
+    closed = mod.filter_closed_trade_events(rows)
+    assert closed[0]['predicted_slippage_bps'] == 8.0
+    assert closed[0]['actual_fill_slippage_bps'] == 10.0
+    assert closed[0]['slippage_error_bps'] == 2.0
+    calibration = mod.build_trade_bucket_analysis_payload(rows)['slippage_calibration']
+    assert calibration['sample_count'] == 1
+    assert calibration['avg_predicted_slippage_bps'] == 8.0
+    assert calibration['avg_actual_slippage_bps'] == 10.0
+    assert calibration['actual_to_predicted_ratio'] == 1.25
+    assert calibration['mean_error_bps'] == 2.0
+    assert calibration['mean_absolute_error_bps'] == 2.0
+    assert calibration['underprediction_rate_pct'] == 100.0
+    coverage = mod.build_trade_bucket_analysis_payload(rows)['prediction_coverage']
+    assert coverage['actual_slippage_coverage_pct'] == 100.0
+
+
+def test_entry_fill_slippage_backfill_prefers_same_side_and_clears_after_close():
+    rows = [
+        {'event_type': 'candidate_selected', 'symbol': 'SUIUSDT', 'side': 'LONG', 'expected_slippage_pct': 0.05, 'shadow_entry_price': 100.0},
+        {'event_type': 'candidate_selected', 'symbol': 'SUIUSDT', 'side': 'SHORT', 'expected_slippage_pct': 0.20, 'shadow_entry_price': 100.0},
+        {'event_type': 'entry_filled', 'symbol': 'SUIUSDT', 'side': 'LONG', 'entry_price': 100.1},
+        {'event_type': 'trade_invalidated', 'symbol': 'SUIUSDT', 'side': 'LONG', 'realized_r': 0.2},
+        {'event_type': 'trade_invalidated', 'symbol': 'SUIUSDT', 'side': 'LONG', 'realized_r': -0.2},
+    ]
+    closed = mod.filter_closed_trade_events(rows)
+    assert closed[0]['predicted_slippage_bps'] == 5.0
+    assert closed[0]['actual_fill_slippage_bps'] == 10.0
+    assert closed[1].get('actual_fill_slippage_bps') is None
+
+
 def test_candidate_prediction_backfill_prefers_same_side():
     rows = [
         {'event_type': 'candidate_selected', 'symbol': 'SUIUSDT', 'side': 'LONG', 'expected_edge': 0.5, 'stop_distance_pct': 1.0},
@@ -138,6 +196,7 @@ def test_run_filters_symbol_and_writes_report_files(tmp_path):
     markdown = md_path.read_text(encoding='utf-8')
     assert '# Trade Bucket Analysis' in markdown
     assert '## Edge calibration' in markdown
+    assert '## Slippage calibration' in markdown
     assert '## Prediction coverage' in markdown
     assert 'DOGEUSDT' in markdown
     assert 'SUIUSDT' not in markdown
