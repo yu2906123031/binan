@@ -40,6 +40,10 @@ PREDICTION_FIELDS = (
     'market_regime_label',
     'market_regime_multiplier',
     'shadow_entry_price',
+    'maker_or_taker',
+    'execution_mode',
+    'liquidity_grade_at_entry',
+    'execution_liquidity_grade',
 )
 
 
@@ -139,7 +143,13 @@ def _with_entry_fill(snapshot: Dict[str, Any], row: Dict[str, Any]) -> Dict[str,
     entry_price = _optional_float(row, 'entry_price', 'avg_price')
     if entry_price is not None and entry_price > 0:
         enriched['entry_price_at_fill'] = entry_price
+    for field in ('maker_or_taker', 'execution_mode', 'liquidity_grade_at_entry', 'execution_liquidity_grade'):
+        value = row.get(field)
+        if value not in (None, ''):
+            enriched[field] = value
     predicted_bps = _optional_float(enriched, 'predicted_slippage_bps')
+    if predicted_bps is None:
+        predicted_bps = _optional_float(row, 'predicted_slippage_bps')
     if predicted_bps is None:
         expected_slippage_pct = _optional_float(enriched, 'expected_slippage_pct')
         if expected_slippage_pct is not None:
@@ -333,6 +343,29 @@ def _slippage_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _slippage_calibration_by_dimension(closed_rows: List[Dict[str, Any]], dimension: str) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in closed_rows:
+        if dimension == 'side':
+            key = _side_key(row.get('position_side') or row.get('side')) or 'unknown'
+        elif dimension == 'maker_or_taker':
+            key = _normalize_text(row.get('maker_or_taker') or row.get('execution_mode'))
+        elif dimension == 'liquidity_grade':
+            key = _normalize_text(row.get('liquidity_grade_at_entry') or row.get('execution_liquidity_grade') or row.get('liquidity_grade'))
+        elif dimension == 'market_regime_label':
+            key = _normalize_text(row.get('market_regime_label'))
+        else:
+            key = _normalize_text(row.get(dimension))
+        grouped[key].append(row)
+    output: List[Dict[str, Any]] = []
+    for key, group_rows in grouped.items():
+        calibration = _slippage_calibration(group_rows)
+        if calibration['sample_count'] <= 0:
+            continue
+        output.append({dimension: key, **calibration})
+    return sorted(output, key=lambda item: (-int(item['sample_count']), str(item.get(dimension, ''))))
+
+
 def _prediction_coverage(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(closed_rows)
     with_prediction = 0
@@ -444,6 +477,10 @@ def build_trade_bucket_analysis_payload(
         },
         'edge_calibration': _edge_calibration(closed_rows),
         'slippage_calibration': _slippage_calibration(closed_rows),
+        'slippage_calibration_by_side': _slippage_calibration_by_dimension(closed_rows, 'side'),
+        'slippage_calibration_by_maker_or_taker': _slippage_calibration_by_dimension(closed_rows, 'maker_or_taker'),
+        'slippage_calibration_by_liquidity_grade': _slippage_calibration_by_dimension(closed_rows, 'liquidity_grade'),
+        'slippage_calibration_by_market_regime': _slippage_calibration_by_dimension(closed_rows, 'market_regime_label'),
         'prediction_coverage': _prediction_coverage(closed_rows),
         'by_bucket': by_bucket,
         'by_exit_reason': _count_table(exit_reason_counter, 'exit_reason'),
@@ -501,6 +538,11 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
             lines.append('| ' + ' | '.join(str(row.get(column, '')) for column in columns) + ' |')
         lines.append('')
 
+    slippage_columns = ['sample_count', 'avg_predicted_slippage_bps', 'avg_actual_slippage_bps', 'actual_to_predicted_ratio', 'mean_error_bps', 'mean_absolute_error_bps', 'underprediction_rate_pct']
+    append_table('Slippage by side', payload.get('slippage_calibration_by_side', []), ['side', *slippage_columns])
+    append_table('Slippage by maker or taker', payload.get('slippage_calibration_by_maker_or_taker', []), ['maker_or_taker', *slippage_columns])
+    append_table('Slippage by liquidity grade', payload.get('slippage_calibration_by_liquidity_grade', []), ['liquidity_grade', *slippage_columns])
+    append_table('Slippage by market regime', payload.get('slippage_calibration_by_market_regime', []), ['market_regime_label', *slippage_columns])
     append_table('By bucket', payload.get('by_bucket', []), ['market_regime_label', 'side', 'state', 'trigger_class', 'score_decile', 'count', 'win_rate_pct', 'avg_expectancy_r', 'avg_mfe_r', 'avg_mae_r', 'avg_time_to_1r_minutes', 'avg_time_in_trade_minutes'])
     append_table('By exit reason', payload.get('by_exit_reason', []), ['exit_reason', 'count'])
     append_table('By symbol', payload.get('by_symbol', []), ['symbol', 'count'])
