@@ -71,9 +71,7 @@ class GlobalRateLimiter:
     async def acquire(self, *, weight: int = 1) -> None:
         weight = max(1, int(weight))
         if weight > self.max_weight_per_minute:
-            raise ValueError(
-                f"request weight {weight} exceeds configured per-minute limit {self.max_weight_per_minute}"
-            )
+            raise ValueError(f"request weight {weight} exceeds configured per-minute limit {self.max_weight_per_minute}")
         async with self._semaphore:
             while True:
                 async with self._lock:
@@ -130,13 +128,7 @@ class RetryManager:
         self.max_delay = max(self.base_delay, float(max_delay))
         self.jitter = max(0.0, float(jitter))
 
-    async def run(
-        self,
-        op: Callable[[], Awaitable[Any]],
-        *,
-        is_retryable: Callable[[BaseException], bool],
-        on_retry: Optional[Callable[[BaseException, int], None]] = None,
-    ) -> Any:
+    async def run(self, op: Callable[[], Awaitable[Any]], *, is_retryable: Callable[[BaseException], bool], on_retry: Optional[Callable[[BaseException, int], None]] = None) -> Any:
         attempt = 0
         while True:
             attempt += 1
@@ -158,15 +150,7 @@ class RetryManager:
 class BinanceRequestManager:
     IDEMPOTENT_METHODS = frozenset({'GET', 'HEAD', 'OPTIONS'})
 
-    def __init__(
-        self,
-        *,
-        transport: Callable[[BinanceRequest], Awaitable[Any]],
-        limiter: Optional[GlobalRateLimiter] = None,
-        retry_manager: Optional[RetryManager] = None,
-        circuit_breaker: Optional[CircuitBreaker] = None,
-        max_queue_size: int = 512,
-    ):
+    def __init__(self, *, transport: Callable[[BinanceRequest], Awaitable[Any]], limiter: Optional[GlobalRateLimiter] = None, retry_manager: Optional[RetryManager] = None, circuit_breaker: Optional[CircuitBreaker] = None, max_queue_size: int = 512, shutdown_timeout: float = 5.0):
         self.transport = transport
         self.limiter = limiter or GlobalRateLimiter()
         self.retry_manager = retry_manager or RetryManager()
@@ -176,6 +160,7 @@ class BinanceRequestManager:
         self._sequence = 0
         self._worker: Optional[asyncio.Task] = None
         self._stopping = False
+        self.shutdown_timeout = max(float(shutdown_timeout), 0.1)
 
     async def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -184,14 +169,28 @@ class BinanceRequestManager:
 
     async def shutdown(self) -> None:
         self._stopping = True
-        if self._worker:
-            await self.queue.join()
+        if not self._worker:
+            return
+        try:
+            await asyncio.wait_for(self.queue.join(), timeout=self.shutdown_timeout)
+        except TimeoutError:
+            self.metrics.last_error = "shutdown_queue_drain_timeout"
+        finally:
             self._worker.cancel()
             try:
                 await self._worker
             except asyncio.CancelledError:
                 pass
             self._worker = None
+            while True:
+                try:
+                    item = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not item.future.done():
+                    item.future.cancel()
+                self.queue.task_done()
+            self.metrics.queue_size = self.queue.qsize()
 
     async def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, *, signed: bool = False, weight: int = 1, priority: int = 10, timeout: float = 15.0) -> Any:
         if self._stopping:
@@ -224,6 +223,12 @@ class BinanceRequestManager:
                 future.cancel()
             raise
 
+    async def _run_transport(self, request: BinanceRequest) -> Any:
+        try:
+            return await asyncio.wait_for(self.transport(request), timeout=request.timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Binance transport timed out after {request.timeout:.3f}s: {request.method} {request.path}") from exc
+
     async def _run_worker(self) -> None:
         while True:
             item = await self.queue.get()
@@ -236,7 +241,7 @@ class BinanceRequestManager:
                     continue
                 started = time.monotonic()
                 result = await self.retry_manager.run(
-                    lambda: self.transport(item.request),
+                    lambda: self._run_transport(item.request),
                     is_retryable=lambda exc: self._is_retryable_request(item.request, exc),
                     on_retry=self._record_retry,
                 )
@@ -279,15 +284,6 @@ class BinanceRequestManager:
 
     @classmethod
     def _is_retryable_request(cls, request: BinanceRequest, exc: BaseException) -> bool:
-        """Retry transport failures only when replaying the HTTP method is safe.
-
-        Binance order creation/cancel/margin/leverage endpoints are generally
-        POST/DELETE writes. A transport timeout is ambiguous: the exchange may
-        already have committed the write even though the client did not receive
-        the response. Blindly replaying such a request can duplicate orders or
-        mutate account state twice, so write reconciliation belongs at the
-        execution layer rather than in this generic transport retry loop.
-        """
         if str(request.method or '').upper() not in cls.IDEMPOTENT_METHODS:
             return False
         return cls._is_retryable(exc)
