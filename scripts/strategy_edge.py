@@ -13,6 +13,9 @@ def estimate_realizable_reward_r(
     base_reward_r: float = 1.0,
     trigger_type: str = 'breakout',
     state: str = 'watch',
+    candidate_stage: str = '',
+    setup_ready: bool = True,
+    trigger_fired: bool = True,
     overextension_flag: bool = False,
     breakout_quality: Optional[Dict[str, Any]] = None,
     volume_multiple: float = 1.0,
@@ -26,11 +29,13 @@ def estimate_realizable_reward_r(
 
     The model deliberately estimates *realizable* reward instead of assuming every
     candidate can achieve the same configured R multiple. Missing optional orderbook
-    data is neutral; observed poor depth/slippage is penalized.
+    data is neutral; observed poor depth/slippage is penalized. Unconfirmed/watch
+    candidates are also discounted so raw heat cannot outrank fully fired setups.
     """
     base = _clamp(float(base_reward_r or 1.0), 0.25, 4.0)
     trigger = str(trigger_type or 'breakout').strip().lower()
     state_name = str(state or 'watch').strip().lower()
+    stage_name = str(candidate_stage or '').strip().lower()
 
     trigger_multiplier = 1.08 if trigger == 'pullback' else 1.0
     state_multiplier = {
@@ -44,6 +49,15 @@ def estimate_realizable_reward_r(
         'none': 0.82,
     }.get(state_name, 0.90)
     extension_multiplier = 0.70 if bool(overextension_flag) else 1.0
+
+    if not setup_ready:
+        stage_multiplier = 0.62
+    elif not trigger_fired:
+        stage_multiplier = 0.78 if stage_name in {'pre_trigger_watch', 'watch_candidate', ''} else 0.82
+    elif stage_name in {'pre_trigger_watch', 'watch_candidate'}:
+        stage_multiplier = 0.90
+    else:
+        stage_multiplier = 1.0
 
     required_volume = max(float(min_volume_multiple or 0.0), 1.0)
     volume_ratio = max(float(volume_multiple or 0.0), 0.0) / required_volume
@@ -97,6 +111,7 @@ def estimate_realizable_reward_r(
     for multiplier in (
         trigger_multiplier,
         state_multiplier,
+        stage_multiplier,
         extension_multiplier,
         volume_multiplier,
         breakout_multiplier,
@@ -111,6 +126,7 @@ def estimate_realizable_reward_r(
         'base_reward_r': round(base, 4),
         'trigger_multiplier': round(trigger_multiplier, 4),
         'state_multiplier': round(state_multiplier, 4),
+        'stage_multiplier': round(stage_multiplier, 4),
         'extension_multiplier': round(extension_multiplier, 4),
         'volume_multiplier': round(volume_multiplier, 4),
         'breakout_multiplier': round(breakout_multiplier, 4),
@@ -118,6 +134,9 @@ def estimate_realizable_reward_r(
         'slippage_multiplier': round(slippage_multiplier, 4),
         'slippage_r': round(slippage_r, 4),
         'flow_confirmation_count': flow_count,
+        'candidate_stage': stage_name,
+        'setup_ready': bool(setup_ready),
+        'trigger_fired': bool(trigger_fired),
         'has_orderbook_depth': bool(has_orderbook_depth),
         'book_depth_fill_ratio': None if fill_ratio is None else round(fill_ratio, 4),
     }
