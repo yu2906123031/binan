@@ -1,9 +1,9 @@
 """Conservative whole-market directional bias for the futures scanner.
 
-This module changes ranking scores only; it never directly vetoes a side or alters
-position/protection decisions. It also applies a small economics-aware ranking
-adjustment after the market-direction tilt so expensive/extended candidates do
-not outrank cleaner setups merely because their raw momentum score is high.
+This module applies a bounded market-direction tilt plus an economics-aware
+ranking adjustment. The economics pass also updates ``candidate.expected_edge``
+with a conservative realizable estimate so downstream cost/risk gates evaluate
+what the setup can plausibly capture rather than a fixed configured reward.
 """
 from __future__ import annotations
 
@@ -132,7 +132,8 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
         return 1.0
 
     stop_distance_pct = max(float(getattr(candidate, 'stop_distance_pct', 0.0) or 0.0), 0.0)
-    base_expected_edge = max(float(getattr(candidate, 'expected_edge', 0.0) or 0.0), 0.0)
+    current_expected_edge = max(float(getattr(candidate, 'expected_edge', 0.0) or 0.0), 0.0)
+    base_expected_edge = max(float(getattr(candidate, 'base_expected_edge', current_expected_edge) or current_expected_edge), 0.0)
     if stop_distance_pct <= 1e-12 or base_expected_edge <= 0:
         candidate.realizable_edge_score_multiplier = 1.0
         return 1.0
@@ -142,10 +143,15 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
     trigger_type = str(getattr(candidate, 'trigger_type', 'breakout') or 'breakout').lower()
     breakout_quality = None
     if trigger_type == 'breakout':
+        flow_confirmation_count = max(int(getattr(candidate, 'breakout_flow_confirmation_count', 0) or 0), 0)
+        if flow_confirmation_count <= 0:
+            flow_confirmation_count = max(int(flags.get('breakout_flow_confirmation_count', 0) or 0), 0)
+        if flow_confirmation_count <= 0 and bool(flags.get('breakout_flow_confirmed', False)):
+            flow_confirmation_count = 1
         breakout_quality = {
             'quality_pass': bool(flags.get('breakout_quality_pass', True)),
             'hard_reject': bool(flags.get('breakout_quality_hard_reject', False)),
-            'confirmation_count': 1 if bool(flags.get('breakout_flow_confirmed', False)) else 0,
+            'confirmation_count': flow_confirmation_count,
         }
 
     setup_ready = bool(getattr(candidate, 'setup_ready', True))
@@ -153,6 +159,7 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
     top_depth = max(float(getattr(candidate, 'top_depth_usdt', 0.0) or 0.0), 0.0)
     available_depth = max(float(getattr(candidate, 'available_depth_usdt', 0.0) or 0.0), 0.0)
     has_depth = top_depth > 0 or available_depth > 0
+    effective_min_volume = max(float(getattr(candidate, 'effective_min_volume_multiple', getattr(candidate, 'min_volume_multiple', 1.0)) or 1.0), 1.0)
     edge_model = estimate_realizable_reward_r(
         base_reward_r=base_reward_r,
         trigger_type=trigger_type,
@@ -163,7 +170,7 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
         overextension_flag=bool(getattr(candidate, 'overextension_flag', False)),
         breakout_quality=breakout_quality,
         volume_multiple=float(getattr(candidate, 'volume_multiple', 0.0) or 0.0),
-        min_volume_multiple=1.0,
+        min_volume_multiple=effective_min_volume,
         stop_distance_pct=stop_distance_pct,
         expected_slippage_pct=max(float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0), 0.0),
         book_depth_fill_ratio=float(getattr(candidate, 'book_depth_fill_ratio', 0.0) or 0.0),
@@ -195,9 +202,6 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
     else:
         score_multiplier = 1.0
 
-    # Readiness is a direct ranking constraint, not merely an edge-model input.
-    # A very hot symbol that has not fired must not outrank an equally strong,
-    # fully confirmed setup just because rank/momentum points are large.
     if not setup_ready:
         score_multiplier = min(score_multiplier, 0.78)
     elif not trigger_fired:
@@ -210,14 +214,19 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
 
 
 def apply_market_direction_bias(candidate: Any, payload: Dict[str, Any] | None, *, max_score_tilt: float = 0.04) -> Any:
-    """Apply soft market tilt, then a bounded economics-aware ranking adjustment."""
+    """Apply soft market tilt and economics from an immutable raw-score baseline."""
     data = payload or {}
     bias = str(data.get('bias') or 'NEUTRAL').upper()
     side = str(getattr(candidate, 'side', getattr(candidate, 'position_side', 'LONG')) or 'LONG').upper()
     strength = max(0.0, min(float(data.get('strength') or 0.0), 1.0))
     tilt = max(0.0, min(float(max_score_tilt or 0.0), 0.10)) * strength
     multiplier = 1.0 if bias == 'NEUTRAL' else (1.0 + tilt if side == bias else 1.0 - tilt)
-    candidate.score = round(float(getattr(candidate, 'score', 0.0) or 0.0) * multiplier, 4)
+
+    current_score = float(getattr(candidate, 'score', 0.0) or 0.0)
+    raw_score = float(getattr(candidate, 'base_ranking_score', current_score) or current_score)
+    candidate.base_ranking_score = round(raw_score, 4)
+    market_adjusted_score = raw_score * multiplier
+
     candidate.market_direction_bias = bias
     candidate.market_direction_bias_strength = strength
     candidate.market_direction_score_multiplier = round(multiplier, 4)
@@ -225,16 +234,20 @@ def apply_market_direction_bias(candidate: Any, payload: Dict[str, Any] | None, 
     candidate.market_weighted_breadth_ratio = float(data.get('weighted_breadth_ratio', candidate.market_breadth_ratio) or candidate.market_breadth_ratio)
     candidate.market_median_change_pct = float(data.get('median_change_pct', 0.0) or 0.0)
     candidate.market_directional_conviction = float(data.get('directional_conviction', 0.0) or 0.0)
-    candidate.reasons = list(getattr(candidate, 'reasons', []) or [])
-    candidate.reasons.append(
+
+    reasons = [
+        reason for reason in list(getattr(candidate, 'reasons', []) or [])
+        if not str(reason).startswith(('market_direction_bias=', 'realizable_edge='))
+    ]
+    reasons.append(
         f"market_direction_bias={bias}:strength={strength:.2f}:breadth={candidate.market_breadth_ratio:.2f}:"
         f"weighted={candidate.market_weighted_breadth_ratio:.2f}:median={candidate.market_median_change_pct:.2f}:"
         f"conviction={candidate.market_directional_conviction:.2f}:multiplier={multiplier:.4f}"
     )
+    candidate.reasons = reasons
 
     edge_multiplier = _apply_realizable_edge_adjustment(candidate)
-    if edge_multiplier != 1.0:
-        candidate.score = round(float(candidate.score or 0.0) * edge_multiplier, 4)
+    candidate.score = round(market_adjusted_score * edge_multiplier, 4)
     if hasattr(candidate, 'realizable_reward_r'):
         candidate.reasons.append(
             f"realizable_edge=reward_r={candidate.realizable_reward_r:.3f}:"
