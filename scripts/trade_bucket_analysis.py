@@ -108,6 +108,53 @@ def _count_table(counter: Counter, key_name: str) -> List[Dict[str, Any]]:
     return [{key_name: key, 'count': count} for key, count in ordered]
 
 
+def _optional_float(row: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ''):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _edge_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    samples: List[Dict[str, float]] = []
+    for row in closed_rows:
+        predicted = _optional_float(row, 'realizable_reward_r', 'expected_reward_r')
+        if predicted is None:
+            expected_edge = _optional_float(row, 'expected_edge')
+            stop_pct = _optional_float(row, 'stop_distance_pct')
+            if expected_edge is not None and stop_pct is not None and stop_pct > 0:
+                predicted = expected_edge / stop_pct
+        if predicted is None or predicted <= 0:
+            continue
+        samples.append({'predicted': predicted, 'realized': _to_float(row.get('realized_r'))})
+
+    if not samples:
+        return {
+            'sample_count': 0,
+            'avg_predicted_reward_r': None,
+            'avg_realized_r': None,
+            'calibration_ratio': None,
+            'mean_error_r': None,
+            'mean_absolute_error_r': None,
+        }
+    count = len(samples)
+    predicted_sum = sum(item['predicted'] for item in samples)
+    realized_sum = sum(item['realized'] for item in samples)
+    errors = [item['realized'] - item['predicted'] for item in samples]
+    return {
+        'sample_count': count,
+        'avg_predicted_reward_r': _round(predicted_sum / count, 4),
+        'avg_realized_r': _round(realized_sum / count, 4),
+        'calibration_ratio': _round(realized_sum / predicted_sum if predicted_sum else 0.0, 4),
+        'mean_error_r': _round(sum(errors) / count, 4),
+        'mean_absolute_error_r': _round(sum(abs(error) for error in errors) / count, 4),
+    }
+
+
 def build_trade_bucket_analysis_payload(
     rows: Iterable[Dict[str, Any]],
     symbol: str = '',
@@ -116,18 +163,13 @@ def build_trade_bucket_analysis_payload(
 ) -> Dict[str, Any]:
     closed_rows = filter_closed_trade_events(rows, symbol=symbol, lookback_days=lookback_days, now=now)
     aggregates: Dict[tuple[str, str, str, str, str], Dict[str, float]] = defaultdict(lambda: {
-        'count': 0.0,
-        'wins': 0.0,
-        'expectancy_sum': 0.0,
-        'mfe_sum': 0.0,
-        'mae_sum': 0.0,
-        'time_to_1r_sum': 0.0,
-        'time_to_1r_count': 0.0,
-        'time_in_trade_sum': 0.0,
-        'time_in_trade_count': 0.0,
+        'count': 0.0, 'wins': 0.0, 'expectancy_sum': 0.0, 'mfe_sum': 0.0, 'mae_sum': 0.0,
+        'time_to_1r_sum': 0.0, 'time_to_1r_count': 0.0, 'time_in_trade_sum': 0.0, 'time_in_trade_count': 0.0,
     })
     exit_reason_counter: Counter = Counter()
     symbol_counter: Counter = Counter()
+    trigger_counter: Counter = Counter()
+    state_counter: Counter = Counter()
 
     for row in closed_rows:
         regime = _normalize_text(row.get('market_regime_label'))
@@ -142,7 +184,6 @@ def build_trade_bucket_analysis_payload(
         time_in_trade = row.get('time_in_trade_minutes')
         exit_reason = _normalize_text(row.get('exit_reason'))
         event_symbol = _normalize_text(row.get('symbol'))
-
         bucket = (regime, side, state, trigger_class, score_decile)
         aggregate = aggregates[bucket]
         aggregate['count'] += 1
@@ -156,25 +197,19 @@ def build_trade_bucket_analysis_payload(
         if time_in_trade not in (None, ''):
             aggregate['time_in_trade_sum'] += _to_float(time_in_trade)
             aggregate['time_in_trade_count'] += 1
-
         exit_reason_counter[exit_reason] += 1
         symbol_counter[event_symbol] += 1
+        trigger_counter[trigger_class] += 1
+        state_counter[state] += 1
 
     by_bucket: List[Dict[str, Any]] = []
-    for bucket, aggregate in sorted(
-        aggregates.items(),
-        key=lambda item: (-item[1]['count'], -item[1]['expectancy_sum'], item[0]),
-    ):
+    for bucket, aggregate in sorted(aggregates.items(), key=lambda item: (-item[1]['count'], -item[1]['expectancy_sum'], item[0])):
         regime, side, state, trigger_class, score_decile = bucket
         count = int(aggregate['count'])
         wins = int(aggregate['wins'])
         by_bucket.append({
-            'market_regime_label': regime,
-            'side': side,
-            'state': state,
-            'trigger_class': trigger_class,
-            'score_decile': score_decile,
-            'count': count,
+            'market_regime_label': regime, 'side': side, 'state': state, 'trigger_class': trigger_class,
+            'score_decile': score_decile, 'count': count,
             'win_rate_pct': _round((wins / count) * 100.0 if count else 0.0, 2),
             'avg_expectancy_r': _round(aggregate['expectancy_sum'] / count if count else 0.0, 4),
             'avg_mfe_r': _round(aggregate['mfe_sum'] / count if count else 0.0, 4),
@@ -188,41 +223,48 @@ def build_trade_bucket_analysis_payload(
     total_expectancy = sum(_to_float(row.get('realized_r')) for row in closed_rows)
     total_mfe = sum(_to_float(row.get('mfe_r')) for row in closed_rows)
     total_mae = sum(_to_float(row.get('mae_r')) for row in closed_rows)
-
     return {
         'summary': {
-            'symbol': _normalize_text(symbol, default='').upper(),
-            'lookback_days': int(lookback_days or 0),
-            'total_closed_trades': total_closed,
-            'distinct_buckets': len(by_bucket),
+            'symbol': _normalize_text(symbol, default='').upper(), 'lookback_days': int(lookback_days or 0),
+            'total_closed_trades': total_closed, 'distinct_buckets': len(by_bucket),
             'win_rate_pct': _round((total_wins / total_closed) * 100.0 if total_closed else 0.0, 2),
             'avg_expectancy_r': _round(total_expectancy / total_closed if total_closed else 0.0, 4),
             'avg_mfe_r': _round(total_mfe / total_closed if total_closed else 0.0, 4),
             'avg_mae_r': _round(total_mae / total_closed if total_closed else 0.0, 4),
         },
+        'edge_calibration': _edge_calibration(closed_rows),
         'by_bucket': by_bucket,
         'by_exit_reason': _count_table(exit_reason_counter, 'exit_reason'),
         'by_symbol': _count_table(symbol_counter, 'symbol'),
+        'by_trigger_class': _count_table(trigger_counter, 'trigger_class'),
+        'by_state': _count_table(state_counter, 'state'),
     }
 
 
 def render_markdown_report(payload: Dict[str, Any]) -> str:
     lines = ['# Trade Bucket Analysis', '']
     summary = payload.get('summary', {})
-    lines.append(f"- symbol: {summary.get('symbol') or 'ALL'}")
-    lines.append(f"- lookback_days: {summary.get('lookback_days', 0)}")
-    lines.append(f"- total_closed_trades: {summary.get('total_closed_trades', 0)}")
-    lines.append(f"- distinct_buckets: {summary.get('distinct_buckets', 0)}")
-    lines.append(f"- win_rate_pct: {summary.get('win_rate_pct', 0)}")
-    lines.append(f"- avg_expectancy_r: {summary.get('avg_expectancy_r', 0)}")
-    lines.append('')
+    calibration = payload.get('edge_calibration', {})
+    lines.extend([
+        f"- symbol: {summary.get('symbol') or 'ALL'}",
+        f"- lookback_days: {summary.get('lookback_days', 0)}",
+        f"- total_closed_trades: {summary.get('total_closed_trades', 0)}",
+        f"- distinct_buckets: {summary.get('distinct_buckets', 0)}",
+        f"- win_rate_pct: {summary.get('win_rate_pct', 0)}",
+        f"- avg_expectancy_r: {summary.get('avg_expectancy_r', 0)}", '',
+        '## Edge calibration', '',
+        f"- sample_count: {calibration.get('sample_count', 0)}",
+        f"- avg_predicted_reward_r: {calibration.get('avg_predicted_reward_r')}",
+        f"- avg_realized_r: {calibration.get('avg_realized_r')}",
+        f"- calibration_ratio: {calibration.get('calibration_ratio')}",
+        f"- mean_error_r: {calibration.get('mean_error_r')}",
+        f"- mean_absolute_error_r: {calibration.get('mean_absolute_error_r')}", '',
+    ])
 
     def append_table(title: str, rows: List[Dict[str, Any]], columns: List[str]) -> None:
-        lines.append(f'## {title}')
-        lines.append('')
+        lines.extend([f'## {title}', ''])
         if not rows:
-            lines.append('_no rows_')
-            lines.append('')
+            lines.extend(['_no rows_', ''])
             return
         lines.append('| ' + ' | '.join(columns) + ' |')
         lines.append('| ' + ' | '.join(['---'] * len(columns)) + ' |')
@@ -230,43 +272,17 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
             lines.append('| ' + ' | '.join(str(row.get(column, '')) for column in columns) + ' |')
         lines.append('')
 
-    append_table(
-        'By bucket',
-        payload.get('by_bucket', []),
-        [
-            'market_regime_label',
-            'side',
-            'state',
-            'trigger_class',
-            'score_decile',
-            'count',
-            'win_rate_pct',
-            'avg_expectancy_r',
-            'avg_mfe_r',
-            'avg_mae_r',
-            'avg_time_to_1r_minutes',
-            'avg_time_in_trade_minutes',
-        ],
-    )
+    append_table('By bucket', payload.get('by_bucket', []), ['market_regime_label', 'side', 'state', 'trigger_class', 'score_decile', 'count', 'win_rate_pct', 'avg_expectancy_r', 'avg_mfe_r', 'avg_mae_r', 'avg_time_to_1r_minutes', 'avg_time_in_trade_minutes'])
     append_table('By exit reason', payload.get('by_exit_reason', []), ['exit_reason', 'count'])
     append_table('By symbol', payload.get('by_symbol', []), ['symbol', 'count'])
+    append_table('By trigger class', payload.get('by_trigger_class', []), ['trigger_class', 'count'])
+    append_table('By state', payload.get('by_state', []), ['state', 'count'])
     return '\n'.join(lines).rstrip() + '\n'
 
 
-def run(
-    runtime_state_dir: Path,
-    output_json_path: Path,
-    output_markdown_path: Path,
-    limit: int = 5000,
-    symbol: str = '',
-    lookback_days: int = 0,
-) -> Dict[str, Any]:
+def run(runtime_state_dir: Path, output_json_path: Path, output_markdown_path: Path, limit: int = 5000, symbol: str = '', lookback_days: int = 0) -> Dict[str, Any]:
     runtime_state_dir = Path(runtime_state_dir)
-    payload = build_trade_bucket_analysis_payload(
-        load_events(runtime_state_dir / 'events.jsonl', limit=limit),
-        symbol=symbol,
-        lookback_days=lookback_days,
-    )
+    payload = build_trade_bucket_analysis_payload(load_events(runtime_state_dir / 'events.jsonl', limit=limit), symbol=symbol, lookback_days=lookback_days)
     output_json_path = Path(output_json_path)
     output_markdown_path = Path(output_markdown_path)
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,14 +301,7 @@ def main() -> int:
     parser.add_argument('--lookback-days', type=int, default=0)
     parser.add_argument('--limit', type=int, default=5000)
     args = parser.parse_args()
-    payload = run(
-        runtime_state_dir=Path(args.runtime_state_dir),
-        output_json_path=Path(args.output_json),
-        output_markdown_path=Path(args.output_markdown),
-        limit=args.limit,
-        symbol=args.symbol,
-        lookback_days=args.lookback_days,
-    )
+    payload = run(runtime_state_dir=Path(args.runtime_state_dir), output_json_path=Path(args.output_json), output_markdown_path=Path(args.output_markdown), limit=args.limit, symbol=args.symbol, lookback_days=args.lookback_days)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
