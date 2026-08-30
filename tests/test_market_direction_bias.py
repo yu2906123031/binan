@@ -33,6 +33,7 @@ def test_broad_rising_market_produces_long_bias():
     assert result['breadth_ratio'] > 0.6
     assert result['weighted_breadth_ratio'] > 0.6
     assert result['median_change_pct'] > 0
+    assert result['directional_conviction'] >= 0.2
     assert 0 < result['strength'] <= 1
 
 
@@ -46,12 +47,43 @@ def test_broad_falling_market_produces_short_bias():
     assert result['breadth_ratio'] < 0.4
     assert result['weighted_breadth_ratio'] < 0.4
     assert result['median_change_pct'] < 0
+    assert result['directional_conviction'] >= 0.2
 
 
 def test_mixed_or_insufficient_market_is_neutral():
     mod = load_module()
     assert mod.compute_market_direction_bias(tickers([2, 1, -1, -2]), {'structural_label': 'RANGE'})['bias'] == 'NEUTRAL'
     assert mod.compute_market_direction_bias(tickers([2, 1]), {'structural_label': 'BULL_TREND'})['bias'] == 'NEUTRAL'
+
+
+def test_tiny_positive_drift_in_choppy_market_is_neutral():
+    mod = load_module()
+    result = mod.compute_market_direction_bias(
+        tickers([0.03, 0.02, 0.01, 0.01, 0.01, 0.01, -3.0, -2.0]),
+        {'structural_label': 'BULL_TREND'},
+    )
+    assert result['breadth_ratio'] >= 0.55
+    assert result['weighted_breadth_ratio'] >= 0.60
+    assert result['median_change_pct'] > 0
+    assert result['directional_conviction'] < 0.2
+    assert result['bias'] == 'NEUTRAL'
+    assert result['strength'] == 0.0
+
+
+def test_conviction_scales_bias_strength():
+    mod = load_module()
+    strong = mod.compute_market_direction_bias(
+        tickers([5, 4, 3, 2, 1, 0.8, -0.2, -0.5]),
+        {'structural_label': 'BULL_TREND'},
+    )
+    weaker = mod.compute_market_direction_bias(
+        tickers([1.0, 0.8, 0.6, 0.4, 0.2, 0.2, -1.0, -2.0]),
+        {'structural_label': 'BULL_TREND'},
+    )
+    assert strong['bias'] == 'LONG'
+    assert weaker['bias'] == 'LONG'
+    assert strong['directional_conviction'] > weaker['directional_conviction']
+    assert strong['strength'] > weaker['strength']
 
 
 def test_low_liquidity_alt_noise_is_ignored():
@@ -105,6 +137,7 @@ def test_bias_is_soft_observable_and_preserves_both_sides():
         'breadth_ratio': 0.75,
         'weighted_breadth_ratio': 0.72,
         'median_change_pct': 1.2,
+        'directional_conviction': 0.7,
         'sample_size': 100,
     }
 
@@ -116,7 +149,9 @@ def test_bias_is_soft_observable_and_preserves_both_sides():
     assert long.market_direction_bias == short.market_direction_bias == 'LONG'
     assert long.market_weighted_breadth_ratio == 0.72
     assert long.market_median_change_pct == 1.2
+    assert long.market_directional_conviction == 0.7
     assert any('market_direction_bias=LONG' in reason for reason in short.reasons)
+    assert any('conviction=0.70' in reason for reason in short.reasons)
 
 
 def test_neutral_bias_does_not_change_score():
