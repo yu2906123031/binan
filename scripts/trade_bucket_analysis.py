@@ -16,6 +16,30 @@ DEFAULT_RUNTIME_STATE_DIR = DEFAULT_APP_HOME / 'runtime-state'
 DEFAULT_OUTPUT_JSON = DEFAULT_APP_HOME / 'trade-bucket-analysis.json'
 DEFAULT_OUTPUT_MARKDOWN = DEFAULT_APP_HOME / 'trade-bucket-analysis.md'
 
+PREDICTION_FIELDS = (
+    'realizable_reward_r',
+    'expected_reward_r',
+    'expected_edge',
+    'expected_total_fee_pct',
+    'execution_slippage_buffer_pct',
+    'min_profit_buffer_pct',
+    'expected_slippage_pct',
+    'expected_slippage_r',
+    'stop_distance_pct',
+    'trigger_confirmation_count',
+    'trigger_confirmation_flags',
+    'candidate_stage',
+    'setup_ready',
+    'trigger_fired',
+    'score',
+    'score_decile',
+    'state',
+    'alert_tier',
+    'trigger_class',
+    'market_regime_label',
+    'market_regime_multiplier',
+)
+
 
 def _to_float(value: Any) -> float:
     if value is None:
@@ -78,6 +102,72 @@ def load_events(events_path: Path, limit: int = 5000) -> List[Dict[str, Any]]:
     return rows[-max_rows:]
 
 
+def _side_key(value: Any) -> str:
+    side = str(value or '').strip().upper()
+    if side in {'BUY', 'LONG'}:
+        return 'LONG'
+    if side in {'SELL', 'SHORT'}:
+        return 'SHORT'
+    return side
+
+
+def _prediction_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {}
+    for field in PREDICTION_FIELDS:
+        value = row.get(field)
+        if value not in (None, '', [], {}):
+            snapshot[field] = value
+    flags = row.get('trigger_confirmation_flags')
+    if isinstance(flags, dict):
+        flow_count = flags.get('breakout_flow_confirmation_count')
+        if flow_count not in (None, ''):
+            snapshot['breakout_flow_confirmation_count'] = flow_count
+        min_volume = flags.get('breakout_min_volume_multiple')
+        if min_volume not in (None, ''):
+            snapshot['breakout_min_volume_multiple'] = min_volume
+    if 'breakout_flow_confirmation_count' not in snapshot:
+        flow_count = row.get('breakout_flow_confirmation_count')
+        if flow_count not in (None, ''):
+            snapshot['breakout_flow_confirmation_count'] = flow_count
+    return snapshot
+
+
+def enrich_closed_trade_events(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest_by_symbol: Dict[str, Dict[str, Any]] = {}
+    latest_by_symbol_side: Dict[tuple[str, str], Dict[str, Any]] = {}
+    enriched: List[Dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        event_type = str(row.get('event_type') or '')
+        symbol = _normalize_text(row.get('symbol'), default='').upper()
+        side = _side_key(row.get('position_side') or row.get('side'))
+        if event_type == 'candidate_selected' and symbol:
+            snapshot = _prediction_snapshot(row)
+            if snapshot:
+                snapshot['prediction_source_event'] = 'candidate_selected'
+                snapshot['prediction_recorded_at'] = row.get('recorded_at')
+                latest_by_symbol[symbol] = snapshot
+                if side:
+                    latest_by_symbol_side[(symbol, side)] = snapshot
+            continue
+        if event_type != 'trade_invalidated':
+            continue
+        snapshot = latest_by_symbol_side.get((symbol, side)) if symbol and side else None
+        if snapshot is None and symbol:
+            snapshot = latest_by_symbol.get(symbol)
+        if snapshot:
+            for key, value in snapshot.items():
+                if row.get(key) in (None, '', [], {}):
+                    row[key] = value
+            row['prediction_snapshot_backfilled'] = True
+        else:
+            row.setdefault('prediction_snapshot_backfilled', False)
+        enriched.append(row)
+    return enriched
+
+
 def filter_closed_trade_events(
     rows: Iterable[Dict[str, Any]],
     symbol: str = '',
@@ -90,9 +180,7 @@ def filter_closed_trade_events(
     if int(lookback_days or 0) > 0:
         min_time = effective_now - datetime.timedelta(days=int(lookback_days))
     filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict) or row.get('event_type') != 'trade_invalidated':
-            continue
+    for row in enrich_closed_trade_events(rows):
         row_symbol = _normalize_text(row.get('symbol'), default='').upper()
         if target_symbol and row_symbol != target_symbol:
             continue
@@ -121,20 +209,24 @@ def _optional_float(row: Dict[str, Any], *keys: str) -> Optional[float]:
 
 def _edge_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     samples: List[Dict[str, float]] = []
+    backfilled_samples = 0
     for row in closed_rows:
         predicted = _optional_float(row, 'realizable_reward_r', 'expected_reward_r')
         if predicted is None:
             expected_edge = _optional_float(row, 'expected_edge')
-            stop_pct = _optional_float(row, 'stop_distance_pct')
+            stop_pct = _optional_float(row, 'stop_distance_pct', 'initial_stop_distance_pct')
             if expected_edge is not None and stop_pct is not None and stop_pct > 0:
                 predicted = expected_edge / stop_pct
         if predicted is None or predicted <= 0:
             continue
+        if row.get('prediction_snapshot_backfilled'):
+            backfilled_samples += 1
         samples.append({'predicted': predicted, 'realized': _to_float(row.get('realized_r'))})
 
     if not samples:
         return {
             'sample_count': 0,
+            'backfilled_sample_count': 0,
             'avg_predicted_reward_r': None,
             'avg_realized_r': None,
             'calibration_ratio': None,
@@ -147,11 +239,39 @@ def _edge_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     errors = [item['realized'] - item['predicted'] for item in samples]
     return {
         'sample_count': count,
+        'backfilled_sample_count': backfilled_samples,
         'avg_predicted_reward_r': _round(predicted_sum / count, 4),
         'avg_realized_r': _round(realized_sum / count, 4),
         'calibration_ratio': _round(realized_sum / predicted_sum if predicted_sum else 0.0, 4),
         'mean_error_r': _round(sum(errors) / count, 4),
         'mean_absolute_error_r': _round(sum(abs(error) for error in errors) / count, 4),
+    }
+
+
+def _prediction_coverage(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(closed_rows)
+    with_prediction = 0
+    with_slippage = 0
+    with_flow = 0
+    backfilled = 0
+    for row in closed_rows:
+        if _optional_float(row, 'realizable_reward_r', 'expected_reward_r', 'expected_edge') is not None:
+            with_prediction += 1
+        if _optional_float(row, 'expected_slippage_pct', 'expected_slippage_r', 'execution_slippage_buffer_pct') is not None:
+            with_slippage += 1
+        if row.get('breakout_flow_confirmation_count') not in (None, '') or row.get('trigger_confirmation_count') not in (None, ''):
+            with_flow += 1
+        if row.get('prediction_snapshot_backfilled'):
+            backfilled += 1
+    return {
+        'closed_trade_count': total,
+        'with_edge_prediction': with_prediction,
+        'with_slippage_prediction': with_slippage,
+        'with_flow_confirmation': with_flow,
+        'backfilled_from_candidate_selected': backfilled,
+        'edge_prediction_coverage_pct': _round((with_prediction / total) * 100.0 if total else 0.0, 2),
+        'slippage_prediction_coverage_pct': _round((with_slippage / total) * 100.0 if total else 0.0, 2),
+        'flow_confirmation_coverage_pct': _round((with_flow / total) * 100.0 if total else 0.0, 2),
     }
 
 
@@ -233,6 +353,7 @@ def build_trade_bucket_analysis_payload(
             'avg_mae_r': _round(total_mae / total_closed if total_closed else 0.0, 4),
         },
         'edge_calibration': _edge_calibration(closed_rows),
+        'prediction_coverage': _prediction_coverage(closed_rows),
         'by_bucket': by_bucket,
         'by_exit_reason': _count_table(exit_reason_counter, 'exit_reason'),
         'by_symbol': _count_table(symbol_counter, 'symbol'),
@@ -245,6 +366,7 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
     lines = ['# Trade Bucket Analysis', '']
     summary = payload.get('summary', {})
     calibration = payload.get('edge_calibration', {})
+    coverage = payload.get('prediction_coverage', {})
     lines.extend([
         f"- symbol: {summary.get('symbol') or 'ALL'}",
         f"- lookback_days: {summary.get('lookback_days', 0)}",
@@ -254,11 +376,17 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
         f"- avg_expectancy_r: {summary.get('avg_expectancy_r', 0)}", '',
         '## Edge calibration', '',
         f"- sample_count: {calibration.get('sample_count', 0)}",
+        f"- backfilled_sample_count: {calibration.get('backfilled_sample_count', 0)}",
         f"- avg_predicted_reward_r: {calibration.get('avg_predicted_reward_r')}",
         f"- avg_realized_r: {calibration.get('avg_realized_r')}",
         f"- calibration_ratio: {calibration.get('calibration_ratio')}",
         f"- mean_error_r: {calibration.get('mean_error_r')}",
         f"- mean_absolute_error_r: {calibration.get('mean_absolute_error_r')}", '',
+        '## Prediction coverage', '',
+        f"- edge_prediction_coverage_pct: {coverage.get('edge_prediction_coverage_pct', 0)}",
+        f"- slippage_prediction_coverage_pct: {coverage.get('slippage_prediction_coverage_pct', 0)}",
+        f"- flow_confirmation_coverage_pct: {coverage.get('flow_confirmation_coverage_pct', 0)}",
+        f"- backfilled_from_candidate_selected: {coverage.get('backfilled_from_candidate_selected', 0)}", '',
     ])
 
     def append_table(title: str, rows: List[Dict[str, Any]], columns: List[str]) -> None:
