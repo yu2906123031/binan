@@ -33,7 +33,16 @@ def validate_runtime_state_layout(
         raise RuntimeError(f'canonical runtime-state path is not writable: {canonical_path}')
 
     legacy_path = Path(legacy_dir).expanduser()
-    if legacy_path.is_symlink():
+    try:
+        legacy_is_symlink = legacy_path.is_symlink()
+        legacy_exists = legacy_path.exists()
+    except PermissionError:
+        # A non-root process cannot inspect paths below /root.  That legacy
+        # location cannot be selected or used by the process, so it must not
+        # prevent the canonical per-user runtime directory from starting.
+        legacy_is_symlink = False
+        legacy_exists = False
+    if legacy_is_symlink:
         try:
             legacy_resolved = legacy_path.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -42,7 +51,7 @@ def validate_runtime_state_layout(
             raise RuntimeError(
                 f'legacy runtime-state symlink points to {legacy_resolved}, expected {canonical_path}'
             )
-    elif legacy_path.exists():
+    elif legacy_exists:
         raise RuntimeError(f'legacy runtime-state path is a real directory or file: {legacy_path}')
 
     configured_path = Path(configured_dir).expanduser()
