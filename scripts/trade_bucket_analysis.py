@@ -25,6 +25,7 @@ PREDICTION_FIELDS = (
     'min_profit_buffer_pct',
     'expected_slippage_pct',
     'expected_slippage_r',
+    'predicted_slippage_bps',
     'stop_distance_pct',
     'trigger_confirmation_count',
     'trigger_confirmation_flags',
@@ -38,6 +39,7 @@ PREDICTION_FIELDS = (
     'trigger_class',
     'market_regime_label',
     'market_regime_multiplier',
+    'shadow_entry_price',
 )
 
 
@@ -132,9 +134,37 @@ def _prediction_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     return snapshot
 
 
+def _with_entry_fill(snapshot: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = dict(snapshot)
+    entry_price = _optional_float(row, 'entry_price', 'avg_price')
+    if entry_price is not None and entry_price > 0:
+        enriched['entry_price_at_fill'] = entry_price
+    predicted_bps = _optional_float(enriched, 'predicted_slippage_bps')
+    if predicted_bps is None:
+        expected_slippage_pct = _optional_float(enriched, 'expected_slippage_pct')
+        if expected_slippage_pct is not None:
+            predicted_bps = expected_slippage_pct * 100.0
+    if predicted_bps is not None:
+        enriched['predicted_slippage_bps'] = _round(predicted_bps, 4)
+    actual_bps = _optional_float(row, 'actual_fill_slippage_bps')
+    if actual_bps is None and entry_price is not None and entry_price > 0:
+        shadow_entry_price = _optional_float(enriched, 'shadow_entry_price')
+        if shadow_entry_price is not None and shadow_entry_price > 0:
+            actual_bps = abs(entry_price - shadow_entry_price) / shadow_entry_price * 10000.0
+    if actual_bps is not None:
+        enriched['actual_fill_slippage_bps'] = _round(actual_bps, 4)
+    if predicted_bps is not None and actual_bps is not None:
+        enriched['slippage_error_bps'] = _round(actual_bps - predicted_bps, 4)
+    enriched['entry_fill_recorded_at'] = row.get('recorded_at')
+    enriched['prediction_source_event'] = 'entry_filled'
+    return enriched
+
+
 def enrich_closed_trade_events(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     latest_by_symbol: Dict[str, Dict[str, Any]] = {}
     latest_by_symbol_side: Dict[tuple[str, str], Dict[str, Any]] = {}
+    latest_entry_by_symbol: Dict[str, Dict[str, Any]] = {}
+    latest_entry_by_symbol_side: Dict[tuple[str, str], Dict[str, Any]] = {}
     enriched: List[Dict[str, Any]] = []
     for raw in rows:
         if not isinstance(raw, dict):
@@ -152,9 +182,22 @@ def enrich_closed_trade_events(rows: Iterable[Dict[str, Any]]) -> List[Dict[str,
                 if side:
                     latest_by_symbol_side[(symbol, side)] = snapshot
             continue
+        if event_type in {'entry_filled', 'buy_fill_confirmed'} and symbol:
+            snapshot = latest_by_symbol_side.get((symbol, side)) if side else None
+            if snapshot is None:
+                snapshot = latest_by_symbol.get(symbol, {})
+            entry_snapshot = _with_entry_fill(snapshot or {}, row)
+            latest_entry_by_symbol[symbol] = entry_snapshot
+            if side:
+                latest_entry_by_symbol_side[(symbol, side)] = entry_snapshot
+            continue
         if event_type != 'trade_invalidated':
             continue
-        snapshot = latest_by_symbol_side.get((symbol, side)) if symbol and side else None
+        snapshot = latest_entry_by_symbol_side.get((symbol, side)) if symbol and side else None
+        if snapshot is None and symbol:
+            snapshot = latest_entry_by_symbol.get(symbol)
+        if snapshot is None:
+            snapshot = latest_by_symbol_side.get((symbol, side)) if symbol and side else None
         if snapshot is None and symbol:
             snapshot = latest_by_symbol.get(symbol)
         if snapshot:
@@ -165,6 +208,10 @@ def enrich_closed_trade_events(rows: Iterable[Dict[str, Any]]) -> List[Dict[str,
         else:
             row.setdefault('prediction_snapshot_backfilled', False)
         enriched.append(row)
+        if symbol and side:
+            latest_entry_by_symbol_side.pop((symbol, side), None)
+        if symbol:
+            latest_entry_by_symbol.pop(symbol, None)
     return enriched
 
 
@@ -248,17 +295,58 @@ def _edge_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _slippage_calibration(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    samples: List[Dict[str, float]] = []
+    for row in closed_rows:
+        predicted = _optional_float(row, 'predicted_slippage_bps')
+        if predicted is None:
+            expected_slippage_pct = _optional_float(row, 'expected_slippage_pct')
+            if expected_slippage_pct is not None:
+                predicted = expected_slippage_pct * 100.0
+        actual = _optional_float(row, 'actual_fill_slippage_bps')
+        if predicted is None or actual is None:
+            continue
+        samples.append({'predicted': predicted, 'actual': actual})
+    if not samples:
+        return {
+            'sample_count': 0,
+            'avg_predicted_slippage_bps': None,
+            'avg_actual_slippage_bps': None,
+            'actual_to_predicted_ratio': None,
+            'mean_error_bps': None,
+            'mean_absolute_error_bps': None,
+            'underprediction_rate_pct': None,
+        }
+    count = len(samples)
+    predicted_sum = sum(item['predicted'] for item in samples)
+    actual_sum = sum(item['actual'] for item in samples)
+    errors = [item['actual'] - item['predicted'] for item in samples]
+    underpredicted = sum(1 for item in samples if item['actual'] > item['predicted'])
+    return {
+        'sample_count': count,
+        'avg_predicted_slippage_bps': _round(predicted_sum / count, 4),
+        'avg_actual_slippage_bps': _round(actual_sum / count, 4),
+        'actual_to_predicted_ratio': _round(actual_sum / predicted_sum, 4) if predicted_sum else None,
+        'mean_error_bps': _round(sum(errors) / count, 4),
+        'mean_absolute_error_bps': _round(sum(abs(error) for error in errors) / count, 4),
+        'underprediction_rate_pct': _round((underpredicted / count) * 100.0, 2),
+    }
+
+
 def _prediction_coverage(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(closed_rows)
     with_prediction = 0
     with_slippage = 0
+    with_actual_slippage = 0
     with_flow = 0
     backfilled = 0
     for row in closed_rows:
         if _optional_float(row, 'realizable_reward_r', 'expected_reward_r', 'expected_edge') is not None:
             with_prediction += 1
-        if _optional_float(row, 'expected_slippage_pct', 'expected_slippage_r', 'execution_slippage_buffer_pct') is not None:
+        if _optional_float(row, 'predicted_slippage_bps', 'expected_slippage_pct', 'expected_slippage_r', 'execution_slippage_buffer_pct') is not None:
             with_slippage += 1
+        if _optional_float(row, 'actual_fill_slippage_bps') is not None:
+            with_actual_slippage += 1
         if row.get('breakout_flow_confirmation_count') not in (None, '') or row.get('trigger_confirmation_count') not in (None, ''):
             with_flow += 1
         if row.get('prediction_snapshot_backfilled'):
@@ -267,10 +355,12 @@ def _prediction_coverage(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         'closed_trade_count': total,
         'with_edge_prediction': with_prediction,
         'with_slippage_prediction': with_slippage,
+        'with_actual_slippage': with_actual_slippage,
         'with_flow_confirmation': with_flow,
         'backfilled_from_candidate_selected': backfilled,
         'edge_prediction_coverage_pct': _round((with_prediction / total) * 100.0 if total else 0.0, 2),
         'slippage_prediction_coverage_pct': _round((with_slippage / total) * 100.0 if total else 0.0, 2),
+        'actual_slippage_coverage_pct': _round((with_actual_slippage / total) * 100.0 if total else 0.0, 2),
         'flow_confirmation_coverage_pct': _round((with_flow / total) * 100.0 if total else 0.0, 2),
     }
 
@@ -353,6 +443,7 @@ def build_trade_bucket_analysis_payload(
             'avg_mae_r': _round(total_mae / total_closed if total_closed else 0.0, 4),
         },
         'edge_calibration': _edge_calibration(closed_rows),
+        'slippage_calibration': _slippage_calibration(closed_rows),
         'prediction_coverage': _prediction_coverage(closed_rows),
         'by_bucket': by_bucket,
         'by_exit_reason': _count_table(exit_reason_counter, 'exit_reason'),
@@ -366,6 +457,7 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
     lines = ['# Trade Bucket Analysis', '']
     summary = payload.get('summary', {})
     calibration = payload.get('edge_calibration', {})
+    slippage = payload.get('slippage_calibration', {})
     coverage = payload.get('prediction_coverage', {})
     lines.extend([
         f"- symbol: {summary.get('symbol') or 'ALL'}",
@@ -382,9 +474,18 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
         f"- calibration_ratio: {calibration.get('calibration_ratio')}",
         f"- mean_error_r: {calibration.get('mean_error_r')}",
         f"- mean_absolute_error_r: {calibration.get('mean_absolute_error_r')}", '',
+        '## Slippage calibration', '',
+        f"- sample_count: {slippage.get('sample_count', 0)}",
+        f"- avg_predicted_slippage_bps: {slippage.get('avg_predicted_slippage_bps')}",
+        f"- avg_actual_slippage_bps: {slippage.get('avg_actual_slippage_bps')}",
+        f"- actual_to_predicted_ratio: {slippage.get('actual_to_predicted_ratio')}",
+        f"- mean_error_bps: {slippage.get('mean_error_bps')}",
+        f"- mean_absolute_error_bps: {slippage.get('mean_absolute_error_bps')}",
+        f"- underprediction_rate_pct: {slippage.get('underprediction_rate_pct')}", '',
         '## Prediction coverage', '',
         f"- edge_prediction_coverage_pct: {coverage.get('edge_prediction_coverage_pct', 0)}",
         f"- slippage_prediction_coverage_pct: {coverage.get('slippage_prediction_coverage_pct', 0)}",
+        f"- actual_slippage_coverage_pct: {coverage.get('actual_slippage_coverage_pct', 0)}",
         f"- flow_confirmation_coverage_pct: {coverage.get('flow_confirmation_coverage_pct', 0)}",
         f"- backfilled_from_candidate_selected: {coverage.get('backfilled_from_candidate_selected', 0)}", '',
     ])
