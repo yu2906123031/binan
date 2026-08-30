@@ -28,7 +28,11 @@ def evaluate_portfolio_risk_guards(
         candidate_side = normalize_position_side(
             getattr(candidate, 'position_side', None) or getattr(candidate, 'side', position_side_long)
         )
-    candidate_notional = abs(_to_float(getattr(candidate, 'notional', 0.0) or getattr(candidate, 'planned_notional', 0.0)))
+    candidate_notional = abs(_to_float(
+        getattr(candidate, 'notional', 0.0)
+        or getattr(candidate, 'planned_notional_usdt', 0.0)
+        or getattr(candidate, 'planned_notional', 0.0)
+    ))
     if candidate_notional <= 0:
         candidate_notional = abs(_to_float(getattr(candidate, 'entry_price', 0.0) or getattr(candidate, 'last_price', 0.0))) * abs(_to_float(getattr(candidate, 'quantity', 0.0)))
 
@@ -47,6 +51,18 @@ def evaluate_portfolio_risk_guards(
             reasons.append('max_net_exposure_reached')
         if max_gross_exposure_usdt > 0 and projected_gross >= max_gross_exposure_usdt:
             reasons.append('max_gross_exposure_reached')
+
+        flip_cooldown_seconds = max(int(opposite_side_flip_cooldown_minutes or 0), 0) * 60
+        if flip_cooldown_seconds > 0 and candidate_symbol:
+            last_closed_symbol = str(getattr(candidate, 'last_closed_symbol', candidate_symbol) or '').upper()
+            last_closed_side_raw = getattr(candidate, 'last_closed_position_side', None) or getattr(candidate, 'last_closed_side', None)
+            last_closed_at = _to_float(getattr(candidate, 'last_closed_at', 0.0) or getattr(candidate, 'last_opposite_side_closed_at', 0.0))
+            if last_closed_side_raw is not None and last_closed_at > 0 and last_closed_symbol == candidate_symbol:
+                last_closed_side = normalize_position_side(last_closed_side_raw)
+                now_ts = _to_float(getattr(candidate, 'risk_now_ts', 0.0)) or datetime.datetime.now(datetime.timezone.utc).timestamp()
+                if last_closed_side != candidate_side and 0 <= now_ts - last_closed_at < flip_cooldown_seconds:
+                    reasons.append('opposite_side_flip_cooldown_active')
+
     snapshot['candidate_symbol'] = candidate_symbol
     snapshot['candidate_side'] = candidate_side
     snapshot['candidate_notional_usdt'] = candidate_notional
@@ -117,13 +133,18 @@ def evaluate_risk_guards(
     candidate_side = _normalize_candidate_side(
         getattr(candidate, 'position_side', None) or getattr(candidate, 'side', None)
     ) if candidate is not None else 'LONG'
+    reduce_only_context = bool(kwargs.get('reduce_only') or kwargs.get('close_position') or kwargs.get('allow_reduce_only'))
     if normalized.get('halted'):
         reasons.append('strategy_halted')
     allowed_session_utc_hours = kwargs.get('allowed_session_utc_hours')
-    if allowed_session_utc_hours:
+    if allowed_session_utc_hours and not reduce_only_context:
         try:
-            allowed_hours = {int(hour) % 24 for hour in allowed_session_utc_hours}
+            raw_hours = list(allowed_session_utc_hours)
+            allowed_hours = {int(hour) for hour in raw_hours}
+            if any(hour < 0 or hour > 23 for hour in allowed_hours):
+                raise ValueError('UTC hour must be in range 0..23')
         except (TypeError, ValueError):
+            reasons.append('session_filter_config_invalid')
             allowed_hours = set()
         current_utc_hour = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).hour
         if allowed_hours and current_utc_hour not in allowed_hours:
@@ -135,8 +156,8 @@ def evaluate_risk_guards(
         reasons.append('max_consecutive_losses_reached')
 
     cooldown_until = None
-    reduce_only_context = bool(kwargs.get('reduce_only') or kwargs.get('close_position') or kwargs.get('allow_reduce_only'))
-    cooldown_minutes_after_loss = max(int(kwargs.get('after_symbol_loss_cooldown_minutes', 180) or 0), 0)
+    default_loss_cooldown = int(symbol_cooldown_minutes or 180)
+    cooldown_minutes_after_loss = max(int(kwargs.get('after_symbol_loss_cooldown_minutes', default_loss_cooldown) or 0), 0)
     cooldown_seconds_after_loss = cooldown_minutes_after_loss * 60
     if normalized_symbol:
         cooldown_until = normalized['symbol_cooldowns'].get(normalized_symbol)
@@ -189,7 +210,7 @@ def evaluate_risk_guards(
                     reasons.append('symbol_reentry_30m_limit_reached')
             max_cancel_replace = max(int(kwargs.get('max_limit_cancel_replace_per_symbol', 2) or 0), 0)
             cancel_replace_count = int(normalized['limit_cancel_replace_count_by_symbol'].get(normalized_symbol, 0) or 0)
-            if max_cancel_replace > 0 and cancel_replace_count > max_cancel_replace:
+            if max_cancel_replace > 0 and cancel_replace_count >= max_cancel_replace:
                 reasons.append('symbol_limit_cancel_replace_limit_reached')
         daily_symbol_trade_limit = max(int(kwargs.get('daily_symbol_trade_limit', 0) or 0), 0)
         if daily_symbol_trade_limit > 0:
@@ -222,11 +243,17 @@ def evaluate_risk_guards(
             deweighted_until = int(deweighted_payload.get('cooldown_until', 0) or 0)
         elif deweighted_payload:
             deweighted_until = int(deweighted_payload)
-        if normalized_symbol in {'NEARUSDT', 'PUMPBTCUSDT', 'ONDOUSDT', 'AGTUSDT'} and not deweighted_until:
-            rolling_loss_value = _to_float(normalized.get('rolling_symbol_loss_usdt', {}).get(normalized_symbol, 0.0))
-            if rolling_loss_value < 0 and cooldown_seconds_after_loss > 0:
-                deweighted_until = ts + cooldown_seconds_after_loss
-                normalized['loss_deweighted_symbols'][normalized_symbol] = {'cooldown_until': deweighted_until, 'score_penalty': score_threshold_penalty}
+        rolling_loss_value = _to_float(normalized.get('rolling_symbol_loss_usdt', {}).get(normalized_symbol, 0.0)) if normalized_symbol else 0.0
+        if rolling_loss_value >= 0 and normalized_symbol:
+            normalized['loss_deweighted_symbols'].pop(normalized_symbol, None)
+            deweighted_until = 0
+        elif rolling_loss_value < 0 and not deweighted_until and cooldown_seconds_after_loss > 0:
+            deweighted_until = ts + cooldown_seconds_after_loss
+            normalized['loss_deweighted_symbols'][normalized_symbol] = {
+                'cooldown_until': deweighted_until,
+                'score_penalty': score_threshold_penalty,
+                'rolling_loss_usdt': rolling_loss_value,
+            }
         if deweighted_until and ts >= deweighted_until:
             normalized['loss_deweighted_symbols'].pop(normalized_symbol, None)
             deweighted_until = 0
@@ -314,9 +341,7 @@ def evaluate_risk_guards(
         expected_edge = max(_to_float(getattr(candidate, 'expected_edge', 0.0)), 0.0)
         expected_total_fee_pct = max(_to_float(getattr(candidate, 'expected_total_fee_pct', 0.0)), 0.0)
         execution_slippage_buffer_pct = max(
-            _to_float(
-                getattr(candidate, 'execution_slippage_buffer_pct', getattr(candidate, 'expected_slippage_pct', 0.0)),
-            ),
+            _to_float(getattr(candidate, 'execution_slippage_buffer_pct', getattr(candidate, 'expected_slippage_pct', 0.0))),
             0.0,
         )
         min_profit_buffer_pct = max(_to_float(getattr(candidate, 'min_profit_buffer_pct', 0.0)), 0.0)
