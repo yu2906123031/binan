@@ -40,9 +40,9 @@ pretty = true
 # suppressing only the two inference-only error classes that cannot be expressed
 # precisely without a larger API/type refactor.
 [[tool.mypy.overrides]]
-module = "scripts.risk_engine"
+module = "risk_engine"
 disable_error_code = ["call-overload"]
 
 [[tool.mypy.overrides]]
-module = "scripts.execution_engine"
+module = "execution_engine"
 disable_error_code = ["assignment"]
