@@ -213,11 +213,12 @@ class BinanceRequestManager:
         self.metrics.enqueued_requests += 1
         self.metrics.queue_size = self.queue.qsize()
         try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=request.timeout)
-        except asyncio.TimeoutError as exc:
-            if not future.done():
-                future.cancel()
-            raise TimeoutError(f"Binance request timed out after {request.timeout:.3f}s: {request.method} {request.path}") from exc
+            done, _pending = await asyncio.wait({future}, timeout=request.timeout, return_when=asyncio.FIRST_COMPLETED)
+            if future not in done:
+                if not future.done():
+                    future.cancel()
+                raise TimeoutError(f"Binance request timed out after {request.timeout:.3f}s: {request.method} {request.path}")
+            return future.result()
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
