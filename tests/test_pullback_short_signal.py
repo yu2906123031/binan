@@ -55,17 +55,24 @@ def test_not_weak_coin_is_not_pullback_short():
 
 def test_no_rebound_is_not_pullback_short():
     mod = load_candidate_builder()
-    # 价格没有高于近期低点 0.5% 以上（仍在低点附近）
     assert detect(mod, last_price=0.991, breakout_level=0.99) is False
 
 
 def test_rebound_not_near_resistance_is_not_pullback_short():
     mod = load_candidate_builder()
-    # 距离 EMA 和 VWAP 都超过 tolerance
     assert detect(mod, distance_from_ema20_5m_pct=3.0, distance_from_vwap_15m_pct=4.0) is False
+
+
+def test_broken_resistance_is_not_treated_as_pullback_short():
+    mod = load_candidate_builder()
+    assert detect(mod, distance_from_ema20_5m_pct=-0.8, distance_from_vwap_15m_pct=-1.0) is False
+
+
+def test_small_resistance_overshoot_can_reject_and_remain_valid():
+    mod = load_candidate_builder()
+    assert detect(mod, distance_from_ema20_5m_pct=-0.20, distance_from_vwap_15m_pct=-2.0) is True
 
 
 def test_rebound_near_resistance_without_exhaustion_is_not_pullback_short():
     mod = load_candidate_builder()
-    # MACD 未转弱且未收阴（动能仍在）
     assert detect(mod, macd_hist=0.001, macd_prev_hist=-0.001, last_price=1.004, current_open=1.0) is False
