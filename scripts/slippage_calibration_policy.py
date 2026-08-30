@@ -64,19 +64,20 @@ def load_calibration_payload(
 ) -> Dict[str, Any]:
     events_path = _runtime_events_path(runtime_state_dir)
     current_monotonic = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    cached_payload = _POLICY_CACHE.get('payload')
+    cache_age = current_monotonic - _number(_POLICY_CACHE.get('loaded_at_monotonic'))
+    refresh_window = max(float(refresh_seconds or 0.0), 0.0)
+    if isinstance(cached_payload, dict) and cache_age >= 0 and cache_age < refresh_window:
+        return cached_payload
+
     try:
         mtime_ns = events_path.stat().st_mtime_ns
     except OSError:
         mtime_ns = None
-    cached_payload = _POLICY_CACHE.get('payload')
-    cache_age = current_monotonic - _number(_POLICY_CACHE.get('loaded_at_monotonic'))
-    if (
-        isinstance(cached_payload, dict)
-        and cache_age >= 0
-        and cache_age < max(float(refresh_seconds or 0.0), 0.0)
-        and _POLICY_CACHE.get('events_mtime_ns') == mtime_ns
-    ):
+    if isinstance(cached_payload, dict) and _POLICY_CACHE.get('events_mtime_ns') == mtime_ns:
+        _POLICY_CACHE['loaded_at_monotonic'] = current_monotonic
         return cached_payload
+
     if not events_path.exists():
         payload: Dict[str, Any] = {}
     else:
