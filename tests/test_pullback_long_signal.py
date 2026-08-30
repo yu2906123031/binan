@@ -25,7 +25,7 @@ def detect(mod, **overrides):
         higher_tf_allowed=True,
         macd_hist=0.001,
         macd_prev_hist=0.0,
-        distance_from_ema20_5m_pct=-0.5,
+        distance_from_ema20_5m_pct=-0.1,
         distance_from_vwap_15m_pct=-2.5,
         current_open=0.988,
     )
@@ -61,6 +61,16 @@ def test_no_meaningful_pullback_is_not_pullback_long():
 def test_pullback_not_near_support_is_not_pullback_long():
     mod = load_candidate_builder()
     assert detect(mod, distance_from_ema20_5m_pct=-3.0, distance_from_vwap_15m_pct=-4.0) is False
+
+
+def test_broken_support_is_not_treated_as_pullback_long():
+    mod = load_candidate_builder()
+    assert detect(mod, distance_from_ema20_5m_pct=-0.8, distance_from_vwap_15m_pct=-1.0) is False
+
+
+def test_small_support_undercut_can_reclaim_and_remain_valid():
+    mod = load_candidate_builder()
+    assert detect(mod, distance_from_ema20_5m_pct=-0.20, distance_from_vwap_15m_pct=-2.0) is True
 
 
 def test_pullback_near_support_without_reacceleration_is_not_pullback_long():
