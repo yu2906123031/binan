@@ -1,10 +1,12 @@
 import argparse
 import copy
 import dataclasses
+import datetime
 import importlib.util
 import json
 import pathlib
 import sys
+from unittest.mock import Mock
 
 import pytest
 
@@ -1773,7 +1775,176 @@ def test_append_candidate_rejected_event_uses_enum_reason_and_phase2_execution_f
     assert event['reject_reason'] == 'extended_chase_veto'
     assert event['reject_reason_label'] == 'price_extension_chase'
     assert event['expected_slippage_r'] == 0.155
+    assert event['shadow_entry_price'] == 100.0
+    assert event['planned_take_profit_price'] == 0.0
+    assert event['planned_stop_price'] == 0.0
+    assert event['planned_quantity'] == 0.0
+    assert event['planned_notional_usdt'] == 0.0
+    assert event['expected_gross_profit_usdt'] == 0.0
+    assert event['expected_net_profit_usdt'] == 0.0
+    assert event['expected_loss_usdt'] == 0.0
+    assert event['expected_rr'] == 0.0
     assert event['execution_liquidity_grade'] == 'C'
+
+
+def test_persist_economic_shadow_candidates_keeps_first_observation_and_only_triggered(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    eligible = {
+        'symbol': 'BTCUSDT', 'side': 'short', 'shadow_eligible': True,
+        'shadow_entry_price': 100.0, 'expected_net_profit_usdt': 0.2,
+        'reject_reason': 'fee_ratio_too_high',
+    }
+    ignored = {'symbol': 'ETHUSDT', 'side': 'long', 'shadow_eligible': False}
+
+    first = mod.persist_economic_shadow_candidates(
+        store, [eligible, ignored], observed_at='2026-08-04T00:00:00Z'
+    )
+    second = mod.persist_economic_shadow_candidates(
+        store,
+        [{**eligible, 'shadow_entry_price': 101.0}],
+        observed_at='2026-08-04T00:05:00Z',
+    )
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert second[0]['captured_at'] == '2026-08-04T00:00:00Z'
+    assert second[0]['shadow_entry_price'] == 100.0
+    assert second[0]['last_seen_at'] == '2026-08-04T00:05:00Z'
+    assert second[0]['status'] == 'pending'
+
+
+def test_persist_economic_shadow_candidates_never_evicts_pending_rows(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    pending = [
+        {'symbol': f'P{i}USDT', 'side': 'long', 'shadow_eligible': True, 'shadow_entry_price': 100.0}
+        for i in range(3)
+    ]
+    mod.persist_economic_shadow_candidates(store, pending, observed_at='2026-08-04T00:00:00Z', max_rows=3)
+    state = store.load_json('economic_shadow_candidates', {})
+    for row in state['rows']:
+        row['status'] = 'completed'
+    state['rows'][0]['status'] = 'pending'
+    store.save_json('economic_shadow_candidates', state)
+
+    rows = mod.persist_economic_shadow_candidates(
+        store,
+        [{'symbol': 'NEWUSDT', 'side': 'long', 'shadow_eligible': True, 'shadow_entry_price': 100.0}],
+        observed_at='2026-08-04T01:00:00Z',
+        max_rows=1,
+    )
+
+    assert {(row['symbol'], row['status']) for row in rows} == {
+        ('P0USDT', 'pending'), ('P2USDT', 'completed'), ('NEWUSDT', 'pending'),
+    }
+
+
+def _shadow_kline(minute, open_price, high, low, close):
+    opened = int(datetime.datetime(2026, 8, 4, 0, minute, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    return [opened, str(open_price), str(high), str(low), str(close), '1', opened + 59_999]
+
+
+def test_evaluate_economic_shadow_candidates_matures_horizons_and_models_long_pnl(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    mod.persist_economic_shadow_candidates(store, [{
+        'symbol': 'BTCUSDT', 'side': 'long', 'shadow_eligible': True,
+        'shadow_entry_price': 100.0, 'planned_take_profit_price': 110.0,
+        'planned_stop_price': 95.0, 'planned_quantity': 2.0,
+        'expected_total_fee_pct': 0.1, 'execution_slippage_buffer_pct': 0.2,
+    }], observed_at='2026-08-04T00:00:00Z')
+    klines = [_shadow_kline(i, 100, 100 + i / 2, 100 - i / 10, 100 + i / 5) for i in range(46)]
+    client = Mock()
+    client.get.return_value = klines
+
+    rows = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T00:46:00Z')
+
+    row = rows[0]
+    assert row['status'] == 'completed'
+    assert row['directional_return_pct_15m'] == 3.0
+    assert row['directional_return_pct_30m'] == 6.0
+    assert row['directional_return_pct_45m'] == 9.0
+    assert row['mfe_pct'] == 22.5
+    assert row['mae_pct'] == -4.5
+    assert row['exit_reason'] == 'take_profit'
+    assert row['exit_price'] == 110.0
+    assert row['modeled_gross_pnl_usdt'] == 20.0
+    assert row['modeled_net_pnl_usdt'] == 19.4
+    assert row['sizing_diagnostics'] == []
+    client.get.assert_called_once()
+    assert client.get.call_args.kwargs['purpose'] == 'market_data'
+    # Economic outcome percentages are round-trip PnL normalized to entry notional.
+    assert row['modeled_gross_pnl_pct'] == 10.0
+    assert row['modeled_net_pnl_pct'] == 9.7
+
+
+def test_economic_shadow_uses_first_closed_candle_after_non_minute_horizon(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    mod.persist_economic_shadow_candidates(store, [{
+        'symbol': 'BTCUSDT', 'side': 'long', 'shadow_eligible': True,
+        'shadow_entry_price': 100.0, 'planned_quantity': 1.0,
+    }], observed_at='2026-08-04T00:00:30Z')
+    client = Mock()
+    client.get.return_value = [_shadow_kline(i, 100, 101, 99, 100 + i) for i in range(47)]
+
+    pending = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T00:15:45Z')[0]
+    assert 'directional_return_pct_15m' not in pending
+    mature = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T00:16:00Z')[0]
+    assert mature['directional_return_pct_15m'] == 15.0
+    assert client.get.call_args.kwargs['params']['startTime'] == int(
+        datetime.datetime(2026, 8, 4, 0, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000
+    )
+
+
+def test_economic_shadow_respects_scanner_rest_fallback_and_circuit_guards(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    mod.persist_economic_shadow_candidates(store, [{
+        'symbol': 'BTCUSDT', 'side': 'long', 'shadow_eligible': True, 'shadow_entry_price': 100.0,
+    }], observed_at='2026-08-04T00:00:00Z')
+    client = Mock()
+    args = argparse.Namespace(scanner_rest_fallback=False)
+
+    rows = mod.evaluate_economic_shadow_candidates(store, client, args=args, evaluated_at='2026-08-04T00:46:00Z')
+    assert rows[0]['evaluation_deferred_reason'] == 'scanner_rest_fallback_disabled'
+    client.get.assert_not_called()
+
+    args.scanner_rest_fallback = True
+    store.save_json('binance_rest_guard', {'rest_circuit_state': 'OPEN', 'rest_used_weight_1m': 0})
+    rows = mod.evaluate_economic_shadow_candidates(store, client, args=args, evaluated_at='2026-08-04T00:46:00Z')
+    assert rows[0]['evaluation_deferred_reason'] == 'rest_circuit_state_open'
+    client.get.assert_not_called()
+
+    store.save_json('binance_rest_guard', {'rest_circuit_state': 'CLOSED', 'rest_used_weight_1m': 700})
+    rows = mod.evaluate_economic_shadow_candidates(store, client, args=args, evaluated_at='2026-08-04T00:46:00Z')
+    assert rows[0]['evaluation_deferred_reason'] == 'rest_used_weight_1m_exceeds_limit'
+    client.get.assert_not_called()
+
+
+def test_evaluate_economic_shadow_candidates_pending_idempotent_and_ambiguous_stop_first(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path / 'runtime'))
+    base = {
+        'symbol': 'ETHUSDT', 'side': 'short', 'shadow_eligible': True,
+        'shadow_entry_price': 100.0, 'planned_take_profit_price': 95.0,
+        'planned_stop_price': 105.0,
+    }
+    mod.persist_economic_shadow_candidates(store, [base], observed_at='2026-08-04T00:00:00Z')
+    client = Mock()
+    client.get.return_value = [_shadow_kline(i, 100, 106 if i == 10 else 101, 94 if i == 10 else 99, 100) for i in range(46)]
+
+    pending = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T00:20:00Z')[0]
+    assert pending['status'] == 'pending'
+    assert pending['directional_return_pct_15m'] == 0.0
+    assert 'planned_quantity' in pending['sizing_diagnostics']
+    completed = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T00:46:00Z')[0]
+    assert completed['status'] == 'completed'
+    assert completed['exit_reason'] == 'ambiguous_stop_first'
+    assert completed['exit_price'] == 105.0
+    calls = client.get.call_count
+    again = mod.evaluate_economic_shadow_candidates(store, client, evaluated_at='2026-08-04T01:00:00Z')[0]
+    assert again == completed
+    assert client.get.call_count == calls
+
+    rows = mod.persist_economic_shadow_candidates(store, [base], observed_at='2026-08-04T01:01:00Z')
+    assert len(rows) == 2
+    assert rows[-1]['status'] == 'pending'
 
 
 def test_summarize_candidate_rejected_events_aggregates_reason_grade_and_overextension_metrics(tmp_path):
@@ -2807,8 +2978,23 @@ def test_run_scan_once_reports_funnel_and_rejected_breakdown(monkeypatch, tmp_pa
             'expected_total_fee_pct': 0.12,
             'execution_slippage_buffer_pct': 0.03,
             'min_profit_buffer_pct': 0.02,
+            'shadow_eligible': True,
+            'shadow_entry_price': 100.0,
+            'planned_take_profit_price': 0.0,
+            'planned_stop_price': 0.0,
+            'planned_quantity': 0.0,
+            'planned_notional_usdt': 0.0,
+            'expected_gross_profit_usdt': 0.0,
+            'expected_net_profit_usdt': 0.0,
+            'expected_loss_usdt': 0.0,
+            'expected_rr': 0.0,
         }
     ]
+    assert payload['economic_shadow_candidate_count'] == 1
+    shadow_state = mod.RuntimeStateStore(str(tmp_path)).load_json('economic_shadow_candidates', {})
+    assert len(shadow_state['rows']) == 1
+    assert shadow_state['rows'][0]['symbol'] == 'TESTUSDT'
+    assert shadow_state['rows'][0]['status'] == 'pending'
 
 
 def test_run_scan_once_reports_diagnostic_trading_mode_in_summary(monkeypatch, tmp_path):
@@ -5006,3 +5192,30 @@ def test_trigger_relax_keeps_btc_risk_off_long_blocked():
     args = argparse.Namespace(trigger_relax_mode=True, trigger_relax_min_score=70.0, trigger_relax_min_points=3)
 
     assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'risk_off'}) is False
+
+
+def test_trigger_relax_accepts_near_breakout_with_only_soft_setup_misses():
+    candidate = mod.Candidate(
+        symbol='TESTUSDT', last_price=1.0, price_change_pct_24h=8.0, quote_volume_24h=2_000_000.0,
+        hot_rank=1, gainer_rank=1, funding_rate=0.0, funding_rate_avg=0.0,
+        recent_5m_change_pct=0.9, acceleration_ratio_5m_vs_15m=1.1, breakout_level=1.002,
+        recent_swing_low=0.97, stop_price=0.98, quantity=100.0, risk_per_unit=0.02,
+        recommended_leverage=10, rsi_5m=66.0, volume_multiple=1.8,
+        distance_from_ema20_5m_pct=0.4, distance_from_vwap_15m_pct=0.3,
+        higher_tf_summary='aligned', score=76.0, reasons=['watch_candidate'], state='launch',
+        liquidity_grade='B', expected_slippage_pct=0.08, book_depth_fill_ratio=0.9,
+        setup_ready=False, setup_missing=['waiting_breakout', 'breakout_close_not_confirmed'],
+        trigger_fired=False, candidate_stage='watch_candidate',
+        trigger_missing=['waiting_breakout', 'oi_taker_not_confirmed'],
+        trigger_confirmation_flags={'breakout_close_confirmed': False, 'oi_taker_alignment_confirmed': False},
+        entry_distance_from_breakout_pct=-0.30, oi_change_pct_5m=0.1, cvd_delta=12.0, taker_buy_ratio=0.53,
+    )
+    args = argparse.Namespace(trigger_relax_mode=True, trigger_relax_min_score=70.0, trigger_relax_min_points=3)
+
+    assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'neutral'}) is True
+
+    candidate.entry_distance_from_breakout_pct = -0.36
+    assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'neutral'}) is False
+    candidate.entry_distance_from_breakout_pct = -0.30
+    candidate.setup_missing.append('retest_not_confirmed')
+    assert mod.is_trigger_relax_eligible(candidate, args, {'label': 'neutral'}) is False

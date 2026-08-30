@@ -234,6 +234,8 @@ def test_parse_args_defaults_cover_run_loop_dependencies():
     assert args.target_notional_usdt == 80.0
     assert args.min_notional_usdt == 60.0
     assert args.max_notional_usdt == 90.0
+    assert args.watch_breakout_tolerance_pct == 3.0
+    assert args.setup_breakout_tolerance_pct == 3.0
     assert args.notify_target == ''
     assert args.disable_notify is False
     assert args.telegram_bot_token_env == 'TELEGRAM_BOT_TOKEN'

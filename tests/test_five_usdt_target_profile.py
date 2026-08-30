@@ -60,6 +60,28 @@ def make_candidate(mod, symbol='1000BONKUSDT', **kwargs):
     return mod.Candidate(**base)
 
 
+def test_five_usdt_profile_enables_positive_target_profit_planning():
+    mod = load_strategy()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'five-usdt-scalp-v2']))
+    assert args.target_net_profit_usdt >= args.min_target_net_profit_usdt
+    assert abs(args.target_net_profit_usdt - 1.2) < 1e-9
+
+
+def test_five_usdt_profile_uses_account_sized_profit_targets():
+    mod = load_strategy()
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'five-usdt-scalp-v2']))
+    assert abs(args.target_net_profit_usdt - 1.2) < 1e-9
+    assert abs(args.min_target_net_profit_usdt - 0.6) < 1e-9
+    assert args.max_notional_usdt == 90.0
+    assert args.risk_usdt == 1.5
+    assert mod.FIVE_USDT_TIER_RULES['A']['min_profit'] == 0.2
+    assert mod.FIVE_USDT_TIER_RULES['B']['min_profit'] == 0.3
+    assert mod.FIVE_USDT_TIER_RULES['C']['min_profit'] == 0.5
+    assert mod.FIVE_USDT_TIER_RULES['A']['min_rr'] == 0.8
+    assert mod.FIVE_USDT_TIER_RULES['B']['min_rr'] == 0.9
+    assert mod.FIVE_USDT_TIER_RULES['C']['min_rr'] == 1.0
+
+
 def test_long_target_5u_quantity_reverse_sizing():
     mod = load_strategy()
     plan = mod.plan_five_usdt_target_trade('LONG', 100.0, 105.0, 99.2, target_net_profit_usdt=5.0)
@@ -73,6 +95,24 @@ def test_short_target_5u_quantity_reverse_sizing():
     plan = mod.plan_five_usdt_target_trade('SHORT', 100.0, 95.0, 100.8, target_net_profit_usdt=5.0)
     assert plan['planned_quantity'] > 1.0
     assert abs(plan['expected_net_profit_usdt'] - 5.0) < 0.08
+    assert plan['target_profit_reject_reason'] == ''
+
+
+def test_target_trade_allows_step_rounding_within_half_percent_of_min_notional():
+    mod = load_strategy()
+    plan = mod.plan_five_usdt_target_trade(
+        'LONG', 9.99, 10.49, 9.79,
+        target_net_profit_usdt=0.2,
+        min_target_net_profit_usdt=0.0,
+        min_expected_rr=0.0,
+        min_notional_usdt=30.0,
+        max_notional_usdt=90.0,
+        max_loss_usdt=1.5,
+        taker_fee_rate=0.0,
+        slippage_buffer_pct=0.0,
+        step_size=0.01,
+    )
+    assert 29.85 <= plan['planned_notional_usdt'] < 30.0
     assert plan['target_profit_reject_reason'] == ''
 
 
@@ -143,12 +183,14 @@ class DummyStore:
 
 def test_five_usdt_profile_classifies_symbol_quality_tiers():
     mod = load_strategy()
-    assert mod.classify_five_usdt_symbol_quality_tier('BTCUSDT')['symbol_quality_tier'] == 'A'
-    assert mod.classify_five_usdt_symbol_quality_tier('NEARUSDT')['symbol_quality_tier'] == 'B'
+    assert mod.classify_five_usdt_symbol_quality_tier('XRPUSDT')['symbol_quality_tier'] == 'A'
+    assert mod.classify_five_usdt_symbol_quality_tier('BTCUSDT')['symbol_quality_tier'] == 'C'
+    assert mod.classify_five_usdt_symbol_quality_tier('SEIUSDT')['symbol_quality_tier'] == 'B'
+    assert mod.classify_five_usdt_symbol_quality_tier('NEARUSDT')['symbol_quality_tier'] == 'C'
     tier_c = mod.classify_five_usdt_symbol_quality_tier('1000BONKUSDT')
     assert tier_c['symbol_quality_tier'] == 'C'
-    assert tier_c['symbol_tier_min_expected_net_profit_usdt'] == 5.8
-    assert tier_c['symbol_tier_min_rr'] == 2.5
+    assert tier_c['symbol_tier_min_expected_net_profit_usdt'] == 0.5
+    assert tier_c['symbol_tier_min_rr'] == 1.0
     underperformer = mod.classify_five_usdt_symbol_quality_tier('NOTUSDT')
     assert underperformer['symbol_quality_tier'] == 'C'
     assert underperformer['symbol_quality_reason'] == 'recent_30d_underperformer_deweighted'
@@ -192,29 +234,66 @@ def test_five_usdt_symbol_loss_cooldown_map_blocks_recent_profit_factor_below_po
 
 def test_five_usdt_candidate_selection_filter_applies_tier_thresholds_and_fields():
     mod = load_strategy()
-    candidate = make_candidate(mod, expected_net_profit_usdt=4.8, oi_change_pct_5m=1.0, cvd_delta=1.0)
+    candidate = make_candidate(mod, expected_net_profit_usdt=0.4, expected_rr=99.0, oi_change_pct_5m=1.0, cvd_delta=1.0)
     reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
     assert reason == 'symbol_tier_expected_profit_too_low'
     assert candidate.symbol_quality_tier == 'C'
-    assert candidate.symbol_tier_min_expected_net_profit_usdt == 5.8
+    assert candidate.symbol_tier_min_expected_net_profit_usdt == 0.5
 
 
-def test_five_usdt_candidate_selection_filter_blocks_recent_underperformers():
+def test_five_usdt_symbol_quality_tier_profit_thresholds_are_relaxed():
+    mod = load_strategy()
+    assert mod.classify_five_usdt_symbol_quality_tier('XRPUSDT')['symbol_tier_min_expected_net_profit_usdt'] == 0.2
+    assert mod.classify_five_usdt_symbol_quality_tier('ONDOUSDT')['symbol_tier_min_expected_net_profit_usdt'] == 0.3
+    assert mod.classify_five_usdt_symbol_quality_tier('SNDKUSDT')['symbol_tier_min_expected_net_profit_usdt'] == 0.5
+
+
+def test_profile_candidate_selection_filter_wires_five_usdt_rules_into_scan():
     mod = load_strategy()
     candidate = make_candidate(
         mod,
-        symbol='NOTUSDT',
+        symbol='HYPEUSDT',
         expected_net_profit_usdt=99.0,
         expected_rr=99.0,
         expected_loss_usdt=0.1,
         oi_change_pct_5m=1.0,
         cvd_delta=1.0,
     )
+    args = mod.apply_runtime_profile(mod.parse_args(['--profile', 'five-usdt-scalp-v2']))
 
-    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+    reason = mod.apply_profile_candidate_selection_filter(candidate, args, None, {})
 
     assert reason == 'recent_30d_underperformer_blacklist'
-    assert 'recent_30d_underperformer_deweighted' in candidate.reasons
+    assert candidate.symbol_quality_tier == 'C'
+
+
+def test_profile_candidate_selection_filter_leaves_other_profiles_unchanged():
+    mod = load_strategy()
+    candidate = make_candidate(mod, symbol='HYPEUSDT')
+
+    reason = mod.apply_profile_candidate_selection_filter(candidate, mod.parse_args(['--profile', 'default']), None, {})
+
+    assert reason is None
+    assert candidate.symbol_quality_tier == ''
+
+
+def test_five_usdt_candidate_selection_filter_blocks_recent_underperformers():
+    mod = load_strategy()
+    for symbol in ['NOTUSDT', 'VICUSDT', 'HYPEUSDT', 'COSUSDT', 'NEARUSDT', 'WLDUSDT', 'BNBUSDT', 'BTWUSDT', 'LITUSDT', 'BTCUSDT']:
+        candidate = make_candidate(
+            mod,
+            symbol=symbol,
+            expected_net_profit_usdt=99.0,
+            expected_rr=99.0,
+            expected_loss_usdt=0.1,
+            oi_change_pct_5m=1.0,
+            cvd_delta=1.0,
+        )
+
+        reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+        assert reason == 'recent_30d_underperformer_blacklist'
+        assert 'recent_30d_underperformer_deweighted' in candidate.reasons
 
 
 def test_five_usdt_candidate_selection_filter_rejects_c_tier_without_orderflow_confirmation():
@@ -222,6 +301,98 @@ def test_five_usdt_candidate_selection_filter_rejects_c_tier_without_orderflow_c
     candidate = make_candidate(mod, expected_net_profit_usdt=6.2, expected_rr=2.8, expected_loss_usdt=1.0)
     reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
     assert reason == 'c_tier_missing_orderflow_confirmation'
+
+
+def test_five_usdt_candidate_selection_filter_accepts_relaxed_c_tier_volume_spike():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        expected_net_profit_usdt=1.2,
+        expected_rr=1.2,
+        expected_loss_usdt=1.0,
+        volume_multiple=1.0,
+        oi_change_pct_5m=1.0,
+        cvd_delta=1.0,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason is None
+
+
+def test_five_usdt_candidate_selection_filter_keeps_c_tier_volume_floor():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        expected_net_profit_usdt=1.2,
+        expected_rr=1.2,
+        expected_loss_usdt=1.0,
+        volume_multiple=0.99,
+        volume_zscore_5m=0.49,
+        oi_change_pct_5m=1.0,
+        cvd_delta=1.0,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason == 'c_tier_missing_volume_spike'
+
+
+def test_five_usdt_candidate_selection_filter_accepts_high_conviction_c_tier_without_volume_spike():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        score=120.0,
+        expected_net_profit_usdt=1.2,
+        expected_rr=1.2,
+        expected_loss_usdt=1.0,
+        volume_multiple=0.7,
+        volume_zscore_5m=0.1,
+        oi_change_pct_5m=1.0,
+        cvd_delta=1.0,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason is None
+
+
+def test_five_usdt_candidate_selection_filter_keeps_score_119_c_tier_volume_floor():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        score=119.0,
+        expected_net_profit_usdt=1.2,
+        expected_rr=1.2,
+        expected_loss_usdt=1.0,
+        volume_multiple=0.7,
+        volume_zscore_5m=0.1,
+        oi_change_pct_5m=1.0,
+        cvd_delta=1.0,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason == 'c_tier_missing_volume_spike'
+
+
+def test_five_usdt_candidate_selection_filter_accepts_high_conviction_c_tier_with_one_orderflow_confirmation():
+    mod = load_strategy()
+    candidate = make_candidate(
+        mod,
+        score=120.0,
+        expected_net_profit_usdt=1.2,
+        expected_rr=1.2,
+        expected_loss_usdt=1.0,
+        volume_multiple=1.0,
+        oi_change_pct_5m=1.0,
+        cvd_delta=0.0,
+        taker_buy_ratio=0.5,
+    )
+
+    reason = mod.apply_five_usdt_candidate_selection_filter(candidate, mod.parse_args([]), None, {})
+
+    assert reason is None
 
 
 def test_five_usdt_profile_defaults_candidate_source_caps_and_symbol_quality():
@@ -316,6 +487,9 @@ def test_micro_scalp_profile_defaults_are_safe_and_small():
     assert args.micro_scalp_min_profit_r == 0.0
     assert args.execution_preflight_enabled is True
     assert args.repair_missing_protection is True
+    assert args.max_distance_from_ema_pct == 1.8
+    assert args.max_distance_from_vwap_pct == 1.8
+    assert args.trigger_relax_mode is True
 
 
 def test_micro_scalp_score_breakdown_thresholds_and_breakout_soft_score():

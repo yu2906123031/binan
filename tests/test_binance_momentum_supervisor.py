@@ -168,31 +168,88 @@ def test_main_blocks_when_runtime_state_cannot_recover_account_position(monkeypa
 def test_build_command_uses_live_entry_relaxation_thresholds(monkeypatch, isolated_supervisor_files):
     cmd = supervisor.build_command()
 
-    assert cmd[cmd.index('--trigger-relax-min-score') + 1] == '72'
+    assert cmd[cmd.index('--trigger-relax-min-score') + 1] == '78'
     assert cmd[cmd.index('--trigger-relax-min-points') + 1] == '3'
     assert cmd[cmd.index('--execution-slippage-hard-veto-r') + 1] == '450'
     assert cmd[cmd.index('--execution-slippage-risk-threshold-r') + 1] == '450'
+
+
+def test_build_command_forwards_bounded_post_only_taker_fallback(monkeypatch, isolated_supervisor_files):
+    config_path = isolated_supervisor_files.parent / 'runtime-config.json'
+    config_path.write_text(json.dumps({
+        'allow_post_only_taker_fallback': True,
+        'maker_post_only_fallback_min_score': 92,
+        'maker_post_only_fallback_min_liquidity_grade': 'A',
+        'maker_post_only_fallback_max_spread_bps': 6,
+    }), encoding='utf-8')
+    monkeypatch.setattr(supervisor, 'RUNTIME_CONFIG_FILE', config_path)
+
+    cmd = supervisor.build_command()
+
+    assert '--allow-post-only-taker-fallback' in cmd
+    assert cmd[cmd.index('--maker-post-only-fallback-min-score') + 1] == '92'
+    assert cmd[cmd.index('--maker-post-only-fallback-min-liquidity-grade') + 1] == 'A'
+    assert cmd[cmd.index('--maker-post-only-fallback-max-spread-bps') + 1] == '6'
 
 
 def test_build_command_uses_current_five_usdt_runtime_defaults(monkeypatch, isolated_supervisor_files):
     cmd = supervisor.build_command()
 
     assert cmd[cmd.index('--profile') + 1] == 'five-usdt-scalp-v2'
-    assert cmd[cmd.index('--target-notional-usdt') + 1] == '110.0'
-    assert cmd[cmd.index('--min-notional-usdt') + 1] == '100.0'
-    assert cmd[cmd.index('--max-notional-usdt') + 1] == '120.0'
-    assert cmd[cmd.index('--tp1-profit-usdt') + 1] == '6.0'
-    assert cmd[cmd.index('--tp2-profit-usdt') + 1] == '0.0'
-    assert cmd[cmd.index('--tp1-close-pct') + 1] == '1.0'
-    assert cmd[cmd.index('--tp2-close-pct') + 1] == '0.0'
+    assert cmd[cmd.index('--target-notional-usdt') + 1] == '80.0'
+    assert cmd[cmd.index('--min-notional-usdt') + 1] == '60.0'
+    assert cmd[cmd.index('--max-notional-usdt') + 1] == '90.0'
+    assert cmd[cmd.index('--tp1-profit-usdt') + 1] == '1.5'
+    assert cmd[cmd.index('--tp2-profit-usdt') + 1] == '3.0'
+    assert cmd[cmd.index('--tp1-close-pct') + 1] == '0.4'
+    assert cmd[cmd.index('--tp2-close-pct') + 1] == '0.4'
     assert cmd[cmd.index('--max-open-positions') + 1] == '3'
-    assert cmd[cmd.index('--min-target-net-profit-usdt') + 1] == '4.0'
-    assert cmd[cmd.index('--max-loss-usdt') + 1] == '1.8'
-    assert cmd[cmd.index('--min-expected-rr') + 1] == '2.0'
-    assert cmd[cmd.index('--trigger-min-confirmations') + 1] == '3'
-    assert cmd[cmd.index('--micro-scalp-time-stop-sec') + 1] == '2700'
+    assert cmd[cmd.index('--max-long-positions') + 1] == '3'
+    assert cmd[cmd.index('--max-short-positions') + 1] == '3'
+    assert cmd[cmd.index('--min-target-net-profit-usdt') + 1] == '0.1'
+    assert cmd[cmd.index('--max-loss-usdt') + 1] == '1.5'
+    assert cmd[cmd.index('--min-expected-rr') + 1] == '0.7'
+    assert cmd[cmd.index('--trigger-min-confirmations') + 1] == '1'
+    assert cmd[cmd.index('--micro-scalp-time-stop-sec') + 1] == '1800'
+    assert cmd[cmd.index('--daily-max-loss-usdt') + 1] == '4.0'
+    assert cmd[cmd.index('--max-consecutive-losses') + 1] == '2'
+    assert cmd[cmd.index('--consecutive-loss-pause-minutes') + 1] == '180'
     assert cmd[cmd.index('--leverage') + 1] == '10'
     assert cmd[cmd.index('--margin-type') + 1] == 'ISOLATED'
+
+
+def test_build_command_allows_runtime_risk_and_exit_overrides(monkeypatch, isolated_supervisor_files):
+    cmd = supervisor.build_command({
+        'risk_usdt': 1.2,
+        'target_notional_usdt': 75.0,
+        'min_notional_usdt': 55.0,
+        'max_notional_usdt': 85.0,
+        'tp1_profit_usdt': 1.2,
+        'tp2_profit_usdt': 2.8,
+        'tp1_close_pct': 0.5,
+        'tp2_close_pct': 0.3,
+        'leverage': 8,
+        'margin_type': 'ISOLATED',
+        'trigger_relax_min_score': 78,
+        'trigger_relax_min_points': 3,
+    })
+
+    expected = {
+        '--risk-usdt': '1.2',
+        '--target-notional-usdt': '75.0',
+        '--min-notional-usdt': '55.0',
+        '--max-notional-usdt': '85.0',
+        '--tp1-profit-usdt': '1.2',
+        '--tp2-profit-usdt': '2.8',
+        '--tp1-close-pct': '0.5',
+        '--tp2-close-pct': '0.3',
+        '--leverage': '8',
+        '--margin-type': 'ISOLATED',
+        '--trigger-relax-min-score': '78',
+        '--trigger-relax-min-points': '3',
+    }
+    for flag, value in expected.items():
+        assert cmd[cmd.index(flag) + 1] == value
 
 
 def test_build_command_gives_live_execution_enough_deadman_budget(monkeypatch, isolated_supervisor_files):

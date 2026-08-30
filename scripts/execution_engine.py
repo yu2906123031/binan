@@ -131,6 +131,26 @@ def resolve_position_protection_status(
         }
     matched_trigger_price = _to_float(matched.get('triggerPrice')) if isinstance(matched, dict) else None
     matched_quantity = abs(_to_float(matched.get('quantity') or matched.get('origQty'))) if isinstance(matched, dict) else None
+    active_quantity = abs(_to_float(active.get('positionAmt'))) if isinstance(active, dict) else 0.0
+    quantity_tolerance = max(active_quantity * 1e-9, 1e-12)
+    if (
+        matched_quantity is not None
+        and active_quantity > 0
+        and abs(matched_quantity - active_quantity) > quantity_tolerance
+        and not (matched.get('closePosition') is True or str(matched.get('closePosition') or '').lower() == 'true')
+    ):
+        return {
+            'status': 'quantity_mismatch',
+            'active_position': active,
+            'expected_order_id': expected_order_id,
+            'expected_client_algo_id': expected_client_algo_id,
+            'stop_order': matched,
+            'matched_via': matched_via,
+            'matched_trigger_price': matched_trigger_price,
+            'matched_quantity': matched_quantity,
+            'active_quantity': active_quantity,
+            'side': position_side,
+        }
     return {
         'status': 'protected',
         'active_position': active,

@@ -35,6 +35,7 @@ _REAL_TIME_TIME = time.time
 from execution_engine import cancel_stale_protection_orders_after_flat as execution_cancel_stale_protection_orders_after_flat, ensure_symbol_margin_type as execution_ensure_symbol_margin_type, monitor_live_trade as execution_monitor_live_trade, place_initial_stop_with_retries as execution_place_initial_stop_with_retries, place_live_trade as execution_place_live_trade, repair_missing_protection as execution_repair_missing_protection, resolve_position_protection_status as execution_resolve_position_protection_status, start_trade_monitor_thread as execution_start_trade_monitor_thread
 import candidate_builder as candidate_builder_mod  # noqa: F401 - re-exported for regression tests and helper compatibility
 from candidate_builder import build_candidate as build_candidate_impl
+from market_direction_bias import apply_market_direction_bias, compute_market_direction_bias
 from risk_engine import evaluate_portfolio_risk_guards as evaluate_portfolio_risk_guards_impl, evaluate_risk_guards as evaluate_risk_guards_impl
 from risk_state_helpers import normalize_loaded_risk_state as normalize_loaded_risk_state_impl, refresh_risk_state_heat_snapshot as refresh_risk_state_heat_snapshot_impl
 from runtime_state_risk_helpers import build_local_open_positions_from_state as build_local_open_positions_from_state_impl, load_local_open_positions_for_risk as load_local_open_positions_for_risk_impl, load_runtime_risk_state as load_runtime_risk_state_impl
@@ -1667,8 +1668,29 @@ async def await_component_with_timeout(awaitable: Any, timeout_seconds: float, *
         return {'ok': False, 'reason': 'deadman_timeout', 'component': component, 'operation': operation, 'timeout_seconds': float(timeout_seconds or 0.0)}
 
 
+def _prepare_deadman_child_runtime(args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Reset thread-owned state inherited by a forked deadman worker."""
+    global _BOOK_TICKER_WS_SUPERVISOR_LOCK
+    global _EVENT_RATE_LIMIT_STATE_LOCK
+    global _BOOK_TICKER_CACHE_LOCK
+    global _BINANCE_REST_GUARD_LOCK
+
+    _BOOK_TICKER_WS_SUPERVISOR_LOCK = threading.Lock()
+    _EVENT_RATE_LIMIT_STATE_LOCK = threading.Lock()
+    _BOOK_TICKER_CACHE_LOCK = threading.Lock()
+    _BINANCE_REST_GUARD_LOCK = threading.Lock()
+    for value in args:
+        if isinstance(value, BinanceFuturesClient):
+            session = requests.Session()
+            if value.api_key:
+                session.headers.setdefault('X-MBX-APIKEY', value.api_key)
+            value.session = session
+    return args
+
+
 def _deadman_process_target(result_queue: Any, result_path: str, fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
     try:
+        args = _prepare_deadman_child_runtime(args)
         payload = ('result', fn(*args, **kwargs))
     except BaseException as exc:  # pragma: no cover - passed through to caller
         payload = ('exception', exc)
@@ -2021,6 +2043,7 @@ def emit_position_closed_runtime_event(
         payload['exit_source'] = str(exit_source)
     if extra_payload:
         payload.update(extra_payload)
+    append_runtime_event(store, 'position_closed', payload)
     event = append_runtime_event(store, 'trade_invalidated', payload)
     if store is not None:
         try:
@@ -2029,6 +2052,48 @@ def emit_position_closed_runtime_event(
         except Exception:
             pass
     return event
+
+
+def summarize_exit_trade_fills(tracked: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize Binance user-trade rows that reduce one tracked position."""
+    tracked = dict(tracked or {})
+    symbol = str(tracked.get('symbol') or '').upper()
+    position_side = normalize_position_side(tracked.get('position_side') or tracked.get('side'))
+    exit_buyer = position_side == POSITION_SIDE_SHORT
+    opened_at = _parse_iso8601_utc(tracked.get('opened_at'))
+    opened_at_ms = int(opened_at.timestamp() * 1000) if opened_at is not None else 0
+    exit_fills: List[Dict[str, Any]] = []
+    position_fills: List[Dict[str, Any]] = []
+    for row in list(fills or []):
+        if not isinstance(row, dict) or str(row.get('symbol') or '').upper() != symbol:
+            continue
+        row_side = normalize_position_side(row.get('positionSide') or row.get('position_side'), position_side)
+        if row_side != position_side:
+            continue
+        if opened_at_ms and int(_to_float(row.get('time'), default=0.0)) < opened_at_ms:
+            continue
+        position_fills.append(row)
+        if bool(row.get('buyer')) != exit_buyer:
+            continue
+        exit_fills.append(row)
+    quantity = sum(abs(_to_float(row.get('qty'), default=0.0)) for row in exit_fills)
+    quote = sum(abs(_to_float(row.get('qty'), default=0.0)) * _to_float(row.get('price'), default=0.0) for row in exit_fills)
+    realized = sum(_to_float(row.get('realizedPnl', row.get('realized_pnl')), default=0.0) for row in exit_fills)
+    commission = sum(
+        abs(_to_float(row.get('commission'), default=0.0))
+        for row in position_fills
+        if str(row.get('commissionAsset') or 'USDT').upper() in {'USDT', 'USDC', 'FDUSD'}
+    )
+    order_ids = sorted({int(_to_float(row.get('orderId'), default=0.0)) for row in exit_fills if _to_float(row.get('orderId'), default=0.0) > 0})
+    return {
+        'exit_fill_count': len(exit_fills),
+        'exit_order_ids': order_ids,
+        'closed_quantity': round(quantity, 10),
+        'exit_price': round(quote / quantity, 10) if quantity > 0 else None,
+        'realized_pnl_usdt': round(realized, 10),
+        'commission_usdt': round(commission, 10),
+        'net_pnl_usdt': round(realized - commission, 10),
+    }
 
 
 def apply_user_data_stream_order_update(store: RuntimeStateStore, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3193,28 +3258,28 @@ def append_candidate_rejected_event(store: Optional[RuntimeStateStore], candidat
         'symbol_tier_max_loss_usdt': round(float(getattr(candidate, 'symbol_tier_max_loss_usdt', 0.0) or 0.0), 4),
         'side': getattr(candidate, 'side', getattr(candidate, 'position_side', '')),
         'position_side': getattr(candidate, 'position_side', ''),
-        'state': candidate.state,
-        'alert_tier': candidate.alert_tier,
-        'score': round(float(candidate.score or 0.0), 4),
+        'state': str(getattr(candidate, 'state', '') or ''),
+        'alert_tier': str(getattr(candidate, 'alert_tier', '') or ''),
+        'score': round(float(getattr(candidate, 'score', 0.0) or 0.0), 4),
         'reasons': list(reasons),
         **reject_reason_payload,
-        'must_pass_flags': dict(candidate.must_pass_flags or {}),
-        'quality_score': round(float(candidate.quality_score or 0.0), 4),
-        'execution_priority_score': round(float(candidate.execution_priority_score or 0.0), 4),
-        'entry_distance_from_breakout_pct': round(float(candidate.entry_distance_from_breakout_pct or 0.0), 4),
-        'entry_distance_from_vwap_pct': round(float(candidate.entry_distance_from_vwap_pct or 0.0), 4),
+        'must_pass_flags': dict(getattr(candidate, 'must_pass_flags', {}) or {}),
+        'quality_score': round(float(getattr(candidate, 'quality_score', 0.0) or 0.0), 4),
+        'execution_priority_score': round(float(getattr(candidate, 'execution_priority_score', 0.0) or 0.0), 4),
+        'entry_distance_from_breakout_pct': round(float(getattr(candidate, 'entry_distance_from_breakout_pct', 0.0) or 0.0), 4),
+        'entry_distance_from_vwap_pct': round(float(getattr(candidate, 'entry_distance_from_vwap_pct', 0.0) or 0.0), 4),
         'stop_model': getattr(candidate, 'stop_model', 'structure'),
         'stop_distance_pct': round(float(getattr(candidate, 'stop_distance_pct', 0.0) or 0.0), 4),
         'stop_too_tight_flag': bool(getattr(candidate, 'stop_too_tight_flag', False)),
         'stop_too_wide_flag': bool(getattr(candidate, 'stop_too_wide_flag', False)),
-        'candle_extension_pct': round(float(candidate.candle_extension_pct or 0.0), 4),
-        'recent_3bar_runup_pct': round(float(candidate.recent_3bar_runup_pct or 0.0), 4),
-        'overextension_flag': candidate.overextension_flag,
-        'entry_pattern': candidate.entry_pattern,
-        'trend_regime': candidate.trend_regime,
-        'liquidity_grade': candidate.liquidity_grade,
-        'setup_ready': bool(candidate.setup_ready),
-        'trigger_fired': bool(candidate.trigger_fired),
+        'candle_extension_pct': round(float(getattr(candidate, 'candle_extension_pct', 0.0) or 0.0), 4),
+        'recent_3bar_runup_pct': round(float(getattr(candidate, 'recent_3bar_runup_pct', 0.0) or 0.0), 4),
+        'overextension_flag': bool(getattr(candidate, 'overextension_flag', False)),
+        'entry_pattern': str(getattr(candidate, 'entry_pattern', '') or ''),
+        'trend_regime': str(getattr(candidate, 'trend_regime', '') or ''),
+        'liquidity_grade': str(getattr(candidate, 'liquidity_grade', '') or ''),
+        'setup_ready': bool(getattr(candidate, 'setup_ready', False)),
+        'trigger_fired': bool(getattr(candidate, 'trigger_fired', False)),
         'candidate_stage': getattr(candidate, 'candidate_stage', 'watch_candidate'),
         'setup_missing': setup_missing,
         'trigger_missing': trigger_missing,
@@ -3227,6 +3292,15 @@ def append_candidate_rejected_event(store: Optional[RuntimeStateStore], candidat
         'expected_total_fee_pct': expected_total_fee_pct,
         'execution_slippage_buffer_pct': execution_slippage_buffer_pct,
         'min_profit_buffer_pct': min_profit_buffer_pct,
+        'shadow_entry_price': round(float(getattr(candidate, 'last_price', 0.0) or 0.0), 10),
+        'planned_take_profit_price': round(float(getattr(candidate, 'planned_take_profit_price', 0.0) or 0.0), 10),
+        'planned_stop_price': round(float(getattr(candidate, 'planned_stop_price', 0.0) or 0.0), 10),
+        'planned_quantity': round(float(getattr(candidate, 'planned_quantity', 0.0) or 0.0), 10),
+        'planned_notional_usdt': round(float(getattr(candidate, 'planned_notional_usdt', 0.0) or 0.0), 4),
+        'expected_gross_profit_usdt': round(float(getattr(candidate, 'expected_gross_profit_usdt', 0.0) or 0.0), 4),
+        'expected_net_profit_usdt': round(float(getattr(candidate, 'expected_net_profit_usdt', 0.0) or 0.0), 4),
+        'expected_loss_usdt': round(float(getattr(candidate, 'expected_loss_usdt', 0.0) or 0.0), 4),
+        'expected_rr': round(float(getattr(candidate, 'expected_rr', 0.0) or 0.0), 4),
         'portfolio_narrative_bucket': str(getattr(candidate, 'portfolio_narrative_bucket', '') or ''),
         'portfolio_correlation_group': str(getattr(candidate, 'portfolio_correlation_group', '') or ''),
         'expected_slippage_pct': round(float(candidate.expected_slippage_pct or 0.0), 4),
@@ -3246,6 +3320,163 @@ def append_candidate_rejected_event(store: Optional[RuntimeStateStore], candidat
     if extra:
         payload.update(extra)
     return append_runtime_event(store, 'candidate_rejected', payload)
+
+
+def persist_economic_shadow_candidates(
+    store: RuntimeStateStore,
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    observed_at: Optional[str] = None,
+    max_rows: int = 200,
+) -> List[Dict[str, Any]]:
+    """Persist triggered economic rejections without resetting their maturity clock."""
+    timestamp = observed_at or datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    loaded = store.load_json('economic_shadow_candidates', {'rows': []})
+    existing_rows = loaded.get('rows', []) if isinstance(loaded, dict) else []
+    rows = [dict(item) for item in existing_rows if isinstance(item, dict)]
+    # Completed observations are history, not permanent dedupe keys.
+    by_key = {
+        (str(item.get('symbol') or ''), normalize_position_side(item.get('side'))): item
+        for item in rows
+        if str(item.get('symbol') or '') and item.get('status', 'pending') == 'pending'
+    }
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not bool(candidate.get('shadow_eligible')):
+            continue
+        symbol = normalize_symbol(candidate.get('symbol'))
+        side = normalize_position_side(candidate.get('side') or candidate.get('position_side'))
+        if not symbol:
+            continue
+        key = (symbol, side)
+        existing = by_key.get(key)
+        if existing is not None:
+            existing['last_seen_at'] = timestamp
+            existing['seen_count'] = int(existing.get('seen_count', 1) or 1) + 1
+            continue
+        row = dict(candidate)
+        row.update({
+            'symbol': symbol,
+            'side': side,
+            'captured_at': timestamp,
+            'last_seen_at': timestamp,
+            'seen_count': 1,
+            'status': 'pending',
+        })
+        rows.append(row)
+        by_key[key] = row
+    # Pending observations must survive retention so they can eventually mature.
+    # ``max_rows`` caps completed history only; the pending set may temporarily exceed it.
+    pending_rows = [row for row in rows if row.get('status', 'pending') == 'pending']
+    completed_rows = [row for row in rows if row.get('status', 'pending') != 'pending']
+    rows = completed_rows[-max(1, int(max_rows or 200)):] + pending_rows
+    store.save_json('economic_shadow_candidates', {'updated_at': timestamp, 'rows': rows})
+    return rows
+
+
+def _economic_shadow_timestamp(value: Any) -> Optional[datetime.datetime]:
+    try:
+        result = datetime.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return result if result.tzinfo else result.replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluate_economic_shadow_candidates(store, client, *, args=None, evaluated_at=None):
+    """Mature rejects using closed 1m candles and scanner REST safety policy.
+
+    A horizon is observed at the first candle close at or after its target. Outcome
+    percentages are round-trip PnL percentages normalized to entry notional.
+    """
+    timestamp = evaluated_at or datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+    now = _economic_shadow_timestamp(timestamp)
+    loaded = store.load_json('economic_shadow_candidates', {'rows': []})
+    rows = [dict(r) for r in (loaded.get('rows', []) if isinstance(loaded, dict) else []) if isinstance(r, dict)]
+    if now is None or client is None:
+        return rows
+    due = {}
+    for row in rows:
+        captured = _economic_shadow_timestamp(row.get('captured_at'))
+        symbol = normalize_symbol(row.get('symbol'))
+        horizon_due = any(
+            now >= captured + datetime.timedelta(minutes=minutes)
+            and f'directional_return_pct_{minutes}m' not in row
+            for minutes in (15, 30, 45)
+        ) if captured else False
+        if row.get('status', 'pending') == 'pending' and captured and symbol and horizon_due:
+            due.setdefault(symbol, []).append((row, captured))
+    if due and args is not None:
+        decision = scanner_ticker_rest_fallback_decision(
+            store, args, {'fresh': False, 'reason': 'economic_shadow_observation'}
+        )
+        if not decision.get('allowed'):
+            for items in due.values():
+                for row, _ in items:
+                    row['evaluation_deferred_reason'] = str(decision.get('reason') or 'scanner_rest_guard')
+            store.save_json('economic_shadow_candidates', {'updated_at': timestamp, 'rows': rows})
+            return rows
+    for symbol, items in due.items():
+        start = min(c for _, c in items)
+        end = min(now, max(c + datetime.timedelta(minutes=45) for _, c in items))
+        start = start.replace(second=0, microsecond=0)
+        try:
+            candles = client.get('/fapi/v1/klines', params={'symbol': symbol, 'interval': '1m',
+                'startTime': int(start.timestamp() * 1000), 'endTime': int(end.timestamp() * 1000),
+                'limit': 1000}, purpose='market_data') or []
+        except Exception as exc:
+            for row, _ in items:
+                row['evaluation_error'] = f'{type(exc).__name__}: {exc}'
+            continue
+        candles = [c for c in candles if isinstance(c, (list, tuple)) and len(c) >= 7 and int(c[6]) <= int(now.timestamp() * 1000)]
+        for row, captured in items:
+            entry = _coerce_optional_float(row.get('shadow_entry_price')) or 0.0
+            if entry <= 0:
+                row['evaluation_error'] = 'missing_shadow_entry_price'
+                continue
+            capture_ms = int(captured.timestamp() * 1000)
+            horizon_ms = int((captured + datetime.timedelta(minutes=45)).timestamp() * 1000)
+            relevant = [c for c in candles if int(c[6]) > capture_ms and int(c[0]) <= horizon_ms]
+            if not relevant:
+                continue
+            direction = 1.0 if normalize_position_side(row.get('side')) == POSITION_SIDE_LONG else -1.0
+            for minutes in (15, 30, 45):
+                target = int((captured + datetime.timedelta(minutes=minutes)).timestamp() * 1000)
+                eligible = [c for c in relevant if int(c[6]) >= target]
+                if now >= captured + datetime.timedelta(minutes=minutes) and eligible:
+                    row[f'directional_return_pct_{minutes}m'] = round(direction * (float(eligible[0][4]) - entry) / entry * 100, 6)
+            favorable = max(float(c[2]) for c in relevant) if direction > 0 else min(float(c[3]) for c in relevant)
+            adverse = min(float(c[3]) for c in relevant) if direction > 0 else max(float(c[2]) for c in relevant)
+            row['mfe_pct'] = round(direction * (favorable - entry) / entry * 100, 6)
+            row['mae_pct'] = round(direction * (adverse - entry) / entry * 100, 6)
+            tp = _coerce_optional_float(row.get('planned_take_profit_price')) or 0.0
+            stop = _coerce_optional_float(row.get('planned_stop_price')) or 0.0
+            exit_price, reason = 0.0, ''
+            for candle in relevant:
+                high, low = float(candle[2]), float(candle[3])
+                tp_hit = tp > 0 and (high >= tp if direction > 0 else low <= tp)
+                stop_hit = stop > 0 and (low <= stop if direction > 0 else high >= stop)
+                if tp_hit or stop_hit:
+                    exit_price, reason = ((stop, 'ambiguous_stop_first' if tp_hit else 'stop_loss') if stop_hit else (tp, 'take_profit'))
+                    break
+            complete = now >= captured + datetime.timedelta(minutes=45) and any(int(c[6]) >= horizon_ms for c in relevant)
+            if complete and not reason:
+                exit_price, reason = float(relevant[-1][4]), 'horizon_45m'
+            if reason:
+                row.update(exit_price=round(exit_price, 10), exit_reason=reason)
+            quantity = _coerce_optional_float(row.get('planned_quantity')) or 0.0
+            row['sizing_diagnostics'] = [] if quantity > 0 else ['planned_quantity']
+            if reason and quantity > 0:
+                gross = direction * (exit_price - entry) * quantity
+                costs = ((_coerce_optional_float(row.get('expected_total_fee_pct')) or 0.0) + (_coerce_optional_float(row.get('execution_slippage_buffer_pct')) or 0.0))
+                row['modeled_gross_pnl_usdt'] = round(gross, 6)
+                row['modeled_net_pnl_usdt'] = round(gross - entry * quantity * costs / 100, 6)
+                entry_notional = entry * quantity
+                row['modeled_gross_pnl_pct'] = round(gross / entry_notional * 100, 6)
+                row['modeled_net_pnl_pct'] = round(row['modeled_net_pnl_usdt'] / entry_notional * 100, 6)
+            if complete:
+                row.update(status='completed', completed_at=timestamp)
+            row['last_evaluated_at'] = timestamp
+    store.save_json('economic_shadow_candidates', {'updated_at': timestamp, 'rows': rows})
+    return rows
 
 
 def append_missed_trade_event(
@@ -3326,6 +3557,10 @@ def build_candidate_selected_event_payload(
             'market_regime_label': str((regime_payload or {}).get('label', getattr(candidate, 'regime_label', '')) or ''),
             'market_regime_multiplier': round(float((regime_payload or {}).get('score_multiplier', getattr(candidate, 'regime_multiplier', 0.0)) or 0.0), 4),
             'market_regime_reasons': list((regime_payload or {}).get('reasons', [])),
+            'market_direction_bias': str(getattr(candidate, 'market_direction_bias', 'NEUTRAL') or 'NEUTRAL'),
+            'market_direction_bias_strength': round(float(getattr(candidate, 'market_direction_bias_strength', 0.0) or 0.0), 4),
+            'market_direction_score_multiplier': round(float(getattr(candidate, 'market_direction_score_multiplier', 1.0) or 1.0), 4),
+            'market_breadth_ratio': round(float(getattr(candidate, 'market_breadth_ratio', 0.5) or 0.5), 4),
             'reasons': list(getattr(candidate, 'reasons', []) or []),
             'state_reasons': list(getattr(candidate, 'state_reasons', []) or []),
         }
@@ -3962,7 +4197,7 @@ def plan_five_usdt_target_trade(
     })
     if qty <= 0:
         result['target_profit_reject_reason'] = 'notional_below_min'
-    elif min_notional_usdt > 0 and notional + 1e-9 < min_notional_usdt:
+    elif min_notional_usdt > 0 and notional + 1e-9 < min_notional_usdt * 0.995:
         result['target_profit_reject_reason'] = 'notional_below_min'
     elif max_notional_usdt > 0 and notional > max_notional_usdt + 1e-9:
         result['target_profit_reject_reason'] = 'notional_above_max'
@@ -4510,10 +4745,20 @@ def recover_protected_position_trade_management_plan(
         tracked.get('stop_price'),
     ])
     
+    entry_price = _to_float(tracked.get('entry_price'))
+    position_side = normalize_position_side(tracked.get('position_side') or tracked.get('side'))
     recovered_stop_price = 0.0
     for candidate in stop_candidates:
-        recovered_stop_price = _to_float(candidate)
-        if recovered_stop_price > 0:
+        candidate_price = _to_float(candidate)
+        # A protective stop must be beyond entry in the loss direction. Do not
+        # let a stale persisted stop hide a valid exchange algo-order trigger.
+        valid_direction = (
+            entry_price <= 0
+            or (position_side == POSITION_SIDE_LONG and candidate_price < entry_price)
+            or (position_side == POSITION_SIDE_SHORT and candidate_price > entry_price)
+        )
+        if candidate_price > 0 and valid_direction:
+            recovered_stop_price = candidate_price
             break
     if recovered_stop_price > 0:
         tracked['current_stop_price'] = recovered_stop_price
@@ -4521,6 +4766,9 @@ def recover_protected_position_trade_management_plan(
     if args is None:
         return tracked
     try:
+        # Recovery is authoritative: an embedded stale plan must not prevent a
+        # rebuild from the live exchange stop and quantity.
+        tracked['trade_management_plan'] = None
         plan = build_trade_management_plan_from_position(tracked, args)
     except Exception as exc:
         tracked['recovery_incomplete'] = True
@@ -6267,6 +6515,8 @@ def _save_ticker_24hr_cache_refresher_heartbeat(store: RuntimeStateStore, *, act
         'updated_at': _isoformat_utc(_utc_now()),
         'active': bool(active),
         'pid': os.getpid(),
+        'owner_pid': os.getpid(),
+        'thread_count': 1 if active else 0,
         'thread_name': threading.current_thread().name,
         'last_skipped_reason': str(last_skipped_reason or ''),
     }
@@ -7343,12 +7593,14 @@ FIVE_USDT_TIER_B_SYMBOLS = {
     'NEARUSDT', 'ONDOUSDT', 'APTUSDT', 'SEIUSDT', 'TIAUSDT', 'INJUSDT', 'WIFUSDT', 'PEPEUSDT', 'FETUSDT', 'LDOUSDT',
 }
 FIVE_USDT_RECENT_UNDERPERFORMER_SYMBOLS = {
-    'NOTUSDT', 'HYPEUSDT', 'WLDUSDT', 'ZROUSDT', 'BASUSDT', 'CLOUSDT', 'UBUSDT',
+    'NOTUSDT', 'VICUSDT', 'HYPEUSDT', 'COSUSDT', 'NEARUSDT', 'WLDUSDT',
+    'BNBUSDT', 'BTWUSDT', 'LITUSDT', 'BTCUSDT', 'ZROUSDT', 'BASUSDT',
+    'CLOUSDT', 'UBUSDT',
 }
-FIVE_USDT_TIER_RULES = {
-    'A': {'min_profit': 4.8, 'min_rr': 2.0, 'max_loss': 1.8},
-    'B': {'min_profit': 5.2, 'min_rr': 2.2, 'max_loss': 1.6},
-    'C': {'min_profit': 5.8, 'min_rr': 2.5, 'max_loss': 1.4},
+FIVE_USDT_TIER_RULES: Dict[str, Dict[str, float]] = {
+    'A': {'min_profit': 0.2, 'min_rr': 0.8, 'max_loss': 1.8},
+    'B': {'min_profit': 0.3, 'min_rr': 0.9, 'max_loss': 1.6},
+    'C': {'min_profit': 0.5, 'min_rr': 1.0, 'max_loss': 1.4},
 }
 
 
@@ -7494,8 +7746,13 @@ def apply_five_usdt_candidate_selection_filter(candidate: Candidate, args: argpa
     if tier in {'B', 'C'} and str(execution_quality.get('execution_liquidity_grade') or '') in {'D', 'F'}:
         return 'c_tier_slippage_too_high' if tier == 'C' else 'execution_depth_veto'
     if tier == 'C':
-        volume_spike = float(getattr(candidate, 'volume_multiple', 0.0) or 0.0) >= 1.5 or float(getattr(candidate, 'volume_zscore_5m', 0.0) or 0.0) >= 1.0
-        if not volume_spike:
+        volume_spike = float(candidate.volume_multiple or 0.0) >= 1.0 or float(candidate.volume_zscore_5m or 0.0) >= 0.5
+        high_conviction_economics = (
+            float(getattr(candidate, 'score', 0.0) or 0.0) >= 120.0
+            and float(getattr(candidate, 'expected_net_profit_usdt', 0.0) or 0.0) >= 1.0
+            and float(getattr(candidate, 'expected_rr', 0.0) or 0.0) >= 1.1
+        )
+        if not volume_spike and not high_conviction_economics:
             return 'c_tier_missing_volume_spike'
         flags = dict(getattr(candidate, 'trigger_confirmation_flags', {}) or {})
         orderflow_confirms = 0
@@ -7506,11 +7763,24 @@ def apply_five_usdt_candidate_selection_filter(candidate: Candidate, args: argpa
         taker_ratio = getattr(candidate, 'taker_buy_ratio', None)
         if taker_ratio is not None and abs(float(taker_ratio) - 0.5) >= 0.05:
             orderflow_confirms += 1
-        if orderflow_confirms < 2:
+        min_orderflow_confirms = 1 if high_conviction_economics else 2
+        if orderflow_confirms < min_orderflow_confirms:
             return 'c_tier_missing_orderflow_confirmation'
         if float(execution_quality.get('spread_bps') or 0.0) > 8.0 or float(getattr(candidate, 'expected_slippage_pct', 0.0) or 0.0) > 0.12:
             return 'c_tier_slippage_too_high'
     return None
+
+
+def apply_profile_candidate_selection_filter(
+    candidate: Candidate,
+    args: argparse.Namespace,
+    store: Optional[RuntimeStateStore],
+    cooldown_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    if str(getattr(args, 'profile', '') or '') != 'five-usdt-scalp-v2':
+        return None
+    return apply_five_usdt_candidate_selection_filter(candidate, args, store, cooldown_map)
+
 
 def merged_candidate_symbols(**kwargs) -> Tuple[List[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
     allowed_symbols = {
@@ -8111,14 +8381,14 @@ def build_standardized_alert(candidate: Candidate, regime_payload: Optional[Dict
         'execution_priority_score': round(float(candidate.execution_priority_score or 0.0), 4),
         'entry_distance_from_breakout_pct': round(candidate.entry_distance_from_breakout_pct, 4),
         'entry_distance_from_vwap_pct': round(candidate.entry_distance_from_vwap_pct, 4),
-        'candle_extension_pct': round(float(candidate.candle_extension_pct or 0.0), 4),
-        'recent_3bar_runup_pct': round(float(candidate.recent_3bar_runup_pct or 0.0), 4),
-        'overextension_flag': candidate.overextension_flag,
-        'entry_pattern': candidate.entry_pattern,
-        'trend_regime': candidate.trend_regime,
-        'liquidity_grade': candidate.liquidity_grade,
-        'setup_ready': bool(candidate.setup_ready),
-        'trigger_fired': bool(candidate.trigger_fired),
+        'candle_extension_pct': round(float(getattr(candidate, 'candle_extension_pct', 0.0) or 0.0), 4),
+        'recent_3bar_runup_pct': round(float(getattr(candidate, 'recent_3bar_runup_pct', 0.0) or 0.0), 4),
+        'overextension_flag': getattr(candidate, 'overextension_flag', False),
+        'entry_pattern': str(getattr(candidate, 'entry_pattern', '') or ''),
+        'trend_regime': str(getattr(candidate, 'trend_regime', '') or ''),
+        'liquidity_grade': str(getattr(candidate, 'liquidity_grade', '') or ''),
+        'setup_ready': bool(getattr(candidate, 'setup_ready', False)),
+        'trigger_fired': bool(getattr(candidate, 'trigger_fired', False)),
         'candidate_stage': candidate.candidate_stage,
         'setup_missing': list(candidate.setup_missing or []),
         'trigger_missing': list(candidate.trigger_missing or []),
@@ -8281,8 +8551,16 @@ def build_trigger_relax_candidate(candidate: Candidate, args: argparse.Namespace
 def is_trigger_relax_eligible(candidate: Candidate, args: argparse.Namespace, regime_payload: Optional[Dict[str, Any]] = None) -> bool:
     if not bool(getattr(args, 'trigger_relax_mode', False)):
         return False
-    if not bool(getattr(candidate, 'setup_ready', False)) or bool(getattr(candidate, 'trigger_fired', False)):
+    if bool(getattr(candidate, 'trigger_fired', False)):
         return False
+    if not bool(getattr(candidate, 'setup_ready', False)):
+        soft_setup_misses = {'waiting_breakout', 'breakout_close_not_confirmed'}
+        setup_missing = {str(item) for item in (getattr(candidate, 'setup_missing', []) or [])}
+        if not setup_missing or not setup_missing.issubset(soft_setup_misses):
+            return False
+        entry_distance = float(getattr(candidate, 'entry_distance_from_breakout_pct', 0.0) or 0.0)
+        if entry_distance < -0.35 or entry_distance > 0.05:
+            return False
     if float(getattr(candidate, 'score', 0.0) or 0.0) < float(getattr(args, 'trigger_relax_min_score', 70.0) or 70.0):
         return False
     if bool(getattr(candidate, 'overextension_flag', False)):
@@ -8297,6 +8575,11 @@ def is_trigger_relax_eligible(candidate: Candidate, args: argparse.Namespace, re
 
 def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespace, explicit_square_symbols: Optional[Sequence[str]] = None):
     store = get_runtime_state_store(args)
+    symbol_loss_cooldown_map = (
+        build_symbol_loss_cooldown_map(store)
+        if str(getattr(args, 'profile', '') or '') == 'five-usdt-scalp-v2'
+        else {}
+    )
     trade_memory = None
     if bool(getattr(args, 'enable_trade_memory', False)):
         trade_memory = TradeMemoryEngine(store).aggregate()
@@ -8355,6 +8638,8 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         btc_klines=resolve_scan_klines(client, store, args, 'BTCUSDT', '15m', 30) if client else None,
         sol_klines=resolve_scan_klines(client, store, args, 'SOLUSDT', '15m', 30) if client else None,
     )
+    market_direction_payload = compute_market_direction_bias(tickers, regime_payload)
+    regime_payload['market_direction_bias'] = market_direction_payload
 
     rejected_events: List[Dict[str, Any]] = []
     early_reject_stats: Dict[str, Any] = {'total': 0, 'by_reason': {}, 'by_side': {}}
@@ -8521,6 +8806,14 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                     continue
             if bool(getattr(args, 'five_usdt_watchlist_scoring', False)):
                 apply_five_usdt_watchlist_scoring(candidate, regime_payload)
+            profile_reject_reason = apply_profile_candidate_selection_filter(
+                candidate, args, store, symbol_loss_cooldown_map,
+            )
+            if profile_reject_reason:
+                apply_candidate_diagnostics(candidate)
+                candidate.reasons.append(profile_reject_reason)
+                rejected_events.append(append_candidate_rejected_event(None, candidate, [profile_reject_reason]))
+                continue
             apply_candidate_diagnostics(candidate)
             built_candidates.append(candidate)
             external_veto_reason = apply_external_signal_to_candidate(candidate, external_signal)
@@ -8540,6 +8833,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             side_multiplier = derive_side_risk_multiplier(getattr(candidate, 'side', POSITION_SIDE_LONG), regime_label)
             directional_score_multiplier = derive_directional_score_multiplier(getattr(candidate, 'side', POSITION_SIDE_LONG), regime_label, regime_multiplier)
             candidate.score *= directional_score_multiplier
+            apply_market_direction_bias(candidate, market_direction_payload)
             if trade_memory is not None:
                 candidate = apply_trade_memory_to_candidate(candidate, trade_memory, profile=str(getattr(args, 'profile', 'default') or 'default'))
             candidate.regime_label = regime_label
@@ -8639,6 +8933,16 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
             'expected_total_fee_pct': event.get('expected_total_fee_pct'),
             'execution_slippage_buffer_pct': event.get('execution_slippage_buffer_pct'),
             'min_profit_buffer_pct': event.get('min_profit_buffer_pct'),
+            'shadow_eligible': bool(event.get('setup_ready')) and bool(event.get('trigger_fired')),
+            'shadow_entry_price': event.get('shadow_entry_price'),
+            'planned_take_profit_price': event.get('planned_take_profit_price'),
+            'planned_stop_price': event.get('planned_stop_price'),
+            'planned_quantity': event.get('planned_quantity'),
+            'planned_notional_usdt': event.get('planned_notional_usdt'),
+            'expected_gross_profit_usdt': event.get('expected_gross_profit_usdt'),
+            'expected_net_profit_usdt': event.get('expected_net_profit_usdt'),
+            'expected_loss_usdt': event.get('expected_loss_usdt'),
+            'expected_rr': event.get('expected_rr'),
         }
         for event in sorted(
             all_rejected_events,
@@ -8826,6 +9130,13 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
         'funnel': funnel,
         'summary_counters': summary_counters,
     }
+    try:
+        # Mature old observations before adding this cycle's samples.
+        evaluate_economic_shadow_candidates(store, client, args=args)
+        shadow_rows = persist_economic_shadow_candidates(store, top_rejected)
+        payload['economic_shadow_candidate_count'] = len(shadow_rows)
+    except Exception as exc:
+        payload['economic_shadow_persist_error'] = f'{type(exc).__name__}: {exc}'
     return payload, best, metas
 
 
@@ -8906,6 +9217,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-loss-usdt', type=float, default=0.0)
     parser.add_argument('--min-expected-rr', type=float, default=0.0)
     parser.add_argument('--prefer-maker', action='store_true')
+    parser.add_argument('--allow-post-only-taker-fallback', action='store_true', help='Permit a tightly gated taker entry after Binance rejects a GTX order with -5022.')
+    parser.add_argument('--maker-post-only-fallback-min-score', type=float, default=85.0)
+    parser.add_argument('--maker-post-only-fallback-min-liquidity-grade', choices=['A', 'B'], default='B')
+    parser.add_argument('--maker-post-only-fallback-max-spread-bps', type=float, default=8.0)
     parser.add_argument('--taker-fee-worst-case', action='store_true')
     parser.add_argument('--disable-tiny-tp', action='store_true')
     parser.add_argument('--daily-trade-limit', type=int, default=0)
@@ -9218,6 +9533,8 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
     elif profile == 'five-usdt-scalp-v2':
         profile_overrides = {
             'risk_usdt': 1.5,
+            'target_net_profit_usdt': 1.2,
+            'min_target_net_profit_usdt': 0.6,
             'min_notional_usdt': 60.0,
             'max_notional_usdt': 90.0,
             'target_notional_usdt': 80.0,
@@ -9262,14 +9579,15 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
             'scan_open_interest_symbol_limit': 6,
             'scan_cvd_symbol_limit': 6,
             'scan_watchlist_symbols': 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,1000PEPEUSDT,1000BONKUSDT',
-            'max_distance_from_ema_pct': 1.2,
-            'max_distance_from_vwap_pct': 1.2,
-            'watch_breakout_tolerance_pct': 1.2,
-            'setup_breakout_tolerance_pct': 1.2,
+            'max_distance_from_ema_pct': 1.8,
+            'max_distance_from_vwap_pct': 1.8,
+            'watch_breakout_tolerance_pct': 3.0,
+            'setup_breakout_tolerance_pct': 3.0,
             'enable_symbol_quality_tier': True,
             'enable_fee_aware_edge_filter': True,
             'execution_preflight_enabled': True,
             'repair_missing_protection': True,
+            'trigger_relax_mode': True,
             'allowed_trade_sides': 'long,short',
         }
     elif profile == '10u-active':
@@ -9904,7 +10222,32 @@ def build_exchange_reconciled_position_record(row: Dict[str, Any], args: Optiona
     return record
 
 
-def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_positions: Sequence[Dict[str, Any]], protected_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+def fetch_recent_user_trades_for_position(client: Any, tracked: Dict[str, Any]) -> List[Dict[str, Any]]:
+    symbol = str((tracked or {}).get('symbol') or '').upper()
+    if not symbol or client is None or not hasattr(client, 'signed_get'):
+        return []
+    previous_history_setting = getattr(client, 'allow_heavy_history_rest', None)
+    try:
+        if previous_history_setting is not None:
+            client.allow_heavy_history_rest = True
+        rows = client.signed_get('/fapi/v1/userTrades', {'symbol': symbol, 'limit': 100})
+    except Exception:
+        return []
+    finally:
+        if previous_history_setting is not None:
+            client.allow_heavy_history_rest = previous_history_setting
+    return [row for row in list(rows or []) if isinstance(row, dict)]
+
+
+def classify_reconciled_exit_reason(tracked: Dict[str, Any], summary: Dict[str, Any]) -> str:
+    order_ids = {int(order_id) for order_id in list(summary.get('exit_order_ids') or [])}
+    stop_order_id = int(_to_float((tracked or {}).get('stop_order_id'), default=0.0))
+    if stop_order_id > 0 and stop_order_id in order_ids:
+        return 'stop_loss'
+    return str((tracked or {}).get('exit_reason') or 'exchange_position_missing')
+
+
+def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_positions: Sequence[Dict[str, Any]], protected_symbols: Optional[Sequence[str]] = None, client: Any = None) -> Dict[str, Any]:
     raw_positions_state = store.load_json('positions', {})
     if not isinstance(raw_positions_state, dict):
         raw_positions_state = {}
@@ -9920,6 +10263,7 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
         and abs(_to_float(row.get('positionAmt', row.get('position_amt', row.get('quantity'))))) > 0
     }
     closed_symbols: List[str] = []
+    closed_trade_details: List[Dict[str, Any]] = []
     refreshed_symbols: List[str] = []
     orphan_symbols: List[str] = []
     normalized_positions: Dict[str, Any] = {}
@@ -9952,6 +10296,12 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
                 or live_quantity_value > 0
                 or remaining_quantity_value > 0
             ) and not already_reconciled_closed
+            exit_summary: Dict[str, Any] = {}
+            reconciled_exit_reason = str(tracked.get('exit_reason') or 'exchange_position_missing')
+            if was_openish and client is not None:
+                exit_summary = summarize_exit_trade_fills(tracked, fetch_recent_user_trades_for_position(client, tracked))
+                if int(exit_summary.get('exit_fill_count') or 0) > 0:
+                    reconciled_exit_reason = classify_reconciled_exit_reason(tracked, exit_summary)
             tracked['status'] = 'closed'
             tracked['quantity'] = 0.0
             tracked['remaining_quantity'] = 0.0
@@ -9972,20 +10322,47 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
             tracked['active_stop_order'] = {}
             tracked['exchange_reconcile_reason'] = 'exchange_position_missing'
             tracked['closed_at'] = str(tracked.get('closed_at') or _isoformat_utc(_utc_now()))
-            tracked['exit_reason'] = str(tracked.get('exit_reason') or 'exchange_position_missing')
+            tracked['exit_reason'] = reconciled_exit_reason
+            if exit_summary:
+                tracked.update(exit_summary)
             if was_openish:
                 closed_symbols.append(report_key)
+                closed_detail = {
+                    'position_key': position_key,
+                    'symbol': symbol,
+                    'position_side': side,
+                    'exit_reason': tracked['exit_reason'],
+                    **exit_summary,
+                }
+                closed_trade_details.append(closed_detail)
                 emit_position_closed_runtime_event(
                     store,
                     tracked,
                     exit_reason=tracked['exit_reason'],
+                    exit_price=exit_summary.get('exit_price'),
                     exit_source='exchange_reconcile',
-                    extra_payload={'exchange_reconcile_reason': 'exchange_position_missing'},
+                    extra_payload={'exchange_reconcile_reason': 'exchange_position_missing', **exit_summary},
                 )
             normalized_positions[position_key] = tracked
             continue
 
+        previous_quantity = abs(_to_float(tracked.get('remaining_quantity') or tracked.get('quantity')))
         tracked.update(exchange_position_runtime_fields(exchange_row))
+        live_quantity = abs(_to_float(tracked.get('remaining_quantity') or tracked.get('quantity')))
+        plan = tracked.get('trade_management_plan')
+        if isinstance(plan, dict) and plan and live_quantity > 0 and abs(live_quantity - previous_quantity) > 1e-10:
+            # Preserve trigger prices but resize every close leg to the actual
+            # exchange remainder after partial or manual fills.
+            plan = dict(plan)
+            old_parts = [max(0.0, _to_float(plan.get(name))) for name in ('tp1_close_qty', 'tp2_close_qty', 'runner_qty')]
+            old_total = sum(old_parts)
+            if old_total <= 0:
+                old_parts, old_total = [0.0, 0.0, 1.0], 1.0
+            resized = [live_quantity * part / old_total for part in old_parts]
+            resized[2] = max(0.0, live_quantity - resized[0] - resized[1])
+            plan['quantity'] = live_quantity
+            plan['tp1_close_qty'], plan['tp2_close_qty'], plan['runner_qty'] = [round(value, 10) for value in resized]
+            tracked['trade_management_plan'] = plan
         if str(tracked.get('exchange_reconcile_reason') or '') == 'exchange_position_missing':
             tracked.pop('exchange_reconcile_reason', None)
             tracked.pop('closed_at', None)
@@ -10020,6 +10397,7 @@ def sync_tracked_positions_with_exchange(store: RuntimeStateStore, exchange_posi
     store.save_json('positions', materialized_positions)
     return {
         'closed_symbols': closed_symbols,
+        'closed_trade_details': closed_trade_details,
         'refreshed_symbols': refreshed_symbols,
         'orphan_symbols': orphan_symbols,
     }
@@ -10071,6 +10449,9 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         if protection.get('status') != 'protected':
             repair_result = None
             if repair_missing_protection_enabled:
+                stale_stop = protection.get('stop_order')
+                if protection.get('status') == 'quantity_mismatch' and isinstance(stale_stop, dict):
+                    cancel_protection_order(client, stale_stop)
                 repair_result = repair_missing_protection(
                     client=client,
                     symbol=symbol,
@@ -10096,7 +10477,7 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
                 tracked = recover_protected_position_trade_management_plan(tracked, protection, args)
             positions_state, _ = upsert_position_record(positions_state, tracked, key=position_key)
     store.save_json('positions', positions_state)
-    sync_result = sync_tracked_positions_with_exchange(store, active_exchange_positions, protected_symbols=protected_symbols)
+    sync_result = sync_tracked_positions_with_exchange(store, active_exchange_positions, protected_symbols=protected_symbols, client=client)
     hard_max_loss_guard = evaluate_hard_max_loss_guard(active_exchange_positions, store)
     stale_protection_cleanup = []
     for closed_key in sync_result.get('closed_symbols', []) or []:
@@ -10121,6 +10502,7 @@ def reconcile_runtime_state(client: Any, store: RuntimeStateStore, halt_on_orpha
         'exchange_position_count': len(active_exchange_positions),
         'position_count': len(active_exchange_positions),
         'closed_tracked_positions': sync_result.get('closed_symbols', []),
+        'closed_trade_details': sync_result.get('closed_trade_details', []),
         'refreshed_tracked_positions': sync_result.get('refreshed_symbols', []),
         'hard_max_loss_guard': hard_max_loss_guard,
     }
@@ -10151,6 +10533,11 @@ def apply_reconcile_close_risk_state_updates(store: RuntimeStateStore, reconcile
     cooldown_until = now_ts + cooldown_minutes * 60 if cooldown_minutes > 0 else None
     symbol_cooldowns = risk_state.setdefault('symbol_cooldowns', {})
     recent_closed_trades = risk_state.setdefault('recent_closed_trades', [])
+    detail_by_key = {
+        str(row.get('position_key') or '').upper(): row
+        for row in list((reconcile_result or {}).get('closed_trade_details') or [])
+        if isinstance(row, dict) and row.get('position_key')
+    }
 
     for position_key in closed_position_keys:
         symbol, position_side = split_position_key(position_key)
@@ -10162,14 +10549,26 @@ def apply_reconcile_close_risk_state_updates(store: RuntimeStateStore, reconcile
             existing_until = symbol_cooldowns.get(normalized_symbol)
             if existing_until is None or int(existing_until) < cooldown_until:
                 symbol_cooldowns[normalized_symbol] = cooldown_until
+        detail = detail_by_key.get(build_position_key(normalized_symbol, normalized_side), {})
+        net_pnl = round(_to_float(detail.get('net_pnl_usdt'), default=0.0), 10)
         recent_closed_trades.append({
             'symbol': normalized_symbol,
             'position_side': normalized_side,
             'side': position_side_to_trade_side(normalized_side),
             'closed_at': now_ts,
-            'exit_reason': 'exchange_position_missing',
+            'exit_reason': str(detail.get('exit_reason') or 'exchange_position_missing'),
             'closed_via_reconcile': True,
+            'realized_pnl_usdt': round(_to_float(detail.get('realized_pnl_usdt'), default=0.0), 10),
+            'commission_usdt': round(_to_float(detail.get('commission_usdt'), default=0.0), 10),
+            'net_pnl_usdt': net_pnl,
         })
+        risk_state['daily_realized_pnl'] = round(_to_float(risk_state.get('daily_realized_pnl'), default=0.0) + net_pnl, 10)
+        risk_state['daily_realized_pnl_usdt'] = round(_to_float(risk_state.get('daily_realized_pnl_usdt'), default=0.0) + net_pnl, 10)
+        if net_pnl < 0:
+            risk_state['consecutive_losses'] = int(_to_float(risk_state.get('consecutive_losses'), default=0.0)) + 1
+            risk_state['last_loss_at'] = now_ts
+        elif net_pnl > 0:
+            risk_state['consecutive_losses'] = 0
 
     if len(recent_closed_trades) > 50:
         risk_state['recent_closed_trades'] = recent_closed_trades[-50:]
@@ -11141,7 +11540,11 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         if cycle['book_ticker_websocket'].get('status') == 'unavailable' and not cycle['book_ticker_websocket'].get('health'):
             cycle['book_ticker_websocket'].pop('health', None)
     book_ticker_gate = cycle.get('book_ticker_websocket') if isinstance(cycle.get('book_ticker_websocket'), dict) else None
-    if book_ticker_gate and book_ticker_gate.get('status') == 'unavailable':
+    # Real strategy candidates retain the fail-closed safety gate.  Explicitly
+    # disabled gating remains compatible with lightweight integration adapters
+    # that supply candidate-like objects rather than the production model.
+    websocket_gate_enforced = websocket_gate_required or isinstance(best_candidate, Candidate)
+    if websocket_gate_enforced and book_ticker_gate and book_ticker_gate.get('status') == 'unavailable':
         websocket_reason = str(book_ticker_gate.get('reason') or 'unknown')
         cycle['live_skipped_due_to_websocket_gate'] = [f'book_ticker_websocket_unavailable:{websocket_reason}']
         append_candidate_rejected_event(store, best_candidate, cycle['live_skipped_due_to_websocket_gate'])
@@ -11825,12 +12228,33 @@ async def apply_queue_backpressure(queue: asyncio.Queue, *, store: RuntimeStateS
         'queue_maxsize': queue.maxsize,
         'policy': policy,
     }
-    if queue.full():
-        if reason == 'manager_queue_full' and item is not None:
+    if reason == 'manager_queue_full' and item is not None:
+        # Coalesce on every producer write, not only after reaching maxsize, so
+        # periodic scanner cycles can occupy at most one queue slot.
+        if is_coalescable_manager_update(item):
             coalesced = coalesce_manager_queue_update(queue, item)
             if coalesced.get('accepted'):
-                append_runtime_event(store, 'manager_queue_coalesced', {**payload, **coalesced})
+                if coalesced.get('dropped'):
+                    append_runtime_event(store, 'manager_queue_coalesced', {**payload, **coalesced})
                 return {'accepted': True, 'degraded': False, **payload, **coalesced}
+        elif queue.full():
+            # Lifecycle updates are lossless relative to periodic summaries.
+            kept, dropped = [], 0
+            while not queue.empty():
+                existing = queue.get_nowait()
+                if is_coalescable_manager_update(existing):
+                    queue.task_done()
+                    dropped += 1
+                else:
+                    kept.append(existing)
+            for existing in kept:
+                queue.put_nowait(existing)
+            if dropped:
+                queue.put_nowait(item)
+                result = {'accepted': True, 'coalesced': True, 'dropped': dropped}
+                append_runtime_event(store, 'manager_queue_coalesced', {**payload, **result})
+                return {'degraded': False, **payload, **result}
+    if queue.full():
         degraded = record_runtime_heartbeat(store, component=component, status='degraded', blocked_reason=reason, queue_depth=queue.qsize(), queue_maxsize=queue.maxsize, extra={'backpressure': True, 'policy': policy})
         append_runtime_event(store, 'runtime_backpressure_degrade', {**payload, **degraded, 'degraded': True})
         return {'accepted': False, 'degraded': True, **payload}
@@ -11898,12 +12322,38 @@ async def position_manager_task(client: Any, args: argparse.Namespace, store: Ru
             queues['position_manager'].task_done()
 
 
+async def scanner_backoff_wait(store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], stop_event: asyncio.Event, delay_seconds: float, *, cycle_no: int, degraded_wait: bool = False, slice_seconds: float = 1.0) -> str:
+    """Wait in cancellable slices, refreshing degraded heartbeats and REST state."""
+    deadline = time.monotonic() + max(0.0, float(delay_seconds or 0.0))
+    wait_slice = max(0.01, float(slice_seconds or 1.0))
+    while not stop_event.is_set():
+        remaining = max(0.0, deadline - time.monotonic())
+        rest_snapshot = _binance_rest_guard_snapshot()
+        if degraded_wait and str(rest_snapshot.get('state') or '').upper() == 'CLOSED':
+            return 'circuit_closed'
+        if remaining <= 0.0:
+            return 'elapsed'
+        record_runtime_heartbeat(
+            store, component='scanner', status='degraded_wait' if degraded_wait else 'waiting',
+            blocked_reason='binance_rest_circuit_open' if degraded_wait else '',
+            queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize,
+            extra={'cycle_no': cycle_no, 'backoff_remaining_seconds': remaining, 'rest_circuit': rest_snapshot},
+        )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=min(wait_slice, remaining))
+        except asyncio.TimeoutError:
+            continue
+        return 'stopped'
+    return 'stopped'
+
+
 async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStateStore, queues: Dict[str, asyncio.Queue], run_loop_fn: Optional[Callable[[Any, argparse.Namespace], Dict[str, Any]]], stop_event: asyncio.Event) -> None:
     cycle_no = 0
     scanner_timeout_seconds = float(getattr(args, 'scanner_timeout_seconds', 45.0) or 45.0)
     poll_interval = max(0, int(getattr(args, 'poll_interval_sec', 60) or 60))
     while not stop_event.is_set():
         cycle_no += 1
+        degraded_wait = False
         try:
             websocket_status = store.load_json('book_ticker_ws_status', None)
             record_runtime_heartbeat(store, component='scanner', status='running', blocked_reason='', queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no})
@@ -11957,6 +12407,7 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
                 if isinstance(bp_result, dict) and bp_result.get('degraded'):
                     scan_delay_multiplier = max(scan_delay_multiplier, float((bp_result.get('policy') or {}).get('scan_delay_multiplier', 1.0) or 1.0))
             hb_status = 'degraded_wait' if isinstance(scan_result, dict) and scan_result.get('scanner_degraded_wait') else 'healthy'
+            degraded_wait = hb_status == 'degraded_wait'
             hb_reason = 'binance_rest_circuit_open' if hb_status == 'degraded_wait' else ''
             record_runtime_heartbeat(store, component='scanner', status=hb_status, blocked_reason=hb_reason, queue_depth=queues['execution'].qsize(), queue_maxsize=queues['execution'].maxsize, extra={'cycle_no': cycle_no, 'candidate_found': bool(cycle.get('scan')), 'scan_delay_multiplier': scan_delay_multiplier, 'rest_circuit': _binance_rest_guard_snapshot()})
         except asyncio.TimeoutError:
@@ -11964,6 +12415,7 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
         except BinanceAPIError as exc:
             error_message = str(exc)
             blocked_reason = 'binance_rest_circuit_open' if 'circuit open' in error_message.lower() or 'core-only' in error_message.lower() else 'binance_api_error'
+            degraded_wait = blocked_reason == 'binance_rest_circuit_open'
             rest_snapshot = _binance_rest_guard_snapshot()
             payload = {'cycle_no': cycle_no, 'blocked_reason': blocked_reason, 'error': error_message, 'scanner_degraded_wait': blocked_reason == 'binance_rest_circuit_open', 'rest_used_weight_1m': rest_snapshot.get('rest_used_weight_1m'), 'rest_circuit_state': rest_snapshot.get('state'), 'rest_circuit_reason': rest_snapshot.get('reason'), 'next_rest_probe_at': rest_snapshot.get('next_rest_probe_at_ms'), 'next_retry_after_seconds': rest_snapshot.get('next_retry_after_seconds')}
             append_runtime_event(store, 'scanner_degraded_wait' if blocked_reason == 'binance_rest_circuit_open' else 'scanner_blocked', payload)
@@ -11971,14 +12423,26 @@ async def scanner_task(client: Any, args: argparse.Namespace, store: RuntimeStat
             scan_delay_multiplier = max(locals().get('scan_delay_multiplier', 1.0), max(3.0, float(rest_snapshot.get('next_retry_after_seconds') or 0) / max(1.0, float(poll_interval or 1))))
         except KeyboardInterrupt:
             store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
+            setattr(stop_event, '_resident_interrupted', True)
             stop_event.set()
             break
         if int(getattr(args, 'max_scan_cycles', 0) or 0) and cycle_no >= int(getattr(args, 'max_scan_cycles', 0) or 0):
             break
         try:
-            await asyncio.to_thread(time.sleep, poll_interval * locals().get('scan_delay_multiplier', 1.0))
+            delay_seconds = poll_interval * locals().get('scan_delay_multiplier', 1.0)
+            if degraded_wait:
+                await scanner_backoff_wait(
+                    store, queues, stop_event,
+                    delay_seconds,
+                    cycle_no=cycle_no, degraded_wait=True,
+                )
+            elif delay_seconds > 0:
+                # Preserve the normal scheduler path and its KeyboardInterrupt semantics;
+                # only REST-circuit waits need sliced, early-wake backoff.
+                await asyncio.to_thread(time.sleep, delay_seconds)
         except KeyboardInterrupt:
             store.save_json('resident_last_result', {'ok': True, 'interrupted': True, 'auto_loop': True})
+            setattr(stop_event, '_resident_interrupted', True)
             stop_event.set()
             break
 
@@ -12050,15 +12514,15 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
     async def start_or_recover_supervisor(trigger: str) -> None:
         nonlocal last_restart_at
         global _BOOK_TICKER_WS_SUPERVISOR_ACTIVE
+        now = time.monotonic()
+        if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
+            return
         if _BOOK_TICKER_WS_SUPERVISOR_ACTIVE:
             if trigger == 'initial_start':
                 return
             append_runtime_event(store, 'book_ticker_ws_singleton_recovery_requested', {'trigger': trigger, 'action': 'forced_restart'})
             force_close_book_ticker_websocket_supervisor(store, reason=trigger)
             _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = False
-        now = time.monotonic()
-        if trigger != 'initial_start' and now - last_restart_at < restart_backoff_seconds:
-            return
         last_restart_at = now
         _BOOK_TICKER_WS_SUPERVISOR_ACTIVE = True
         result = await await_component_with_timeout(
@@ -12083,8 +12547,12 @@ async def ws_task(client: Any, args: argparse.Namespace, store: RuntimeStateStor
                 max_age_seconds=stale_seconds,
                 require_messages=bool(getattr(args, 'require_book_ticker_ws_messages', True)),
             )
+            state = str(freshness.get('state') or 'dead')
             if freshness.get('fresh'):
                 record_runtime_heartbeat(store, component='ws', status='healthy', blocked_reason='', extra={'freshness': freshness})
+            elif state != 'dead':
+                reason = str(freshness.get('reason') or 'websocket_degraded')
+                record_runtime_heartbeat(store, component='ws', status='degraded', blocked_reason=f'websocket_degraded:{reason}', extra={'freshness': freshness})
             else:
                 reason = str(freshness.get('reason') or 'stale_websocket')
                 payload = record_runtime_heartbeat(store, component='ws', status='restarting', blocked_reason=f'websocket_stale:{reason}', extra={'freshness': freshness, 'health': health if isinstance(health, dict) else {}})
@@ -12316,8 +12784,27 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
                     await stop_runtime_tasks('watchdog_recovery_request')
                     scanner_runtime_task = await start_runtime_tasks()
                     record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'recovery_request': consumed, 'scanner_task': scanner_runtime_task.get_name()})
-            done, _pending = await asyncio.wait({scanner_runtime_task}, timeout=1.0)
-            if done:
+            supervised_tasks = {
+                task for task in tasks
+                if task.get_name() in {'scanner_task', 'execution_task', 'manager_task', 'position_manager_task'}
+            }
+            done, _pending = await asyncio.wait(supervised_tasks, timeout=1.0)
+            failed_actors = [
+                task for task in done
+                if task.get_name() != 'scanner_task' and not task.cancelled() and task.exception() is not None
+            ]
+            if failed_actors and not stop_event.is_set():
+                failed = failed_actors[0]
+                actor_exc = failed.exception()
+                payload = {'task': failed.get_name(), 'error': str(actor_exc), 'error_type': type(actor_exc).__name__, 'recovery': 'restart_runtime_tasks'}
+                append_runtime_event(store, 'resident_actor_task_failed', payload)
+                record_runtime_heartbeat(store, component='resident', status='recovering', blocked_reason='actor_task_failed', extra=payload)
+                await stop_runtime_tasks('actor_task_failed')
+                scanner_runtime_task = await start_runtime_tasks()
+                append_runtime_event(store, 'resident_actor_failure_recovered', payload)
+                record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'recovered_task': failed.get_name(), 'scanner_task': scanner_runtime_task.get_name()})
+                continue
+            if scanner_runtime_task in done:
                 max_scan_cycles = int(getattr(args, 'max_scan_cycles', 0) or 0)
                 scanner_exc = scanner_runtime_task.exception()
                 if scanner_exc is not None:
@@ -12331,6 +12818,7 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
                     record_runtime_heartbeat(store, component='resident', status='recovering', blocked_reason='scanner_task_failed', extra=payload)
                     if max_scan_cycles == 0 and not stop_event.is_set():
                         scanner_runtime_task = asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task')
+                        tasks.append(scanner_runtime_task)
                         append_runtime_event(store, 'resident_scanner_task_restarted', {'reason': 'scanner_task_failed'})
                         record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'restarted_task': scanner_runtime_task.get_name(), 'previous_error_type': type(scanner_exc).__name__})
                         continue
@@ -12339,6 +12827,7 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
                     append_runtime_event(store, 'resident_scanner_task_unexpected_exit', {'reason': 'scanner_task_completed_in_unlimited_runtime'})
                     record_runtime_heartbeat(store, component='resident', status='recovering', blocked_reason='scanner_task_completed_unexpectedly')
                     scanner_runtime_task = asyncio.create_task(scanner_task(client, args, store, queues, run_loop_fn, stop_event), name='scanner_task')
+                    tasks.append(scanner_runtime_task)
                     record_runtime_heartbeat(store, component='resident', status='running', blocked_reason='', extra={'restarted_task': scanner_runtime_task.get_name(), 'previous_exit': 'scanner_task_completed_unexpectedly'})
                     continue
                 break
@@ -12348,6 +12837,8 @@ async def run_resident_runtime_async(client: Any, args: argparse.Namespace, run_
     finally:
         await stop_runtime_tasks('runtime_shutdown')
     record_runtime_heartbeat(store, component='resident', status='stopped', blocked_reason='')
+    if bool(getattr(stop_event, '_resident_interrupted', False)):
+        return {'ok': True, 'interrupted': True, 'auto_loop': True}
     last_result = store.load_json('resident_last_result', {'ok': True, 'auto_loop': True, 'cycles': []})
     return last_result if isinstance(last_result, dict) else {'ok': True, 'auto_loop': True, 'cycles': []}
 

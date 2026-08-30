@@ -4191,6 +4191,127 @@ def test_sync_tracked_positions_with_exchange_marks_missing_exchange_position_cl
     assert positions['BTCUSDT:LONG']['protection_status'] == 'protected'
 
 
+def test_summarize_exit_trade_fills_calculates_realized_fee_and_net_for_short():
+    tracked = {
+        'symbol': 'SOLUSDT',
+        'position_side': 'SHORT',
+        'opened_at': '2026-08-04T00:00:00Z',
+    }
+    fills = [
+        {'symbol': 'SOLUSDT', 'positionSide': 'SHORT', 'buyer': False, 'time': 1785801700000, 'realizedPnl': '0', 'commission': '0.02', 'commissionAsset': 'USDT', 'qty': '1.14', 'price': '72.84'},
+        {'symbol': 'SOLUSDT', 'positionSide': 'SHORT', 'buyer': True, 'time': 1785801900000, 'realizedPnl': '-1.25', 'commission': '0.021', 'commissionAsset': 'USDT', 'qty': '1.14', 'price': '73.94', 'orderId': 99},
+    ]
+
+    summary = mod.summarize_exit_trade_fills(tracked, fills)
+
+    assert summary['exit_fill_count'] == 1
+    assert summary['exit_order_ids'] == [99]
+    assert summary['closed_quantity'] == 1.14
+    assert summary['exit_price'] == 73.94
+    assert summary['realized_pnl_usdt'] == -1.25
+    assert summary['commission_usdt'] == 0.041
+    assert summary['net_pnl_usdt'] == -1.291
+
+
+def test_emit_position_closed_runtime_event_writes_canonical_lifecycle_event(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    mod.emit_position_closed_runtime_event(
+        store,
+        {'symbol': 'SOLUSDT', 'position_side': 'SHORT', 'remaining_quantity': 0, 'protection_status': 'flat'},
+        exit_reason='stop_loss',
+        exit_price=73.94,
+        exit_source='exchange_reconcile',
+        extra_payload={'realized_pnl_usdt': -1.25, 'commission_usdt': 0.021, 'net_pnl_usdt': -1.271},
+    )
+
+    rows = [mod.json.loads(line) for line in (tmp_path / 'events.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+    assert rows[-2]['event_type'] == 'position_closed'
+    assert rows[-2]['net_pnl_usdt'] == -1.271
+    assert rows[-1]['event_type'] == 'trade_invalidated'
+
+
+def test_apply_reconcile_close_risk_state_updates_persists_net_pnl(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('risk_state', mod.default_risk_state())
+    args = argparse.Namespace(symbol_cooldown_minutes=30)
+    reconcile = {
+        'closed_tracked_positions': ['SOLUSDT:SHORT'],
+        'closed_trade_details': [{
+            'position_key': 'SOLUSDT:SHORT',
+            'exit_reason': 'stop_loss',
+            'realized_pnl_usdt': -1.25,
+            'commission_usdt': 0.021,
+            'net_pnl_usdt': -1.271,
+        }],
+    }
+
+    state = mod.apply_reconcile_close_risk_state_updates(store, reconcile, args)
+
+    assert state['daily_realized_pnl'] == -1.271
+    assert state['daily_realized_pnl_usdt'] == -1.271
+    assert state['consecutive_losses'] == 1
+    assert state['recent_closed_trades'][-1]['net_pnl_usdt'] == -1.271
+    assert state['recent_closed_trades'][-1]['exit_reason'] == 'stop_loss'
+
+
+def test_reconcile_close_history_lookup_is_bounded_and_idempotent(tmp_path):
+    class FakeClient:
+        def __init__(self):
+            self.allow_heavy_history_rest = False
+            self.calls = []
+
+        def signed_get(self, path, params):
+            self.calls.append((path, dict(params), self.allow_heavy_history_rest))
+            return [
+                {'symbol': 'SOLUSDT', 'positionSide': 'SHORT', 'buyer': False, 'time': 1785801700000, 'realizedPnl': '0', 'commission': '0.02', 'commissionAsset': 'USDT', 'qty': '1.14', 'price': '72.84'},
+                {'symbol': 'SOLUSDT', 'positionSide': 'SHORT', 'buyer': True, 'time': 1785801900000, 'realizedPnl': '-1.25', 'commission': '0.021', 'commissionAsset': 'USDT', 'qty': '1.14', 'price': '73.94', 'orderId': 99},
+            ]
+
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {
+        'SOLUSDT:SHORT': {
+            'symbol': 'SOLUSDT',
+            'side': 'SHORT',
+            'position_side': 'SHORT',
+            'status': 'monitoring',
+            'quantity': 1.14,
+            'remaining_quantity': 1.14,
+            'opened_at': '2026-08-04T00:00:00Z',
+            'stop_order_id': 99,
+            'protection_status': 'protected',
+        },
+    })
+    client = FakeClient()
+
+    first = mod.sync_tracked_positions_with_exchange(store, exchange_positions=[], client=client)
+    second = mod.sync_tracked_positions_with_exchange(store, exchange_positions=[], client=client)
+
+    assert first['closed_symbols'] == ['SOLUSDT:SHORT']
+    assert first['closed_trade_details'][0]['net_pnl_usdt'] == -1.291
+    assert second['closed_symbols'] == []
+    assert second['closed_trade_details'] == []
+    assert client.calls == [('/fapi/v1/userTrades', {'symbol': 'SOLUSDT', 'limit': 100}, True)]
+    assert client.allow_heavy_history_rest is False
+    rows = [mod.json.loads(line) for line in store._events_path().read_text(encoding='utf-8').splitlines() if line.strip()]
+    assert [row['event_type'] for row in rows] == ['position_closed', 'trade_invalidated']
+
+
+def test_reconcile_close_history_lookup_restores_guard_after_error():
+    class FailingClient:
+        allow_heavy_history_rest = False
+
+        def signed_get(self, path, params):
+            assert self.allow_heavy_history_rest is True
+            raise RuntimeError('history unavailable')
+
+    client = FailingClient()
+    rows = mod.fetch_recent_user_trades_for_position(client, {'symbol': 'SOLUSDT'})
+
+    assert rows == []
+    assert client.allow_heavy_history_rest is False
+
+
 def test_sync_tracked_positions_with_exchange_treats_zero_exchange_position_as_closed(tmp_path):
     store = mod.RuntimeStateStore(str(tmp_path))
     store.save_json('positions', {
@@ -5001,6 +5122,32 @@ def test_resolve_position_protection_status_requires_matching_algo_identity(monk
     assert result['expected_client_algo_id'] == 'expected-stop'
 
 
+def test_resolve_position_protection_status_rejects_stop_quantity_larger_than_live_position(monkeypatch):
+    monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [
+        {'symbol': 'BICOUSDT', 'positionAmt': '-1', 'positionSide': 'SHORT'}
+    ])
+    monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
+    monkeypatch.setattr(mod, 'fetch_open_algo_orders', lambda client, symbol: [{
+        'symbol': 'BICOUSDT',
+        'algoId': 77,
+        'orderType': 'STOP_MARKET',
+        'positionSide': 'SHORT',
+        'side': 'BUY',
+        'reduceOnly': True,
+        'origQty': '2202',
+        'triggerPrice': '0.02283',
+    }])
+
+    result = mod.resolve_position_protection_status(
+        client=object(), symbol='BICOUSDT', side='SHORT'
+    )
+
+    assert result['status'] == 'quantity_mismatch'
+    assert result['matched_quantity'] == 2202.0
+    assert result['active_quantity'] == 1.0
+    assert result['stop_order']['algoId'] == 77
+
+
 def test_resolve_position_protection_status_rejects_algo_stop_with_wrong_trigger_price(monkeypatch):
     monkeypatch.setattr(mod, 'fetch_open_positions', lambda client: [{'symbol': 'DOGEUSDT', 'positionAmt': '5', 'positionSide': 'LONG'}])
     monkeypatch.setattr(mod, 'fetch_open_orders', lambda client, symbol: [])
@@ -5189,6 +5336,44 @@ def test_sync_tracked_positions_with_exchange_uses_side_aware_position_keys(tmp_
     assert positions['DOGEUSDT:SHORT']['status'] == 'closed'
     assert positions['DOGEUSDT:SHORT']['remaining_quantity'] == 0.0
     assert positions['DOGEUSDT:SHORT']['protection_status'] == 'flat'
+
+
+def test_sync_resizes_embedded_plan_to_live_remaining_quantity(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+    store.save_json('positions', {'BICOUSDT:SHORT': {
+        'symbol': 'BICOUSDT', 'side': 'SHORT', 'position_side': 'SHORT',
+        'status': 'monitoring', 'quantity': 2202.0, 'remaining_quantity': 2202.0,
+        'trade_management_plan': {
+            'quantity': 2202.0, 'tp1_close_qty': 880.8,
+            'tp2_close_qty': 660.6, 'runner_qty': 660.6,
+            'tp1_trigger_price': 0.03, 'tp2_trigger_price': 0.02,
+        },
+    }})
+    mod.sync_tracked_positions_with_exchange(store, [
+        {'symbol': 'BICOUSDT', 'positionAmt': '-1', 'positionSide': 'SHORT'}])
+    plan = store.load_json('positions', {})['BICOUSDT:SHORT']['trade_management_plan']
+    assert plan['quantity'] == 1.0
+    assert sum(plan[name] for name in ('tp1_close_qty', 'tp2_close_qty', 'runner_qty')) <= 1.0
+    assert plan['tp1_trigger_price'] == 0.03
+    assert plan['tp2_trigger_price'] == 0.02
+
+
+def test_protected_recovery_ignores_invalid_stale_stop_and_uses_exchange_algo_stop():
+    tracked = {
+        'symbol': 'VELVETUSDT', 'side': 'LONG', 'position_side': 'LONG',
+        'status': 'protected_recovery_pending', 'quantity': 10, 'remaining_quantity': 10,
+        'entry_price': 1.50, 'stop_price': 1.5139, 'current_stop_price': 1.5139,
+        'trade_management_plan': None,
+    }
+    protection = {'open_orders': [{'orderType': 'STOP_MARKET', 'triggerPrice': '1.47'}]}
+    args = argparse.Namespace(tp1_r=1.5, tp1_close_pct=.3, tp1_profit_usdt=0,
+        tp2_r=2, tp2_close_pct=.4, tp2_profit_usdt=0, breakeven_r=1,
+        breakeven_confirmation_mode='price_only', breakeven_min_buffer_pct=0,
+        micro_scalp_time_stop_sec=0, micro_scalp_min_profit_r=0)
+    recovered = mod.recover_protected_position_trade_management_plan(tracked, protection, args)
+    assert recovered['stop_price'] == 1.47
+    assert recovered['trade_management_plan']['stop_price'] == 1.47
+    assert recovered['status'] == 'monitoring'
 
 
 def test_sync_tracked_positions_with_exchange_persists_realtime_exchange_fields(tmp_path):
@@ -6263,6 +6448,22 @@ def test_build_parser_accepts_absolute_profit_targets():
     assert args.tp2_profit_usdt == 10.0
 
 
+def test_build_parser_accepts_bounded_post_only_taker_fallback():
+    parser = mod.build_parser()
+
+    args = parser.parse_args([
+        '--allow-post-only-taker-fallback',
+        '--maker-post-only-fallback-min-score', '92',
+        '--maker-post-only-fallback-min-liquidity-grade', 'A',
+        '--maker-post-only-fallback-max-spread-bps', '6',
+    ])
+
+    assert args.allow_post_only_taker_fallback is True
+    assert args.maker_post_only_fallback_min_score == 92.0
+    assert args.maker_post_only_fallback_min_liquidity_grade == 'A'
+    assert args.maker_post_only_fallback_max_spread_bps == 6.0
+
+
 def test_restore_position_lifecycle_fields_marks_zero_risk_plan_as_recovery_incomplete():
     restored = mod.restore_position_lifecycle_fields({
         'symbol': 'ZECUSDT',
@@ -7160,6 +7361,15 @@ def test_refresher_heartbeat_with_dead_pid_is_inactive(tmp_path, monkeypatch):
 
     assert heartbeat['active'] is False
     assert heartbeat['pid_alive'] is False
+
+
+def test_refresher_heartbeat_reports_single_thread_for_doctor(tmp_path):
+    store = mod.RuntimeStateStore(str(tmp_path))
+
+    heartbeat = mod._save_ticker_24hr_cache_refresher_heartbeat(store, active=True)
+
+    assert heartbeat['thread_count'] == 1
+    assert heartbeat['owner_pid'] == heartbeat['pid']
 
 
 def test_refresher_start_ignores_fresh_heartbeat_from_dead_pid(tmp_path, monkeypatch):
