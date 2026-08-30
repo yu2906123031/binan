@@ -1,12 +1,15 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 
-MODULE_PATH = Path('/root/.hermes/scripts/binance_momentum_supervisor.py')
+MODULE_PATH = Path(os.environ.get('BINANCE_MOMENTUM_SUPERVISOR_PATH', '/root/.hermes/scripts/binance_momentum_supervisor.py'))
+if not MODULE_PATH.exists():
+    pytest.skip('external supervisor integration script is not installed', allow_module_level=True)
 spec = importlib.util.spec_from_file_location('binance_momentum_supervisor', MODULE_PATH)
 assert spec is not None
 assert spec.loader is not None

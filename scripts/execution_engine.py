@@ -561,6 +561,10 @@ def place_live_trade(
         'quantity': format_decimal(quantity, quantity_precision),
         'newOrderRespType': 'RESULT',
     }
+    entry_id_seed = int(time_module.time() * 1000)
+    entry_id_prefix = f"bm_{str(candidate.symbol).upper()}_{str(position_side).lower()}_ent_"
+    entry_client_order_id = ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in f'{entry_id_prefix}{entry_id_seed}')[:36]
+    entry_params['newClientOrderId'] = entry_client_order_id
     if execution_mode == 'maker_only':
         tick_size = float(getattr(meta, 'tick_size', 0.0) or 0.0)
         price_precision = int(getattr(meta, 'price_precision', 4) or 4)
@@ -578,6 +582,50 @@ def place_live_trade(
         entry_params['positionSide'] = position_side
     started_at = time_module.time()
     post_only_rejection = False
+
+    def cancel_entry_and_confirm(order: Dict[str, Any]) -> Dict[str, Any]:
+        order_id = order.get('orderId')
+        client_order_id = order.get('clientOrderId') or entry_params.get('newClientOrderId')
+        cancel_params = {'symbol': candidate.symbol}
+        if order_id is not None:
+            cancel_params['orderId'] = order_id
+        elif client_order_id:
+            cancel_params['origClientOrderId'] = client_order_id
+        cancel_response: Dict[str, Any] = {}
+        cancel_error: Optional[Exception] = None
+        try:
+            if hasattr(client, 'signed_delete'):
+                cancel_response = client.signed_delete('/fapi/v1/order', params=cancel_params) or {}
+            elif hasattr(client, 'signed_post'):
+                cancel_response = client.signed_post('/fapi/v1/order/cancel', cancel_params) or {}
+        except Exception as exc:
+            cancel_error = exc
+        confirmed: Dict[str, Any] = {}
+        try:
+            confirmed = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id) or {}
+        except Exception:
+            confirmed = cancel_response
+        final_order = confirmed or cancel_response or order
+        final_status = str(final_order.get('status') or '').upper()
+        if final_status not in {'CANCELED', 'EXPIRED', 'REJECTED', 'FILLED'}:
+            filled_now = _to_float(final_order.get('executedQty'), default=_to_float(order.get('executedQty'), default=0.0))
+            if filled_now > 0:
+                try:
+                    place_stop_market_order(
+                        client,
+                        candidate.symbol,
+                        float(candidate.stop_price),
+                        filled_now,
+                        meta,
+                        side=position_side,
+                        runtime_trade_id=str(client_order_id or entry_id_seed),
+                    )
+                except Exception as stop_exc:
+                    raise binance_api_error(f'entry cancellation unresolved and emergency stop failed: {stop_exc}') from stop_exc
+            detail = f': {cancel_error}' if cancel_error is not None else ''
+            raise binance_api_error(f'entry cancellation not confirmed; refusing replacement order{detail}')
+        return final_order
+
     try:
         entry_order = client.signed_post('/fapi/v1/order', entry_params)
         if execution_mode == 'maker_only':
@@ -588,32 +636,29 @@ def place_live_trade(
             confirmed = entry_order
             for attempt in range(retry_count + 1):
                 status = str(entry_order.get('status') or '').upper() if isinstance(entry_order, dict) else ''
-                if _to_float(entry_order.get('executedQty'), default=0.0) > 0 or status in {'FILLED', 'PARTIALLY_FILLED'}:
+                if status == 'FILLED':
+                    break
+                if _to_float(entry_order.get('executedQty'), default=0.0) > 0 or status == 'PARTIALLY_FILLED':
+                    entry_order = cancel_entry_and_confirm(entry_order)
                     break
                 while time_module.time() - started_at <= timeout_seconds:
                     confirmed = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id)
                     status = str(confirmed.get('status') or '').upper()
-                    if _to_float(confirmed.get('executedQty'), default=0.0) > 0 or status in {'FILLED', 'PARTIALLY_FILLED'}:
+                    if status == 'FILLED':
                         entry_order = confirmed
+                        break
+                    if _to_float(confirmed.get('executedQty'), default=0.0) > 0 or status == 'PARTIALLY_FILLED':
+                        entry_order = cancel_entry_and_confirm(confirmed)
                         break
                     time_module.sleep(0.5)
                 if _to_float(entry_order.get('executedQty'), default=0.0) > 0:
                     break
-                try:
-                    cancel_params = {'symbol': candidate.symbol}
-                    if order_id is not None:
-                        cancel_params['orderId'] = order_id
-                    elif client_order_id:
-                        cancel_params['origClientOrderId'] = client_order_id
-                    if hasattr(client, 'signed_delete'):
-                        client.signed_delete('/fapi/v1/order', params=cancel_params)
-                    elif hasattr(client, 'signed_post'):
-                        client.signed_post('/fapi/v1/order/cancel', cancel_params)
-                except Exception:
-                    pass
+                entry_order = cancel_entry_and_confirm(entry_order)
                 if attempt >= retry_count:
                     break
                 started_at = time_module.time()
+                entry_client_order_id = ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in f'{entry_id_prefix}{entry_id_seed}_r{attempt + 1}')[:36]
+                entry_params['newClientOrderId'] = entry_client_order_id
                 entry_order = client.signed_post('/fapi/v1/order', entry_params)
                 order_id = entry_order.get('orderId') if isinstance(entry_order, dict) else order_id
                 client_order_id = entry_order.get('clientOrderId') if isinstance(entry_order, dict) else client_order_id
@@ -626,7 +671,7 @@ def place_live_trade(
             entry_position_mode = 'ONE_WAY'
         elif '-1007' in error_message and 'unknown' in error_message.lower():
             try:
-                entry_order = recover_unknown_entry_order(client, candidate, quantity, quantity_precision)
+                entry_order = recover_unknown_entry_order(client, candidate, quantity, quantity_precision, client_order_id=entry_params.get('newClientOrderId'))
             except Exception as recovery_exc:
                 message = str(recovery_exc)
                 error_payload = {
@@ -656,6 +701,7 @@ def place_live_trade(
                 fallback_params.pop('timeInForce', None)
                 fallback_params.pop('price', None)
                 fallback_params['type'] = 'MARKET'
+                fallback_params['newClientOrderId'] = ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in f'{entry_id_prefix}{entry_id_seed}_tk')[:36]
                 log_runtime_event('post_only_taker_fallback', {
                     'symbol': candidate.symbol,
                     'side': position_side,

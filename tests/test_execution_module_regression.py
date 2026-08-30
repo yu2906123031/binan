@@ -170,6 +170,64 @@ def test_build_candidate_module_exports_entry_point():
     assert hasattr(candidate_mod, 'build_candidate')
 
 
+def test_partial_maker_fill_cancels_remainder_before_protecting_filled_quantity():
+    class PartialClient:
+        def __init__(self):
+            self.calls = []
+
+        def signed_post(self, path, params):
+            self.calls.append(('POST', path, dict(params)))
+            if path == '/fapi/v1/leverage':
+                return {'leverage': params['leverage']}
+            if path == '/fapi/v1/order':
+                return {'orderId': 77, 'clientOrderId': params['newClientOrderId'], 'status': 'PARTIALLY_FILLED', 'avgPrice': '100', 'executedQty': '4', 'cumQuote': '400'}
+            raise AssertionError(path)
+
+        def signed_delete(self, path, params):
+            self.calls.append(('DELETE', path, dict(params)))
+            return {'orderId': 77, 'status': 'CANCELED', 'avgPrice': '100', 'executedQty': '4', 'cumQuote': '400'}
+
+    client = PartialClient()
+    stop_quantities = []
+    result = exec_mod.place_live_trade(
+        client,
+        make_candidate(),
+        leverage=3,
+        meta=make_meta(),
+        args=make_args(),
+        binance_api_error=mod.BinanceAPIError,
+        ensure_symbol_margin_type_fn=lambda *_a, **_k: {'ok': True, 'actual': 'ISOLATED'},
+        round_step=mod.round_step,
+        format_decimal=mod.format_decimal,
+        should_send_position_side=lambda _client: True,
+        is_position_side_mode_error=lambda _exc: False,
+        mark_one_way_position_mode=lambda _client: None,
+        build_trade_management_plan=mod.build_trade_management_plan,
+        fetch_open_positions=lambda _client: [],
+        fetch_open_orders=lambda _client, _symbol=None: [],
+        fetch_open_algo_orders=lambda _client, _symbol=None: [],
+        place_stop_market_order=lambda _client, _symbol, _stop, qty, _meta, **_kwargs: stop_quantities.append(qty) or {'orderId': 88},
+        place_take_profit_market_order=None,
+        resolve_position_protection_status=lambda *_a, **_k: {'status': 'protected'},
+        recover_unknown_entry_order=lambda *_a, **_k: {},
+        query_order=lambda *_a, **_k: {'orderId': 77, 'status': 'CANCELED', 'avgPrice': '100', 'executedQty': '4', 'cumQuote': '400'},
+        log_runtime_event=lambda *_a, **_k: None,
+        emit_notification=lambda *_a, **_k: None,
+        normalize_position_side=mod.normalize_position_side,
+        build_position_key=mod.build_position_key,
+        position_row_matches_symbol_side=mod.position_row_matches_symbol_side,
+        _to_float=mod._to_float,
+        compute_execution_quality_size_adjustment=lambda _candidate: {'size_multiplier': 1.0, 'execution_mode': 'maker_only', 'execution_liquidity_grade': 'A', 'absolute_slippage_bps': 0.0},
+        asdict=mod.asdict,
+        position_side_long=mod.POSITION_SIDE_LONG,
+        time_module=time,
+    )
+
+    assert any(method == 'DELETE' and path == '/fapi/v1/order' for method, path, _params in client.calls)
+    assert result['filled_quantity'] == 4.0
+    assert stop_quantities == [4.0]
+
+
 def test_build_candidate_wrapper_matches_extracted_module(monkeypatch):
     sentinel = object()
     captured = {}
@@ -414,7 +472,17 @@ def test_place_live_trade_extracted_module_matches_main_module(monkeypatch):
     )
 
     assert script_result == extracted_result
-    assert script_client.calls == extracted_client.calls
+    assert len(script_client.calls) == len(extracted_client.calls)
+    for script_call, extracted_call in zip(script_client.calls, extracted_client.calls):
+        assert script_call[0] == extracted_call[0]
+        script_params = dict(script_call[1])
+        extracted_params = dict(extracted_call[1])
+        script_client_id = script_params.pop('newClientOrderId', None)
+        extracted_client_id = extracted_params.pop('newClientOrderId', None)
+        assert script_params == extracted_params
+        if script_call[0] == '/fapi/v1/order':
+            assert str(script_client_id).startswith('bm_TESTUSDT_long_ent_')
+            assert str(extracted_client_id).startswith('bm_TESTUSDT_long_ent_')
     assert extracted_result['filled_quantity'] == 6.5
     assert extracted_result['trade_management_plan']['quantity'] == 6.5
     assert extracted_result['entry_order_feedback']['status'] == 'FILLED'

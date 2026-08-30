@@ -1294,6 +1294,11 @@ class Candidate:
     spread_bps: float = 0.0
     orderbook_slope: float = 0.0
     cancel_rate: float = 0.0
+    top_depth_usdt: float = 0.0
+    available_depth_usdt: float = 0.0
+    estimated_impact_pct: float = 0.0
+    best_bid_price: float = 0.0
+    best_ask_price: float = 0.0
     loser_rank: Optional[int] = None
     trigger_confirmation_flags: Dict[str, bool] = field(default_factory=dict)
     trigger_confirmation_count: int = 0
@@ -4432,6 +4437,28 @@ def projected_position_keys(open_positions: Sequence[Dict[str, Any]], orders: Se
     return {key for key in keys if key and not key.endswith(':')}
 
 
+def opening_orders_as_risk_positions(orders: Sequence[Dict[str, Any]], fallback_price: float = 0.0) -> List[Dict[str, Any]]:
+    projected: List[Dict[str, Any]] = []
+    for order in orders or []:
+        if not isinstance(order, dict) or not is_opening_order(order):
+            continue
+        original_quantity = abs(_to_float(order.get('origQty') or order.get('quantity') or order.get('qty')))
+        executed_quantity = abs(_to_float(order.get('executedQty') or order.get('cumQty')))
+        remaining_quantity = max(original_quantity - executed_quantity, 0.0)
+        if remaining_quantity <= 0:
+            continue
+        price = abs(_to_float(order.get('price') or order.get('avgPrice') or order.get('stopPrice') or order.get('triggerPrice') or fallback_price))
+        projected.append({
+            'symbol': str(order.get('symbol') or '').upper(),
+            'positionSide': order_opening_side(order),
+            'positionAmt': remaining_quantity,
+            'quantity': remaining_quantity,
+            'notional': remaining_quantity * price,
+            'source': 'pending_opening_order',
+        })
+    return projected
+
+
 def cancel_open_order(client: Any, order: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(order.get('symbol') or '')
     order_id = order.get('orderId')
@@ -4911,6 +4938,13 @@ def derive_microstructure_inputs(
         if total_depth > 0 and price_span > 0:
             orderbook_slope = round(total_depth / price_span, 4)
 
+    bid_depth_usdt = sum(max(_to_float(level[0]), 0.0) * max(_to_float(level[1]), 0.0) for level in bids if len(level) > 1)
+    ask_depth_usdt = sum(max(_to_float(level[0]), 0.0) * max(_to_float(level[1]), 0.0) for level in asks if len(level) > 1)
+    best_bid_price = max(_to_float(bids[0][0]), 0.0) if bids and len(bids[0]) > 1 else 0.0
+    best_ask_price = max(_to_float(asks[0][0]), 0.0) if asks and len(asks[0]) > 1 else 0.0
+    top_bid_depth_usdt = best_bid_price * max(_to_float(bids[0][1]), 0.0) if best_bid_price > 0 and bids else 0.0
+    top_ask_depth_usdt = best_ask_price * max(_to_float(asks[0][1]), 0.0) if best_ask_price > 0 and asks else 0.0
+
     cancel_rate = 0.0
     samples = [sample for sample in list(book_ticker_samples or []) if isinstance(sample, dict)]
     if samples:
@@ -4941,6 +4975,14 @@ def derive_microstructure_inputs(
         'orderbook_slope': orderbook_slope,
         'book_depth_fill_ratio': book_depth_fill_ratio,
         'cancel_rate': cancel_rate,
+        'bid_levels': bids,
+        'ask_levels': asks,
+        'bid_depth_usdt': round(bid_depth_usdt, 4),
+        'ask_depth_usdt': round(ask_depth_usdt, 4),
+        'top_bid_depth_usdt': round(top_bid_depth_usdt, 4),
+        'top_ask_depth_usdt': round(top_ask_depth_usdt, 4),
+        'best_bid_price': best_bid_price,
+        'best_ask_price': best_ask_price,
     }
 
 
@@ -8759,6 +8801,7 @@ def run_scan_once(client: Optional[BinanceFuturesClient], args: argparse.Namespa
                 execution_slippage_hard_veto_r=float(getattr(args, 'execution_slippage_hard_veto_r', 0.25) or 0.25),
                 execution_slippage_risk_threshold_r=float(getattr(args, 'execution_slippage_risk_threshold_r', 0.15) or 0.15),
                 trigger_min_confirmations=int(getattr(args, 'trigger_min_confirmations', 2) or 2),
+                expected_reward_r=float(getattr(args, 'tp1_r', 1.0) or 1.0),
                 base_acceleration_ratio=float(getattr(args, 'base_acceleration_ratio', 1.25) or 1.25),
                 side=candidate_side,
                 early_reject_stats=early_reject_stats,
@@ -10766,35 +10809,23 @@ def position_side_from_exchange_position(row: Any, default: str = POSITION_SIDE_
     return normalize_position_side(row_side, default)
 
 
-def recover_unknown_entry_order(client: Any, candidate: Candidate, quantity: float, quantity_precision: int) -> Dict[str, Any]:
+def recover_unknown_entry_order(client: Any, candidate: Candidate, quantity: float, quantity_precision: int, client_order_id: Optional[str] = None) -> Dict[str, Any]:
     position_side = normalize_position_side(getattr(candidate, 'side', POSITION_SIDE_LONG))
-    submit_side = 'SELL' if position_side == POSITION_SIDE_SHORT else 'BUY'
-    params = {
-        'symbol': candidate.symbol,
-        'side': submit_side,
-        'type': 'MARKET',
-        'quantity': format_decimal(quantity, quantity_precision),
-        'newOrderRespType': 'RESULT',
-    }
-    if should_send_position_side(client):
-        params['positionSide'] = position_side
-    try:
-        response = client.signed_post('/fapi/v1/order', params)
-    except Exception as retry_exc:
-        if not should_send_position_side(client) or not is_position_side_mode_error(retry_exc):
-            raise BinanceAPIError(f'entry order status remained unknown after timeout recovery attempt: {retry_exc}') from retry_exc
-        mark_one_way_position_mode(client)
-        params.pop('positionSide', None)
+    if not client_order_id:
+        raise BinanceAPIError('entry order status remained unknown: missing idempotency client order id')
+    confirmed: Dict[str, Any] = {}
+    last_error: Optional[Exception] = None
+    for _ in range(5):
         try:
-            response = client.signed_post('/fapi/v1/order', params)
-        except Exception as one_way_retry_exc:
-            raise BinanceAPIError(f'entry order status remained unknown after timeout recovery attempt: {one_way_retry_exc}') from one_way_retry_exc
-    order_id = response.get('orderId') if isinstance(response, dict) else None
-    client_order_id = response.get('clientOrderId') if isinstance(response, dict) else None
-    try:
-        confirmed = query_order(client, candidate.symbol, order_id=order_id, client_order_id=client_order_id)
-    except Exception as confirm_exc:
-        raise BinanceAPIError(f'entry order status remained unknown after timeout recovery attempt: {confirm_exc}') from confirm_exc
+            confirmed = query_order(client, candidate.symbol, client_order_id=client_order_id)
+            if confirmed:
+                break
+        except Exception as confirm_exc:
+            last_error = confirm_exc
+        time.sleep(0.4)
+    if not confirmed:
+        raise BinanceAPIError(f'entry order status remained unknown after idempotent lookup: {last_error or "empty response"}') from last_error
+    order_id = confirmed.get('orderId')
     payload = {
         'symbol': candidate.symbol,
         'side': position_side,
@@ -11482,6 +11513,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         after_symbol_loss_cooldown_minutes=int(getattr(args, 'after_symbol_loss_cooldown_minutes', 180) or 0),
         loss_deweighted_score_penalty=float(getattr(args, 'loss_deweighted_score_penalty', 12.0) or 0.0),
         score_threshold=float(getattr(args, 'score_threshold', 0.0) or 0.0),
+        aggressive_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0),
     )
     if getattr(args, 'live', False) and not binance_simulated_trading:
         open_positions = fetch_open_positions(client)
@@ -11492,7 +11524,7 @@ def run_loop(client: Any, args: argparse.Namespace) -> Dict[str, Any]:
         pending_opening_orders = []
         projected_open_positions = []
     portfolio_risk_guard = evaluate_portfolio_risk_guards(
-        open_positions=open_positions,
+        open_positions=list(open_positions) + opening_orders_as_risk_positions(pending_opening_orders, float(getattr(best_candidate, 'last_price', 0.0) or 0.0)),
         candidate=best_candidate,
         max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0),
         max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0),
@@ -11944,7 +11976,7 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
         cycle['risk_guard'] = evaluate_risk_guards(risk_state=risk_state, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0))
         return {'ok': True, 'cycle': cycle, 'manager_update': {'kind': 'cycle', 'cycle': cycle, 'state': 'SCAN', 'reason': 'no_candidate'}}
     event_updates: List[Dict[str, Any]] = [append_candidate_selected_event(None, best_candidate, regime_payload=scan_result.get('market_regime', {}) if isinstance(scan_result, dict) else {}, extra={'profile': getattr(args, 'profile', 'default'), 'live_requested': bool(getattr(args, 'live', False)), 'scan_only': bool(getattr(args, 'scan_only', False)), 'execution_exchange': execution_exchange})]
-    risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''))
+    risk_guard = evaluate_risk_guards(symbol=best_candidate.symbol, risk_state=risk_state, candidate=best_candidate, daily_max_loss_usdt=float(getattr(args, 'daily_max_loss_usdt', 0.0) or 0.0), max_consecutive_losses=int(getattr(args, 'max_consecutive_losses', 0) or 0), symbol_cooldown_minutes=int(getattr(args, 'symbol_cooldown_minutes', 0) or 0), base_risk_usdt=float(getattr(args, 'risk_usdt', 0.0) or 0.0), gross_heat_cap_r=float(getattr(args, 'gross_heat_cap_r', 0.0) or 0.0), same_theme_heat_cap_r=float(getattr(args, 'same_theme_heat_cap_r', 0.0) or 0.0), same_correlation_heat_cap_r=float(getattr(args, 'same_correlation_heat_cap_r', 0.0) or 0.0), portfolio_narrative_bucket=getattr(best_candidate, 'portfolio_narrative_bucket', ''), portfolio_correlation_group=getattr(best_candidate, 'portfolio_correlation_group', ''), aggressive_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
     open_positions = fetch_open_positions(client) if getattr(args, 'live', False) and not binance_simulated_trading else []
     pending_opening_orders: List[Dict[str, Any]] = []
     if getattr(args, 'live', False) and not binance_simulated_trading:
@@ -11954,7 +11986,7 @@ def scan_only_cycle(client: Any, args: argparse.Namespace, *, store: Optional[Ru
             if isinstance(order, dict) and is_opening_order(order)
         ]
     projected_open_positions = projected_position_keys(open_positions, pending_opening_orders)
-    portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=open_positions, candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
+    portfolio_risk_guard = evaluate_portfolio_risk_guards(open_positions=list(open_positions) + opening_orders_as_risk_positions(pending_opening_orders, float(getattr(best_candidate, 'last_price', 0.0) or 0.0)), candidate=best_candidate, max_long_positions=int(getattr(args, 'max_long_positions', 0) or 0), max_short_positions=int(getattr(args, 'max_short_positions', 0) or 0), max_net_exposure_usdt=float(getattr(args, 'max_net_exposure_usdt', 0.0) or 0.0), max_gross_exposure_usdt=float(getattr(args, 'max_gross_exposure_usdt', 0.0) or 0.0), per_symbol_single_side_only=bool(getattr(args, 'per_symbol_single_side_only', True)), opposite_side_flip_cooldown_minutes=int(getattr(args, 'opposite_side_flip_cooldown_minutes', 0) or 0))
     risk_guard = {'allowed': bool(risk_guard.get('allowed', True)) and bool(portfolio_risk_guard.get('allowed', True)), 'reasons': list(risk_guard.get('reasons', [])) + list(portfolio_risk_guard.get('reasons', [])), 'cooldown_until': risk_guard.get('cooldown_until'), 'normalized_risk_state': risk_guard.get('normalized_risk_state', default_risk_state()), 'portfolio': portfolio_risk_guard, 'trigger_confidence': risk_guard.get('trigger_confidence', {'level': 'confirmed', 'score': 1.0, 'factors': []}), 'execution_mode': risk_guard.get('execution_mode', 'taker'), 'execution_size_multiplier': risk_guard.get('execution_size_multiplier', 1.0), 'trigger_state': risk_guard.get('trigger_state', 'confirmed'), 'trigger_gate_action': risk_guard.get('trigger_gate_action', 'execute')}
     if risk_guard['allowed'] and risk_guard.get('execution_mode') in {'maker_probe', 'maker_confirm'}:
         size_multiplier = max(min(float(risk_guard.get('execution_size_multiplier') or 1.0), 1.0), 0.0)

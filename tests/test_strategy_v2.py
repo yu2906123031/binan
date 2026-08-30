@@ -4060,11 +4060,13 @@ def test_place_initial_stop_with_retries_supports_short_longer_retry_chain(monke
         'initial_stop_place_attempt_succeeded',
         'initial_stop_placed',
     ]
-    assert calls == [
+    assert calls[:2] == [
         ('/fapi/v1/marginType', {'symbol': 'TESTUSDT', 'marginType': 'ISOLATED'}),
         ('/fapi/v1/leverage', {'symbol': 'TESTUSDT', 'leverage': 5}),
-        ('/fapi/v1/order', {'symbol': 'TESTUSDT', 'side': 'BUY', 'type': 'LIMIT', 'quantity': '6.5', 'newOrderRespType': 'RESULT', 'timeInForce': 'GTX', 'price': '100.00', 'positionSide': 'LONG'}),
     ]
+    assert calls[2][0] == '/fapi/v1/order'
+    assert calls[2][1].pop('newClientOrderId').startswith('bm_TESTUSDT_long_ent_')
+    assert calls[2][1] == {'symbol': 'TESTUSDT', 'side': 'BUY', 'type': 'LIMIT', 'quantity': '6.5', 'newOrderRespType': 'RESULT', 'timeInForce': 'GTX', 'price': '100.00', 'positionSide': 'LONG'}
 
 
 def test_place_live_trade_handles_long_retry_chain_before_stop_success(monkeypatch):

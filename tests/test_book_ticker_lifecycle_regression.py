@@ -5,6 +5,8 @@ import threading
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / 'scripts'
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -131,6 +133,8 @@ def test_real_monitor_results_persist_and_preserve_market_data_timestamps():
 
 def test_runtime_doctor_rejects_stale_historical_healthy_status(tmp_path):
     path = Path('/root/.hermes/scripts/binance_runtime_ctl.py')
+    if not path.exists():
+        pytest.skip('external runtime control integration script is not installed')
     spec = importlib.util.spec_from_file_location('runtime_ctl_lifecycle', path)
     ctl = importlib.util.module_from_spec(spec); spec.loader.exec_module(ctl)
     state = tmp_path / 'state'; state.mkdir()

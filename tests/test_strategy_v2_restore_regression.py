@@ -5867,6 +5867,9 @@ def test_place_live_trade_recovers_entry_order_via_query_when_post_timeout_unkno
     assert result['entry_price'] == 132.5
     assert result['filled_quantity'] == 1.25
     assert any(event_type == 'entry_order_recovered' for event_type, _ in events)
+    assert client.order_attempts == 1
+    submitted_entry = next(params for path, params in client.calls if path == '/fapi/v1/order')
+    assert submitted_entry['newClientOrderId'].startswith('bm_TESTUSDT_long_ent_')
 
 
 def test_place_live_trade_keeps_10u_aggressive_probe_entry_at_profile_leverage(monkeypatch):

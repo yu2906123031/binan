@@ -145,6 +145,50 @@ def test_evaluate_risk_guards_normalizes_malformed_state_and_keeps_candidate_all
     assert payload['normalized_risk_state']['portfolio_heat_r_by_correlation'] == {}
 
 
+def test_daily_loss_guard_does_not_block_on_profit_and_blocks_on_loss():
+    profitable = evaluate_risk_guards(
+        risk_state={'daily_realized_pnl_usdt': 12.0},
+        daily_max_loss_usdt=10.0,
+    )
+    losing = evaluate_risk_guards(
+        risk_state={'daily_realized_pnl_usdt': -12.0},
+        daily_max_loss_usdt=10.0,
+    )
+
+    assert 'daily_max_loss_reached' not in profitable['reasons']
+    assert 'daily_max_loss_reached' in losing['reasons']
+
+
+def test_expired_symbol_deweight_is_removed_instead_of_applied_forever():
+    candidate = make_candidate(score=60.0, score_threshold=55.0)
+    payload = evaluate_risk_guards(
+        symbol='NEARUSDT',
+        candidate=candidate,
+        now_ts=10_000,
+        risk_state={'loss_deweighted_symbols': {'NEARUSDT': {'cooldown_until': 9_000, 'score_penalty': 12.0}}},
+        score_threshold=55.0,
+    )
+
+    assert 'symbol_loss_deweighted_score_below_threshold' not in payload['reasons']
+    assert 'NEARUSDT' not in payload['normalized_risk_state']['loss_deweighted_symbols']
+
+
+def test_pending_opening_order_is_counted_in_directional_and_gross_exposure():
+    pending = main_mod.opening_orders_as_risk_positions([
+        {'symbol': 'ETHUSDT', 'side': 'BUY', 'positionSide': 'LONG', 'type': 'LIMIT', 'origQty': '2', 'executedQty': '0.5', 'price': '100'},
+    ])
+    payload = evaluate_portfolio_risk_guards(
+        open_positions=pending,
+        candidate=SimpleNamespace(symbol='BTCUSDT', side='LONG', notional=60.0),
+        max_long_positions=1,
+        max_gross_exposure_usdt=200.0,
+    )
+
+    assert pending[0]['notional'] == 150.0
+    assert 'max_long_positions_reached' in payload['reasons']
+    assert 'max_gross_exposure_reached' in payload['reasons']
+
+
 def test_evaluate_risk_guards_blocks_liquidity_grade_c_when_depth_is_too_thin():
     candidate = make_candidate(
         risk_per_unit=1.0,
@@ -363,7 +407,7 @@ def test_evaluate_portfolio_risk_guards_blocks_short_count_and_net_exposure_from
     assert payload['snapshot']['candidate_side'] == POSITION_SIDE_SHORT
 
 
-def test_evaluate_portfolio_risk_guards_marks_flip_cooldown_when_single_side_guard_is_enabled():
+def test_evaluate_portfolio_risk_guards_uses_single_side_guard_for_active_opposite_position():
     candidate = SimpleNamespace(symbol='DOGEUSDT', side='SHORT', notional=40.0)
     open_positions = [
         {'symbol': 'DOGEUSDT', 'positionSide': 'LONG', 'notional': 75.0},
@@ -377,10 +421,7 @@ def test_evaluate_portfolio_risk_guards_marks_flip_cooldown_when_single_side_gua
     )
 
     assert payload['allowed'] is False
-    assert payload['reasons'] == [
-        'per_symbol_single_side_only_violation',
-        'opposite_side_flip_cooldown_active',
-    ]
+    assert payload['reasons'] == ['per_symbol_single_side_only_violation']
     assert payload['snapshot']['symbol_sides']['DOGEUSDT'] == [POSITION_SIDE_LONG]
 
 

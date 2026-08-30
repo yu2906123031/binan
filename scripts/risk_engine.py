@@ -41,8 +41,6 @@ def evaluate_portfolio_risk_guards(
             active_sides = snapshot['symbol_sides'].get(candidate_symbol, [])
             if active_sides and candidate_side not in active_sides:
                 reasons.append('per_symbol_single_side_only_violation')
-            if opposite_side_flip_cooldown_minutes > 0 and active_sides and candidate_side not in active_sides:
-                reasons.append('opposite_side_flip_cooldown_active')
         projected_net = snapshot['net_exposure_usdt'] + (candidate_notional if candidate_side == position_side_long else -candidate_notional)
         projected_gross = snapshot['gross_exposure_usdt'] + candidate_notional
         if max_net_exposure_usdt > 0 and abs(projected_net) >= max_net_exposure_usdt:
@@ -130,8 +128,8 @@ def evaluate_risk_guards(
         current_utc_hour = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).hour
         if allowed_hours and current_utc_hour not in allowed_hours:
             reasons.append('session_filter_blocked')
-    pnl = abs(_to_float(normalized.get('daily_realized_pnl_usdt')))
-    if daily_max_loss_usdt > 0 and pnl >= daily_max_loss_usdt:
+    pnl = _to_float(normalized.get('daily_realized_pnl_usdt'))
+    if daily_max_loss_usdt > 0 and pnl <= -daily_max_loss_usdt:
         reasons.append('daily_max_loss_reached')
     if max_consecutive_losses > 0 and int(normalized.get('consecutive_losses', 0) or 0) >= max_consecutive_losses:
         reasons.append('max_consecutive_losses_reached')
@@ -229,7 +227,10 @@ def evaluate_risk_guards(
             if rolling_loss_value < 0 and cooldown_seconds_after_loss > 0:
                 deweighted_until = ts + cooldown_seconds_after_loss
                 normalized['loss_deweighted_symbols'][normalized_symbol] = {'cooldown_until': deweighted_until, 'score_penalty': score_threshold_penalty}
-        if base_score_threshold > 0 and deweighted_until and ts >= deweighted_until and candidate_score < base_score_threshold + score_threshold_penalty:
+        if deweighted_until and ts >= deweighted_until:
+            normalized['loss_deweighted_symbols'].pop(normalized_symbol, None)
+            deweighted_until = 0
+        if base_score_threshold > 0 and deweighted_until and ts < deweighted_until and candidate_score < base_score_threshold + score_threshold_penalty:
             reasons.append('symbol_loss_deweighted_score_below_threshold')
         must_pass_flags = getattr(candidate, 'must_pass_flags', None)
         if not isinstance(must_pass_flags, dict):

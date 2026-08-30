@@ -124,6 +124,15 @@ def finalize_candidate_construction(
     trigger_confirmation: Dict[str, Any],
     legacy_kwargs: Dict[str, Any],
     waiting_breakout: bool,
+    spread_bps: float = 0.0,
+    orderbook_slope: float = 0.0,
+    cancel_rate: float = 0.0,
+    top_depth_usdt: float = 0.0,
+    available_depth_usdt: float = 0.0,
+    estimated_impact_pct: float = 0.0,
+    best_bid_price: float = 0.0,
+    best_ask_price: float = 0.0,
+    planned_notional_usdt: float = 0.0,
     expected_edge: Optional[float] = None,
     expected_total_fee_pct: Optional[float] = None,
     execution_slippage_buffer_pct: Optional[float] = None,
@@ -139,7 +148,8 @@ def finalize_candidate_construction(
         min_profit_buffer_pct = max(_safe_float(legacy_kwargs.get('min_profit_buffer_pct'), default=0.12), 0.0)
     expected_edge_floor = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
     if expected_edge is None:
-        expected_edge = max(_safe_float(legacy_kwargs.get('expected_edge'), default=expected_edge_floor + 0.05), expected_edge_floor + 0.05)
+        expected_reward_r = max(_safe_float(legacy_kwargs.get('expected_reward_r'), default=1.0), 0.0)
+        expected_edge = max(_safe_float(legacy_kwargs.get('expected_edge'), default=stop_distance_pct * expected_reward_r), 0.0)
 
     candidate = Candidate(
         symbol=symbol,
@@ -219,6 +229,15 @@ def finalize_candidate_construction(
         min_notional_usdt=float(min_notional_usdt or 0.0),
         max_notional_usdt=float(max_notional_usdt or 0.0),
         book_depth_fill_ratio=book_depth_fill_ratio,
+        spread_bps=spread_bps,
+        orderbook_slope=orderbook_slope,
+        cancel_rate=cancel_rate,
+        top_depth_usdt=top_depth_usdt,
+        available_depth_usdt=available_depth_usdt,
+        estimated_impact_pct=estimated_impact_pct,
+        best_bid_price=best_bid_price,
+        best_ask_price=best_ask_price,
+        planned_notional_usdt=planned_notional_usdt,
         liquidity_grade=liquidity_grade,
         loser_rank=loser_rank,
         trigger_confirmation_flags=dict(trigger_confirmation['flags']),
@@ -415,6 +434,9 @@ def build_candidate(
     quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
     if min_notional_usdt > 0:
         min_qty_by_notional = round_step(min_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
+        if min_qty_by_notional * risk_per_unit > risk_usdt * 1.000001:
+            early_reject('min_notional_exceeds_risk_budget')
+            return None
         quantity = max(quantity, min_qty_by_notional)
     if max_notional_usdt > 0:
         max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
@@ -465,6 +487,9 @@ def build_candidate(
             quantity = round_step(risk_usdt / risk_per_unit, meta.step_size, meta.quantity_precision)
             if min_notional_usdt > 0:
                 min_qty_by_notional = round_step(min_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
+                if min_qty_by_notional * risk_per_unit > risk_usdt * 1.000001:
+                    early_reject('min_notional_exceeds_risk_budget')
+                    return None
                 quantity = max(quantity, min_qty_by_notional)
             if max_notional_usdt > 0:
                 max_qty_by_notional = round_step(max_notional_usdt / last_price, meta.step_size, meta.quantity_precision)
@@ -799,13 +824,43 @@ def build_candidate(
             setup_ready = False
             trigger_confirmation['setup_ready'] = False
             trigger_confirmation['flags']['watch_only_breakout_distance'] = True
-    expected_slippage_pct = round(max(entry_distance_from_breakout_pct, 0.0) * 0.35, 4)
+    planned_notional_usdt = max(quantity * last_price, 0.0)
+    depth_levels = microstructure_inputs.get('ask_levels') if trade_side == TRADE_SIDE_LONG else microstructure_inputs.get('bid_levels')
+    depth_levels = list(depth_levels or [])
+    remaining_quantity = quantity
+    filled_quantity = 0.0
+    fill_notional = 0.0
+    last_fill_price = 0.0
+    for level in depth_levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2 or remaining_quantity <= 0:
+            continue
+        level_price = max(_to_float(level[0]), 0.0)
+        level_quantity = max(_to_float(level[1]), 0.0)
+        if level_price <= 0 or level_quantity <= 0:
+            continue
+        take_quantity = min(level_quantity, remaining_quantity)
+        filled_quantity += take_quantity
+        fill_notional += take_quantity * level_price
+        last_fill_price = level_price
+        remaining_quantity -= take_quantity
+    book_depth_fill_ratio = round(clamp(filled_quantity / quantity if quantity > 0 else 0.0, 0.0, 1.0), 4)
+    average_fill_price = fill_notional / filled_quantity if filled_quantity > 0 else 0.0
+    if average_fill_price > 0 and last_price > 0:
+        directional_slippage = ((average_fill_price / last_price) - 1.0) if trade_side == TRADE_SIDE_LONG else ((last_price / average_fill_price) - 1.0)
+        expected_slippage_pct = round(max(directional_slippage * 100.0, 0.0), 4)
+    else:
+        expected_slippage_pct = round(max(entry_distance_from_breakout_pct, 0.0) * 0.35, 4)
+    estimated_impact_pct = 0.0
+    if last_fill_price > 0 and last_price > 0:
+        estimated_impact_pct = round(abs(last_fill_price - last_price) / last_price * 100.0, 4)
+    relevant_depth_usdt = max(_to_float(microstructure_inputs.get('ask_depth_usdt' if trade_side == TRADE_SIDE_LONG else 'bid_depth_usdt')), 0.0)
+    top_depth_usdt = max(_to_float(microstructure_inputs.get('top_ask_depth_usdt' if trade_side == TRADE_SIDE_LONG else 'top_bid_depth_usdt')), 0.0)
     expected_total_fee_pct = round(max(_to_float(legacy_kwargs.get('expected_total_fee_pct'), default=0.16), 0.0), 4)
     execution_slippage_buffer_pct = round(max(_to_float(legacy_kwargs.get('execution_slippage_buffer_pct'), default=max(expected_slippage_pct, 0.05)), 0.0), 4)
     min_profit_buffer_pct = round(max(_to_float(legacy_kwargs.get('min_profit_buffer_pct'), default=0.12), 0.0), 4)
     expected_edge_floor = expected_total_fee_pct + execution_slippage_buffer_pct + min_profit_buffer_pct
-    expected_edge = round(max(_to_float(legacy_kwargs.get('expected_edge'), default=max(stop_distance_pct * 0.2, expected_edge_floor + 0.05)), expected_edge_floor + 0.05), 4)
-    book_depth_fill_ratio = round(clamp(1.0 - (expected_slippage_pct / 2.0), 0.0, 1.0), 4)
+    expected_reward_r = max(_to_float(legacy_kwargs.get('expected_reward_r'), default=1.0), 0.0)
+    expected_edge = round(max(_to_float(legacy_kwargs.get('expected_edge'), default=stop_distance_pct * expected_reward_r), 0.0), 4)
     if book_depth_fill_ratio >= 0.85 and expected_slippage_pct <= 0.2:
         liquidity_grade = 'A'
     elif book_depth_fill_ratio >= 0.6 and expected_slippage_pct <= 0.5:
@@ -881,6 +936,15 @@ def build_candidate(
         liquidity_grade=liquidity_grade,
         funding_rate_threshold=funding_rate_threshold,
         tradeability_score=tradeability_score,
+        spread_bps=max(_to_float(microstructure_inputs.get('spread_bps')), 0.0),
+        orderbook_slope=max(_to_float(microstructure_inputs.get('orderbook_slope')), 0.0),
+        cancel_rate=max(_to_float(microstructure_inputs.get('cancel_rate')), 0.0),
+        top_depth_usdt=top_depth_usdt,
+        available_depth_usdt=relevant_depth_usdt,
+        estimated_impact_pct=estimated_impact_pct,
+        best_bid_price=max(_to_float(microstructure_inputs.get('best_bid_price')), 0.0),
+        best_ask_price=max(_to_float(microstructure_inputs.get('best_ask_price')), 0.0),
+        planned_notional_usdt=planned_notional_usdt,
         loser_rank=loser_rank,
         trigger_confirmation=trigger_confirmation,
         legacy_kwargs=legacy_kwargs,

@@ -1,10 +1,15 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
+import pytest
 
-MODULE_PATH = Path('/root/.hermes/scripts/binance_runtime_ctl.py')
+
+MODULE_PATH = Path(os.environ.get('BINANCE_RUNTIME_CTL_PATH', '/root/.hermes/scripts/binance_runtime_ctl.py'))
+if not MODULE_PATH.exists():
+    pytest.skip('external runtime control integration script is not installed', allow_module_level=True)
 spec = importlib.util.spec_from_file_location('binance_runtime_ctl', MODULE_PATH)
 assert spec is not None
 assert spec.loader is not None
@@ -270,4 +275,3 @@ def test_status_json_and_chinese_summary_output(tmp_path, capsys):
     assert '币安 U 本位合约运行状态' in out
     assert '交易所真实状态' in out
     assert '不开单原因: no_seed_symbols' in out
-
