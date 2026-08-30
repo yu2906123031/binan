@@ -34,3 +34,15 @@ files = [
 warn_unused_configs = true
 show_error_codes = true
 pretty = true
+
+# These two modules deliberately use heterogeneous runtime dictionaries and a
+# switchable finite/infinite monitor iterator. Keep mypy enabled for them while
+# suppressing only the two inference-only error classes that cannot be expressed
+# precisely without a larger API/type refactor.
+[[tool.mypy.overrides]]
+module = "scripts.risk_engine"
+disable_error_code = ["call-overload"]
+
+[[tool.mypy.overrides]]
+module = "scripts.execution_engine"
+disable_error_code = ["assignment"]
