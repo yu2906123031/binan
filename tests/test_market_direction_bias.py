@@ -25,10 +25,7 @@ def tickers(changes):
 
 def test_broad_rising_market_produces_long_bias():
     mod = load_module()
-    result = mod.compute_market_direction_bias(
-        tickers([5, 4, 3, 2, 1, 0.5, -0.2, -0.5]),
-        {'structural_label': 'BULL_TREND'},
-    )
+    result = mod.compute_market_direction_bias(tickers([5, 4, 3, 2, 1, 0.5, -0.2, -0.5]), {'structural_label': 'BULL_TREND'})
     assert result['bias'] == 'LONG'
     assert result['breadth_ratio'] > 0.6
     assert result['weighted_breadth_ratio'] > 0.6
@@ -39,10 +36,7 @@ def test_broad_rising_market_produces_long_bias():
 
 def test_broad_falling_market_produces_short_bias():
     mod = load_module()
-    result = mod.compute_market_direction_bias(
-        tickers([-5, -4, -3, -2, -1, -0.5, 0.2, 0.5]),
-        {'structural_label': 'BEAR_TREND'},
-    )
+    result = mod.compute_market_direction_bias(tickers([-5, -4, -3, -2, -1, -0.5, 0.2, 0.5]), {'structural_label': 'BEAR_TREND'})
     assert result['bias'] == 'SHORT'
     assert result['breadth_ratio'] < 0.4
     assert result['weighted_breadth_ratio'] < 0.4
@@ -58,10 +52,7 @@ def test_mixed_or_insufficient_market_is_neutral():
 
 def test_tiny_positive_drift_in_choppy_market_is_neutral():
     mod = load_module()
-    result = mod.compute_market_direction_bias(
-        tickers([0.03, 0.02, 0.01, 0.01, 0.01, 0.01, -3.0, -2.0]),
-        {'structural_label': 'BULL_TREND'},
-    )
+    result = mod.compute_market_direction_bias(tickers([0.03, 0.02, 0.01, 0.01, 0.01, 0.01, -3.0, -2.0]), {'structural_label': 'BULL_TREND'})
     assert result['breadth_ratio'] >= 0.55
     assert result['weighted_breadth_ratio'] >= 0.60
     assert result['median_change_pct'] > 0
@@ -72,14 +63,8 @@ def test_tiny_positive_drift_in_choppy_market_is_neutral():
 
 def test_conviction_scales_bias_strength():
     mod = load_module()
-    strong = mod.compute_market_direction_bias(
-        tickers([5, 4, 3, 2, 1, 0.8, -0.2, -0.5]),
-        {'structural_label': 'BULL_TREND'},
-    )
-    weaker = mod.compute_market_direction_bias(
-        tickers([1.0, 0.8, 0.6, 0.4, 0.2, 0.2, -1.0, -2.0]),
-        {'structural_label': 'BULL_TREND'},
-    )
+    strong = mod.compute_market_direction_bias(tickers([5, 4, 3, 2, 1, 0.8, -0.2, -0.5]), {'structural_label': 'BULL_TREND'})
+    weaker = mod.compute_market_direction_bias(tickers([1.0, 0.8, 0.6, 0.4, 0.2, 0.2, -1.0, -2.0]), {'structural_label': 'BULL_TREND'})
     assert strong['bias'] == 'LONG'
     assert weaker['bias'] == 'LONG'
     assert strong['directional_conviction'] > weaker['directional_conviction']
@@ -88,14 +73,8 @@ def test_conviction_scales_bias_strength():
 
 def test_low_liquidity_alt_noise_is_ignored():
     mod = load_module()
-    rows = [
-        {'symbol': f'TINY{i}USDT', 'priceChangePercent': '15', 'quoteVolume': '10000'}
-        for i in range(20)
-    ]
-    rows += [
-        {'symbol': f'LIQUID{i}USDT', 'priceChangePercent': '-3', 'quoteVolume': '50000000'}
-        for i in range(6)
-    ]
+    rows = [{'symbol': f'TINY{i}USDT', 'priceChangePercent': '15', 'quoteVolume': '10000'} for i in range(20)]
+    rows += [{'symbol': f'LIQUID{i}USDT', 'priceChangePercent': '-3', 'quoteVolume': '50000000'} for i in range(6)]
     result = mod.compute_market_direction_bias(rows, {'structural_label': 'BEAR_TREND'})
     assert result['ignored_low_liquidity'] == 20
     assert result['sample_size'] == 6
@@ -105,13 +84,8 @@ def test_low_liquidity_alt_noise_is_ignored():
 
 def test_single_huge_contract_cannot_overrule_broad_market():
     mod = load_module()
-    rows = [
-        {'symbol': 'MEGAUSDT', 'priceChangePercent': '8', 'quoteVolume': '100000000000'},
-    ]
-    rows += [
-        {'symbol': f'COIN{i}USDT', 'priceChangePercent': '-2', 'quoteVolume': '10000000'}
-        for i in range(9)
-    ]
+    rows = [{'symbol': 'MEGAUSDT', 'priceChangePercent': '8', 'quoteVolume': '100000000000'}]
+    rows += [{'symbol': f'COIN{i}USDT', 'priceChangePercent': '-2', 'quoteVolume': '10000000'} for i in range(9)]
     result = mod.compute_market_direction_bias(rows, {'structural_label': 'BEAR_TREND'})
     assert result['bias'] == 'SHORT'
     assert result['breadth_ratio'] < 0.45
@@ -120,10 +94,7 @@ def test_single_huge_contract_cannot_overrule_broad_market():
 
 def test_regime_conflict_keeps_bias_neutral_even_with_breadth():
     mod = load_module()
-    result = mod.compute_market_direction_bias(
-        tickers([5, 4, 3, 2, 1, 0.5, -0.2, -0.5]),
-        {'structural_label': 'BEAR_TREND'},
-    )
+    result = mod.compute_market_direction_bias(tickers([5, 4, 3, 2, 1, 0.5, -0.2, -0.5]), {'structural_label': 'BEAR_TREND'})
     assert result['bias'] == 'NEUTRAL'
 
 
@@ -131,19 +102,9 @@ def test_bias_is_soft_observable_and_preserves_both_sides():
     mod = load_module()
     long = SimpleNamespace(side='LONG', score=80.0, reasons=[])
     short = SimpleNamespace(side='SHORT', score=80.0, reasons=[])
-    payload = {
-        'bias': 'LONG',
-        'strength': 0.8,
-        'breadth_ratio': 0.75,
-        'weighted_breadth_ratio': 0.72,
-        'median_change_pct': 1.2,
-        'directional_conviction': 0.7,
-        'sample_size': 100,
-    }
-
+    payload = {'bias': 'LONG', 'strength': 0.8, 'breadth_ratio': 0.75, 'weighted_breadth_ratio': 0.72, 'median_change_pct': 1.2, 'directional_conviction': 0.7, 'sample_size': 100}
     mod.apply_market_direction_bias(long, payload)
     mod.apply_market_direction_bias(short, payload)
-
     assert long.score > 80.0
     assert 75.0 < short.score < 80.0
     assert long.market_direction_bias == short.market_direction_bias == 'LONG'
@@ -222,3 +183,40 @@ def test_not_ready_candidate_receives_stronger_ranking_cap():
     mod.apply_market_direction_bias(candidate, {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5})
     assert candidate.realizable_edge_score_multiplier <= 0.78
     assert candidate.score <= 78.0
+
+
+def test_edge_and_score_adjustments_are_idempotent():
+    mod = load_module()
+    candidate = _edge_candidate()
+    payload = {'bias': 'LONG', 'strength': 0.8, 'breadth_ratio': 0.75}
+    mod.apply_market_direction_bias(candidate, payload)
+    first = (candidate.score, candidate.expected_edge, list(candidate.reasons))
+    mod.apply_market_direction_bias(candidate, payload)
+    second = (candidate.score, candidate.expected_edge, list(candidate.reasons))
+    assert second == first
+    assert candidate.base_ranking_score == 100.0
+    assert candidate.base_expected_edge == 1.0
+
+
+def test_effective_volume_requirement_is_used_by_edge_model():
+    mod = load_module()
+    loose = _edge_candidate()
+    strict = _edge_candidate()
+    loose.effective_min_volume_multiple = 1.0
+    strict.effective_min_volume_multiple = 2.5
+    neutral = {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5}
+    mod.apply_market_direction_bias(loose, neutral)
+    mod.apply_market_direction_bias(strict, neutral)
+    assert strict.realizable_edge_model['volume_multiplier'] < loose.realizable_edge_model['volume_multiplier']
+    assert strict.expected_edge < loose.expected_edge
+
+
+def test_real_breakout_flow_confirmation_count_is_preserved():
+    mod = load_module()
+    candidate = _edge_candidate()
+    candidate.trigger_type = 'breakout'
+    candidate.breakout_flow_confirmation_count = 4
+    candidate.trigger_confirmation_flags = {'breakout_quality_pass': True, 'breakout_flow_confirmed': True}
+    mod.apply_market_direction_bias(candidate, {'bias': 'NEUTRAL', 'strength': 0.0, 'breadth_ratio': 0.5})
+    assert candidate.realizable_edge_model['flow_confirmation_count'] == 4
+    assert candidate.realizable_edge_model['breakout_multiplier'] == 1.1
