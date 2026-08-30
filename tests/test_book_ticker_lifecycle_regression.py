@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import importlib.util
+import os
 import threading
 import sys
 from pathlib import Path
@@ -132,7 +133,10 @@ def test_real_monitor_results_persist_and_preserve_market_data_timestamps():
 
 
 def test_runtime_doctor_rejects_stale_historical_healthy_status(tmp_path):
-    path = Path('/root/.hermes/scripts/binance_runtime_ctl.py')
+    path = Path(os.environ.get(
+        'BINANCE_RUNTIME_CTL_PATH',
+        str(Path(__file__).resolve().parents[1] / 'scripts' / 'binance_runtime_ctl.py'),
+    ))
     if not path.exists():
         pytest.skip('external runtime control integration script is not installed')
     spec = importlib.util.spec_from_file_location('runtime_ctl_lifecycle', path)

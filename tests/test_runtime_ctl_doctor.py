@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 
-MODULE_PATH = Path(os.environ.get('BINANCE_RUNTIME_CTL_PATH', '/root/.hermes/scripts/binance_runtime_ctl.py'))
+MODULE_PATH = Path(os.environ.get(
+    'BINANCE_RUNTIME_CTL_PATH',
+    str(Path(__file__).resolve().parents[1] / 'scripts' / 'binance_runtime_ctl.py'),
+))
 if not MODULE_PATH.exists():
     pytest.skip('external runtime control integration script is not installed', allow_module_level=True)
 spec = importlib.util.spec_from_file_location('binance_runtime_ctl', MODULE_PATH)
