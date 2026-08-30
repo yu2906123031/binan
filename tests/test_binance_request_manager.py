@@ -32,6 +32,13 @@ async def test_rate_limiter_enforces_request_spacing_without_busy_loop():
 
 
 @pytest.mark.asyncio
+async def test_rate_limiter_rejects_impossible_request_weight():
+    limiter = GlobalRateLimiter(max_requests_per_second=10, max_weight_per_minute=5)
+    with pytest.raises(ValueError, match="exceeds configured per-minute limit"):
+        await limiter.acquire(weight=6)
+
+
+@pytest.mark.asyncio
 async def test_request_manager_serializes_requests_through_priority_queue_and_tracks_weight():
     calls = []
 
@@ -64,6 +71,55 @@ async def test_retry_manager_has_bounded_budget_and_jittered_backoff():
     with pytest.raises(TimeoutError):
         await retry.run(op, is_retryable=lambda exc: True)
     assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_request_manager_tracks_retry_count():
+    attempts = 0
+
+    async def transport(req: BinanceRequest):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TimeoutError("temporary network failure")
+        return {"ok": True, "headers": {}}
+
+    manager = BinanceRequestManager(
+        transport=transport,
+        limiter=GlobalRateLimiter(max_requests_per_second=50, max_weight_per_minute=100),
+        retry_manager=RetryManager(max_attempts=3, base_delay=0.001, max_delay=0.002, jitter=0.0),
+    )
+    assert await manager.request("GET", "/retry", timeout=1.0) == {"ok": True, "headers": {}}
+    await manager.shutdown()
+    assert attempts == 3
+    assert manager.metrics.retry_count == 2
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_cancels_queued_future_without_poisoning_worker():
+    release = asyncio.Event()
+    calls = []
+
+    async def transport(req: BinanceRequest):
+        calls.append(req.path)
+        if req.path == "/slow":
+            await release.wait()
+        return {"path": req.path, "headers": {}}
+
+    manager = BinanceRequestManager(
+        transport=transport,
+        limiter=GlobalRateLimiter(max_requests_per_second=50, max_weight_per_minute=100),
+        retry_manager=RetryManager(max_attempts=1),
+    )
+    slow = asyncio.create_task(manager.request("GET", "/slow", timeout=1.0))
+    await asyncio.sleep(0.01)
+    with pytest.raises(TimeoutError, match="/queued"):
+        await manager.request("GET", "/queued", timeout=0.01)
+    release.set()
+    assert await slow == {"path": "/slow", "headers": {}}
+    assert await manager.request("GET", "/after", timeout=1.0) == {"path": "/after", "headers": {}}
+    await manager.shutdown()
+    assert calls == ["/slow", "/after"]
 
 
 @pytest.mark.asyncio
