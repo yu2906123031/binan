@@ -159,7 +159,12 @@ def _apply_realizable_edge_adjustment(candidate: Any) -> float:
     top_depth = max(float(getattr(candidate, 'top_depth_usdt', 0.0) or 0.0), 0.0)
     available_depth = max(float(getattr(candidate, 'available_depth_usdt', 0.0) or 0.0), 0.0)
     has_depth = top_depth > 0 or available_depth > 0
-    effective_min_volume = max(float(getattr(candidate, 'effective_min_volume_multiple', getattr(candidate, 'min_volume_multiple', 1.0)) or 1.0), 1.0)
+    configured_min_volume = getattr(
+        candidate,
+        'effective_min_volume_multiple',
+        getattr(candidate, 'min_volume_multiple', flags.get('breakout_min_volume_multiple', 1.0)),
+    )
+    effective_min_volume = max(float(configured_min_volume or 1.0), 1.0)
     edge_model = estimate_realizable_reward_r(
         base_reward_r=base_reward_r,
         trigger_type=trigger_type,
