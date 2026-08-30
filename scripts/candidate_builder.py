@@ -12,6 +12,44 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def detect_pullback_long_setup(
+    trade_side: str,
+    last_price: float,
+    breakout_level: float,
+    higher_tf_allowed: bool,
+    macd_hist: float,
+    macd_prev_hist: float,
+    distance_from_ema20_5m_pct: float,
+    distance_from_vwap_15m_pct: float,
+    current_open: float,
+    pullback_min_pct: float = 0.5,
+    support_tolerance_pct: float = 1.5,
+) -> bool:
+    """强势币回踩支撑做多信号（pullback_long）。
+
+    与「突破追多」互补：不要求价格必须突破近期高点，而是识别大周期上涨的强势币，
+    从近期高点回踩到 EMA20/VWAP 支撑附近后重新转强（MACD 柱改善或收阳）的低追价入场。
+    """
+    if str(trade_side or '').lower() != 'long':
+        return False
+    if not higher_tf_allowed:
+        return False
+    if breakout_level and breakout_level > 0:
+        pullback_ceiling = breakout_level * (1.0 - max(float(pullback_min_pct or 0.0), 0.0) / 100.0)
+        if last_price >= pullback_ceiling:
+            return False
+    tolerance = max(float(support_tolerance_pct or 0.0), 0.0)
+    near_ema = abs(float(distance_from_ema20_5m_pct or 0.0)) <= tolerance
+    near_vwap = abs(float(distance_from_vwap_15m_pct or 0.0)) <= tolerance
+    if not (near_ema or near_vwap):
+        return False
+    macd_turning = float(macd_hist or 0.0) > float(macd_prev_hist or 0.0)
+    bullish_candle = float(last_price or 0.0) > float(current_open or 0.0)
+    if not (macd_turning or bullish_candle):
+        return False
+    return True
+
+
 def detect_pullback_short_setup(
     trade_side: str,
     last_price: float,
@@ -506,12 +544,27 @@ def build_candidate(
     higher_tf_allowed = trend_1h['allowed'] or trend_4h['allowed']
     macd_5m = compute_macd(closes_5m)
     structure_break = last_price > max(closes_5m[-6:-1]) if trade_side == TRADE_SIDE_LONG else last_price < min(closes_5m[-6:-1])
+    current_open = last_price
+    current_bar = klines_5m[-1] if klines_5m else None
+    if current_bar and len(current_bar) > 1:
+        current_open = _to_float(current_bar[1], default=last_price)
+    pullback_long_setup = False
+    if trade_side == TRADE_SIDE_LONG and legacy_kwargs.get('pullback_long_enabled', True):
+        pullback_long_setup = detect_pullback_long_setup(
+            trade_side=trade_side,
+            last_price=last_price,
+            breakout_level=breakout_level,
+            higher_tf_allowed=higher_tf_allowed,
+            macd_hist=macd_5m.get('hist', 0.0),
+            macd_prev_hist=macd_5m.get('prev_hist', 0.0),
+            distance_from_ema20_5m_pct=distance_from_ema20_5m_pct,
+            distance_from_vwap_15m_pct=distance_from_vwap_15m_pct,
+            current_open=current_open,
+            pullback_min_pct=_to_float(legacy_kwargs.get('pullback_long_min_pct'), default=0.5),
+            support_tolerance_pct=_to_float(legacy_kwargs.get('pullback_support_tolerance_pct'), default=1.5),
+        )
     pullback_short_setup = False
     if trade_side == TRADE_SIDE_SHORT and legacy_kwargs.get('pullback_short_enabled', True):
-        current_open = last_price
-        current_bar = klines_5m[-1] if klines_5m else None
-        if current_bar and len(current_bar) > 1:
-            current_open = _to_float(current_bar[1], default=last_price)
         pullback_short_setup = detect_pullback_short_setup(
             trade_side=trade_side,
             last_price=last_price,
@@ -525,6 +578,7 @@ def build_candidate(
             rebound_min_pct=_to_float(legacy_kwargs.get('pullback_rebound_min_pct'), default=0.5),
             resistance_tolerance_pct=_to_float(legacy_kwargs.get('pullback_resistance_tolerance_pct'), default=1.5),
         )
+    pullback_setup = pullback_long_setup or pullback_short_setup
     avg_15m_change_pct = 0.0
     if len(closes_15m) >= 5:
         pct_changes_15m = []
@@ -540,13 +594,13 @@ def build_candidate(
     quote_volume_24h = _to_float(ticker.get('quoteVolume', 0.0))
     price_change_pct_24h = _to_float(ticker.get('priceChangePercent', 0.0))
 
-    if trade_side == TRADE_SIDE_LONG and last_price <= breakout_level and not near_breakout_setup:
+    if trade_side == TRADE_SIDE_LONG and last_price <= breakout_level and not near_breakout_setup and not pullback_long_setup:
         early_reject('long_breakout_not_confirmed')
         return None
     if trade_side == TRADE_SIDE_SHORT and last_price >= breakout_level and not near_breakout_setup and not pullback_short_setup:
         early_reject('short_breakdown_not_confirmed')
         return None
-    if recent_5m_change_pct < effective_min_5m_change_pct and not near_breakout_setup:
+    if recent_5m_change_pct < effective_min_5m_change_pct and not near_breakout_setup and not pullback_setup:
         early_reject('recent_5m_change_below_gate')
         return None
     if quote_volume_24h < min_quote_volume:
@@ -555,7 +609,7 @@ def build_candidate(
     if not higher_tf_allowed and not near_breakout_setup:
         early_reject('higher_timeframe_not_allowed')
         return None
-    if volume_multiple < min_volume_multiple and not near_breakout_setup:
+    if volume_multiple < min_volume_multiple and not near_breakout_setup and not pullback_setup:
         early_reject('volume_multiple_below_gate')
         return None
     if trade_side == TRADE_SIDE_LONG:
@@ -572,16 +626,16 @@ def build_candidate(
         if funding_rate_avg is not None and funding_rate_avg < (-funding_rate_avg_threshold):
             early_reject('short_funding_rate_avg_below_gate')
             return None
-    if not structure_break and not near_breakout_setup and not pullback_short_setup:
+    if not structure_break and not near_breakout_setup and not pullback_setup:
         early_reject('micro_structure_break_not_confirmed')
         return None
-    if trade_side == TRADE_SIDE_LONG and macd_5m['hist'] <= macd_5m['prev_hist'] and not near_breakout_setup:
+    if trade_side == TRADE_SIDE_LONG and macd_5m['hist'] <= macd_5m['prev_hist'] and not near_breakout_setup and not pullback_long_setup:
         early_reject('long_macd_hist_not_accelerating')
         return None
-    if trade_side == TRADE_SIDE_SHORT and macd_5m['hist'] >= macd_5m['prev_hist'] and not near_breakout_setup:
+    if trade_side == TRADE_SIDE_SHORT and macd_5m['hist'] >= macd_5m['prev_hist'] and not near_breakout_setup and not pullback_short_setup:
         early_reject('short_macd_hist_not_accelerating')
         return None
-    if acceleration_ratio < effective_acceleration_threshold and not near_breakout_setup:
+    if acceleration_ratio < effective_acceleration_threshold and not near_breakout_setup and not pullback_setup:
         early_reject('acceleration_ratio_below_gate')
         return None
 
@@ -589,6 +643,8 @@ def build_candidate(
     score = 0.0
     reasons.append(f'min_5m_change_gate={effective_min_5m_change_pct:.2f}')
     reasons.append(f'acceleration_ratio_gate={effective_acceleration_threshold:.2f}')
+    if pullback_long_setup:
+        reasons.append('pullback_long_setup')
     if pullback_short_setup:
         reasons.append('pullback_short_setup')
     if external_setup.get('enabled'):
@@ -761,11 +817,11 @@ def build_candidate(
             'state_reasons': list(state_payload.get('state_reasons', [])) + [squeeze_reason],
             'exhaustion_score': min(float(state_payload.get('exhaustion_score', 0.0) or 0.0), max(float(state_payload.get('setup_score', 0.0) or 0.0) - 0.5, 0.0)),
         }
-    if pullback_short_setup and state_payload.get('state') in {'none', 'distribution'}:
+    if pullback_setup and state_payload.get('state') in {'none', 'distribution'}:
         state_payload = {
             **state_payload,
             'state': 'watch',
-            'state_reasons': list(state_payload.get('state_reasons', [])) + ['pullback_short_watch'],
+            'state_reasons': list(state_payload.get('state_reasons', [])) + [('pullback_long_watch' if pullback_long_setup else 'pullback_short_watch')],
         }
     score += state_payload['setup_score'] - (state_payload['exhaustion_score'] * 0.5)
     reasons.extend(smart_money_merge['sources'])
@@ -777,14 +833,14 @@ def build_candidate(
     else:
         entry_distance_from_breakout_pct = 0.0
     entry_distance_from_vwap_pct = abs(distance_from_vwap_15m_pct)
-    short_squeeze_launch = squeeze_reason in state_payload.get('state_reasons', [])
+    squeeze_launch = squeeze_reason in state_payload.get('state_reasons', [])
     overextension_flag = bool(
         state_payload['state'] in {'overheated', 'momentum_extension'}
-        or (not pullback_short_setup and short_squeeze_launch is False and entry_distance_from_breakout_pct >= max(min(max_distance_from_ema_pct * 0.5, 3.0), 0.75))
-        or (not pullback_short_setup and short_squeeze_launch is False and entry_distance_from_vwap_pct >= max(min(max_distance_from_vwap_pct * 0.5, 3.0), 0.75))
+        or (not pullback_setup and squeeze_launch is False and entry_distance_from_breakout_pct >= max(min(max_distance_from_ema_pct * 0.5, 3.0), 0.75))
+        or (not pullback_setup and squeeze_launch is False and entry_distance_from_vwap_pct >= max(min(max_distance_from_vwap_pct * 0.5, 3.0), 0.75))
     )
     trigger_confirmation = evaluate_trigger_confirmation(
-        structure_break=structure_break or pullback_short_setup,
+        structure_break=structure_break or pullback_setup,
         price_above_vwap=price_above_vwap,
         distance_from_ema20_5m_pct=distance_from_ema20_5m_pct,
         distance_from_vwap_15m_pct=distance_from_vwap_15m_pct,
@@ -809,7 +865,7 @@ def build_candidate(
     trigger_fired = bool(trigger_confirmation['trigger_fired'])
     waiting_breakout = bool(
         near_breakout_setup
-        and not pullback_short_setup
+        and not pullback_setup
         and (
             (trade_side == TRADE_SIDE_LONG and last_price <= breakout_level)
             or (trade_side == TRADE_SIDE_SHORT and last_price >= breakout_level)
