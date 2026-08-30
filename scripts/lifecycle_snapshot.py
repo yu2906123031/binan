@@ -136,7 +136,7 @@ def install_lifecycle_snapshot_hooks(strategy_module: Any) -> None:
                         'entry_price': position.get('entry_price'),
                         **snapshot,
                     }
-                    store.append_event('entry_prediction_snapshot_persisted', payload)
+                    store.append_event('entry_filled', payload)
             return legacy_event
 
         append_with_snapshot._lifecycle_snapshot_hook = True  # type: ignore[attr-defined]
