@@ -90,7 +90,7 @@ python main.py --live --auto-loop --profile 10u-aggressive-v2
 ## five-usdt-scalp-v2 profile
 
 - `five-usdt-scalp-v2` 是默认 profile，面向小仓位高频 scalp；profile 基线参数为 `risk_usdt=1.5`、`min_notional_usdt=20`、`max_notional_usdt=35`、`leverage=5`。
-- 当前 supervisor 实盘覆盖参数为 `risk_usdt=5.0`、`min_notional_usdt=60.0`、`max_notional_usdt=90.0`、`leverage=10`、`max_open_positions=2`、`max_long_positions=2`、`max_short_positions=1`、`margin_type=ISOLATED`。
+- 当前 supervisor 实盘覆盖参数由外部部署脚本/运行时配置决定；仓库 CI 不内置该外部 supervisor 脚本，因此对应 integration tests 在未提供脚本时会明确 skip。
 - 默认扫描多空两侧，启用费用感知、执行预检、缺失保护修复和 micro-scalp 评分。
 - 运行命令无需显式传 `--profile`；显式传入时也使用同一个 profile。
 
@@ -197,4 +197,6 @@ python scripts\symbol_replay.py --symbol DOGEUSDT --runtime-state-dir runtime-st
 - `python scripts\rejected_analysis.py --help` 可正常启动。
 - `python scripts\trade_bucket_analysis.py --help` 可正常启动。
 - `python scripts\symbol_replay.py --help` 可正常启动。
-- 最近一次全量测试记录为 `152 passed`；本轮新增/受影响的针对性测试已通过。
+- CI 会运行 compileall、Ruff、mypy 和全量 pytest，并使用 `pytest -rs` 显示所有 skip 原因；以最新 GitHub Actions 运行结果为准，不在文档中硬编码容易过期的通过数量。
+- `tests/test_binance_momentum_supervisor.py` 依赖外部 `scripts/binance_momentum_supervisor.py`；未提供时会明确 skip。
+- `tests/test_runtime_ctl_doctor.py` 以及 book-ticker 生命周期中的相关 integration case 依赖外部 `scripts/runtime_ctl.py`；未提供时会明确 skip。
