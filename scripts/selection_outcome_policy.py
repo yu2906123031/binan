@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import gzip
 import json
 import math
@@ -11,9 +12,12 @@ from typing import Any, Iterable, TextIO
 _STATE = threading.local()
 MIN_GLOBAL_SAMPLES = 20
 MIN_BUCKET_SAMPLES = 8
+MIN_EFFECTIVE_BUCKET_SAMPLES = 4.0
 SHRINKAGE_SAMPLES = 12.0
 MAX_EVENT_ROWS = 10000
 MAX_MULTIPLIER_ADJUSTMENT = 0.04
+OUTCOME_HALF_LIFE_DAYS = 14.0
+MAX_OUTCOME_AGE_DAYS = 60.0
 
 
 def _num(value: Any, default: float | None = None) -> float | None:
@@ -69,6 +73,31 @@ def _event_key(row: dict[str, Any]) -> tuple[str, str]:
     symbol = _text(row.get('symbol'), default='')
     side = _side(row.get('position_side') or row.get('side'))
     return symbol, side
+
+
+def _parse_time(value: Any) -> datetime.datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _outcome_weight(row: dict[str, Any], now: datetime.datetime) -> float:
+    event_time = _parse_time(row.get('closed_at') or row.get('recorded_at'))
+    if event_time is None:
+        return 1.0
+    age_days = max((now - event_time).total_seconds() / 86400.0, 0.0)
+    if age_days > MAX_OUTCOME_AGE_DAYS:
+        return 0.0
+    return math.exp(-math.log(2.0) * age_days / OUTCOME_HALF_LIFE_DAYS)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -158,48 +187,67 @@ def extract_closed_selection_outcomes(rows: Iterable[dict[str, Any]]) -> list[di
 
 
 def _feature_keys(row: dict[str, Any]) -> dict[str, str]:
+    regime = _text(row.get('market_regime_label') or row.get('regime_label'))
+    trigger = _text(row.get('trigger_class'))
+    liquidity = _text(
+        row.get('liquidity_grade_at_entry')
+        or row.get('execution_liquidity_grade')
+        or row.get('liquidity_grade')
+    )
+    relative = _relative_band(row.get('relative_selection_percentile'))
     return {
-        'trigger': _text(row.get('trigger_class')),
-        'liquidity': _text(
-            row.get('liquidity_grade_at_entry')
-            or row.get('execution_liquidity_grade')
-            or row.get('liquidity_grade')
-        ),
-        'regime': _text(row.get('market_regime_label') or row.get('regime_label')),
-        'relative': _relative_band(row.get('relative_selection_percentile')),
+        'trigger': trigger,
+        'liquidity': liquidity,
+        'regime': regime,
+        'relative': relative,
         'htf': _htf_band(row.get('selection_htf_alignment')),
         'side': _side(row.get('position_side') or row.get('side')),
+        'trigger_regime': f'{trigger}|{regime}',
+        'liquidity_regime': f'{liquidity}|{regime}',
+        'relative_regime': f'{relative}|{regime}',
     }
 
 
-def build_selection_outcome_calibration(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def build_selection_outcome_calibration(
+    rows: Iterable[dict[str, Any]],
+    *,
+    now: datetime.datetime | None = None,
+) -> dict[str, Any]:
     outcomes = extract_closed_selection_outcomes(rows)
     if not outcomes:
-        return {'sample_count': 0, 'avg_realized_r': 0.0, 'win_rate': 0.0, 'buckets': {}}
+        return {'sample_count': 0, 'effective_sample_count': 0.0, 'avg_realized_r': 0.0, 'win_rate': 0.0, 'buckets': {}}
+    effective_now = now or datetime.datetime.now(datetime.timezone.utc)
+    weighted_outcomes = [(row, _outcome_weight(row, effective_now)) for row in outcomes]
+    weighted_outcomes = [(row, weight) for row, weight in weighted_outcomes if weight > 0]
+    if not weighted_outcomes:
+        return {'sample_count': len(outcomes), 'effective_sample_count': 0.0, 'avg_realized_r': 0.0, 'win_rate': 0.0, 'buckets': {}}
 
     global_count = len(outcomes)
-    global_avg = sum(float(row['realized_r']) for row in outcomes) / global_count
-    global_win = sum(1 for row in outcomes if float(row['realized_r']) > 0) / global_count
-    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for row in outcomes:
+    total_weight = sum(weight for _row, weight in weighted_outcomes)
+    global_avg = sum(float(row['realized_r']) * weight for row, weight in weighted_outcomes) / total_weight
+    global_win = sum((1.0 if float(row['realized_r']) > 0 else 0.0) * weight for row, weight in weighted_outcomes) / total_weight
+    grouped: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    for row, weight in weighted_outcomes:
         realized = float(row['realized_r'])
         for dimension, value in _feature_keys(row).items():
-            if value not in {'', 'UNKNOWN', 'NONE', 'N/A'}:
-                grouped[(dimension, value)].append(realized)
+            if value not in {'', 'UNKNOWN', 'NONE', 'N/A'} and '|UNKNOWN' not in value and not value.startswith('UNKNOWN|'):
+                grouped[(dimension, value)].append((realized, weight))
 
     buckets: dict[str, dict[str, Any]] = {}
     for (dimension, value), samples in grouped.items():
         count = len(samples)
-        avg_r = sum(samples) / count
-        win_rate = sum(1 for sample in samples if sample > 0) / count
+        effective_count = sum(weight for _sample, weight in samples)
+        avg_r = sum(sample * weight for sample, weight in samples) / effective_count
+        win_rate = sum((1.0 if sample > 0 else 0.0) * weight for sample, weight in samples) / effective_count
         expectancy_component = math.tanh((avg_r - global_avg) / 0.5)
         win_component = max(-1.0, min((win_rate - global_win) / 0.35, 1.0))
         raw_advantage = (0.65 * expectancy_component) + (0.35 * win_component)
-        reliability = count / (count + SHRINKAGE_SAMPLES)
+        reliability = effective_count / (effective_count + SHRINKAGE_SAMPLES)
         buckets[f'{dimension}:{value}'] = {
             'dimension': dimension,
             'value': value,
             'sample_count': count,
+            'effective_sample_count': round(effective_count, 4),
             'avg_realized_r': round(avg_r, 4),
             'win_rate': round(win_rate, 4),
             'raw_advantage': round(raw_advantage, 4),
@@ -208,26 +256,36 @@ def build_selection_outcome_calibration(rows: Iterable[dict[str, Any]]) -> dict[
         }
     return {
         'sample_count': global_count,
+        'effective_sample_count': round(total_weight, 4),
         'avg_realized_r': round(global_avg, 4),
         'win_rate': round(global_win, 4),
+        'half_life_days': OUTCOME_HALF_LIFE_DAYS,
+        'max_age_days': MAX_OUTCOME_AGE_DAYS,
         'buckets': buckets,
     }
 
 
 def _candidate_feature_keys(candidate: Any) -> dict[str, str]:
+    regime = _text(
+        getattr(candidate, 'market_regime_label', '')
+        or getattr(candidate, 'regime_label', '')
+    )
+    trigger = _text(getattr(candidate, 'trigger_class', ''))
+    liquidity = _text(
+        getattr(candidate, 'execution_liquidity_grade', '')
+        or getattr(candidate, 'liquidity_grade', '')
+    )
+    relative = _relative_band(getattr(candidate, 'relative_selection_percentile', None))
     return {
-        'trigger': _text(getattr(candidate, 'trigger_class', '')),
-        'liquidity': _text(
-            getattr(candidate, 'execution_liquidity_grade', '')
-            or getattr(candidate, 'liquidity_grade', '')
-        ),
-        'regime': _text(
-            getattr(candidate, 'market_regime_label', '')
-            or getattr(candidate, 'regime_label', '')
-        ),
-        'relative': _relative_band(getattr(candidate, 'relative_selection_percentile', None)),
+        'trigger': trigger,
+        'liquidity': liquidity,
+        'regime': regime,
+        'relative': relative,
         'htf': _htf_band(getattr(candidate, 'selection_htf_alignment', None)),
         'side': _side(getattr(candidate, 'position_side', None) or getattr(candidate, 'side', None)),
+        'trigger_regime': f'{trigger}|{regime}',
+        'liquidity_regime': f'{liquidity}|{regime}',
+        'relative_regime': f'{relative}|{regime}',
     }
 
 
@@ -239,21 +297,27 @@ def compute_selection_outcome_multiplier(candidate: Any, calibration: dict[str, 
         return 1.0, 0, 0.0
 
     weights = {
-        'trigger': 0.25,
-        'liquidity': 0.15,
-        'regime': 0.20,
-        'relative': 0.20,
-        'htf': 0.10,
-        'side': 0.10,
+        'trigger': 0.12,
+        'liquidity': 0.08,
+        'regime': 0.12,
+        'relative': 0.08,
+        'htf': 0.08,
+        'side': 0.07,
+        'trigger_regime': 0.20,
+        'liquidity_regime': 0.12,
+        'relative_regime': 0.13,
     }
     weighted = 0.0
     total_weight = 0.0
     evidence_count = 0
     for dimension, value in _candidate_feature_keys(candidate).items():
-        if value in {'', 'UNKNOWN', 'NONE', 'N/A'}:
+        if value in {'', 'UNKNOWN', 'NONE', 'N/A'} or '|UNKNOWN' in value or value.startswith('UNKNOWN|'):
             continue
         bucket = buckets.get(f'{dimension}:{value}')
         if not isinstance(bucket, dict) or int(bucket.get('sample_count') or 0) < MIN_BUCKET_SAMPLES:
+            continue
+        effective_samples = float(bucket.get('effective_sample_count', bucket.get('sample_count', 0)) or 0.0)
+        if effective_samples < MIN_EFFECTIVE_BUCKET_SAMPLES:
             continue
         weight = weights[dimension]
         weighted += weight * float(bucket.get('shrunk_advantage') or 0.0)
@@ -276,6 +340,7 @@ def apply_selection_outcome_calibration(candidates: Iterable[Any], calibration: 
         candidate.selection_outcome_evidence_count = evidence_count
         candidate.selection_outcome_evidence_score = evidence_score
         candidate.selection_outcome_sample_count = int(calibration.get('sample_count') or 0)
+        candidate.selection_outcome_effective_sample_count = round(float(calibration.get('effective_sample_count', candidate.selection_outcome_sample_count) or 0.0), 4)
         candidate.score = round(base * multiplier, 4)
         reasons = [
             reason for reason in list(getattr(candidate, 'reasons', []) or [])
@@ -284,6 +349,7 @@ def apply_selection_outcome_calibration(candidates: Iterable[Any], calibration: 
         reasons.append(
             'selection_outcome='
             f'samples={candidate.selection_outcome_sample_count}:'
+            f'effective={candidate.selection_outcome_effective_sample_count:.2f}:'
             f'evidence={evidence_count}:score={evidence_score:.4f}:multiplier={multiplier:.4f}'
         )
         candidate.reasons = reasons
@@ -317,7 +383,7 @@ def install_selection_outcome_hook(relative_selection_module: Any, strategy_modu
             events = load_selection_outcome_events(store)
             calibration = build_selection_outcome_calibration(events)
         except Exception:
-            calibration = {'sample_count': 0, 'avg_realized_r': 0.0, 'win_rate': 0.0, 'buckets': {}}
+            calibration = {'sample_count': 0, 'effective_sample_count': 0.0, 'avg_realized_r': 0.0, 'win_rate': 0.0, 'buckets': {}}
 
         previous_active = getattr(_STATE, 'active', False)
         previous_calibration = getattr(_STATE, 'calibration', None)
