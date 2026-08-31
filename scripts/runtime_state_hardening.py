@@ -71,7 +71,14 @@ def install_runtime_state_hardening(runtime_store_module: Any) -> None:
     if store_cls is not None:
         original_atomic_write = getattr(store_cls, '_atomic_write_json', None)
         if callable(original_atomic_write) and not getattr(original_atomic_write, '_durability_hardened', False):
-            def durable_atomic_write(self: Any, path: Path, payload: Any):
+            fsync_path_and_directory = _fsync_path_and_directory
+
+            def durable_atomic_write(
+                self: Any,
+                path: Path,
+                payload: Any,
+                _fsync_path_and_directory=fsync_path_and_directory,
+            ):
                 result = original_atomic_write(self, path, payload)
                 _fsync_path_and_directory(Path(path))
                 return result
@@ -81,10 +88,12 @@ def install_runtime_state_hardening(runtime_store_module: Any) -> None:
 
     original_restore = getattr(runtime_store_module, 'restore_position_lifecycle_fields', None)
     if callable(original_restore) and not getattr(original_restore, '_opened_at_hardened', False):
+        infer_opened_at_for_install = infer_opened_at
+
         def restore_with_opened_at(position: Dict[str, Any], *args: Any, **kwargs: Any):
             normalized = dict(position or {})
             if not normalized.get('opened_at'):
-                inferred = infer_opened_at(normalized)
+                inferred = infer_opened_at_for_install(normalized)
                 if inferred:
                     normalized['opened_at'] = inferred
             return original_restore(normalized, *args, **kwargs)
