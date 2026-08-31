@@ -42,12 +42,16 @@ def robust_correlation(left: Sequence[float], right: Sequence[float]) -> float |
     return max(-1.0, min(corr, 1.0))
 
 
+def _field(candidate: Any, name: str) -> Any:
+    return candidate.get(name) if isinstance(candidate, dict) else getattr(candidate, name, None)
+
+
 def _group(candidate: Any) -> str:
     for name in (
         'portfolio_correlation_group', 'correlation_group', 'portfolio_narrative_bucket',
         'narrative_bucket', 'sector', 'sector_name', 'category', 'theme', 'market_segment',
     ):
-        value = str(getattr(candidate, name, '') or '').strip().upper()
+        value = str(_field(candidate, name) or '').strip().upper()
         if value and value not in {'UNKNOWN', 'NONE', 'N/A', 'OTHER'}:
             return value
     return ''
@@ -55,9 +59,9 @@ def _group(candidate: Any) -> str:
 
 def evaluate_portfolio_incremental_risk(candidate: Any, open_positions: Iterable[Any]) -> dict[str, Any]:
     candidate_returns = _series(
-        getattr(candidate, 'recent_returns_1h', None)
-        or getattr(candidate, 'recent_returns_4h', None)
-        or getattr(candidate, 'recent_returns', None)
+        _field(candidate, 'recent_returns_1h')
+        or _field(candidate, 'recent_returns_4h')
+        or _field(candidate, 'recent_returns')
     )
     candidate_group = _group(candidate)
     same_group = 0
@@ -67,12 +71,10 @@ def evaluate_portfolio_incremental_risk(candidate: Any, open_positions: Iterable
         if candidate_group and group and group == candidate_group:
             same_group += 1
         position_returns = _series(
-            getattr(position, 'recent_returns_1h', None) if not isinstance(position, dict) else position.get('recent_returns_1h')
+            _field(position, 'recent_returns_1h')
+            or _field(position, 'recent_returns_4h')
+            or _field(position, 'recent_returns')
         )
-        if not position_returns and isinstance(position, dict):
-            position_returns = _series(position.get('recent_returns_4h') or position.get('recent_returns'))
-        elif not position_returns:
-            position_returns = _series(getattr(position, 'recent_returns_4h', None) or getattr(position, 'recent_returns', None))
         corr = robust_correlation(candidate_returns, position_returns)
         if corr is not None:
             correlations.append(corr)
