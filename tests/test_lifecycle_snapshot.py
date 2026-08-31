@@ -27,6 +27,7 @@ class Store:
 
 def test_build_entry_prediction_snapshot_merges_candidate_and_fill_feedback():
     candidate = SimpleNamespace(
+        side='LONG',
         expected_edge=1.2,
         expected_slippage_pct=0.08,
         last_price=100.0,
@@ -53,13 +54,58 @@ def test_build_entry_prediction_snapshot_merges_candidate_and_fill_feedback():
     assert snapshot['expected_edge'] == 1.2
     assert snapshot['predicted_slippage_bps'] == 8.0
     assert snapshot['actual_fill_slippage_bps'] == 10.0
+    assert snapshot['actual_fill_slippage_abs_bps'] == 10.0
     assert snapshot['slippage_error_bps'] == 2.0
+    assert snapshot['within_expected_slippage'] is False
     assert snapshot['maker_or_taker'] == 'maker'
     assert snapshot['liquidity_grade_at_entry'] == 'A'
     assert snapshot['market_regime_label'] == 'risk_on'
     assert snapshot['market_regime_multiplier'] == 1.1
+    assert snapshot['market_price_at_submit'] == 100.0
+    assert snapshot['fill_price'] == 100.1
     assert snapshot['stop_distance_pct'] == 2.0
     assert snapshot['prediction_snapshot_native'] is True
+
+
+def test_directional_slippage_marks_favorable_fills_negative_for_both_sides():
+    long_candidate = SimpleNamespace(side='LONG', last_price=100.0, stop_price=98.0)
+    short_candidate = SimpleNamespace(side='SHORT', last_price=100.0, stop_price=102.0)
+
+    long_snapshot = mod.build_entry_prediction_snapshot(
+        long_candidate,
+        {'entry_price': 99.9, 'entry_order_feedback': {'predicted_slippage_bps': 8.0}},
+    )
+    short_snapshot = mod.build_entry_prediction_snapshot(
+        short_candidate,
+        {'entry_price': 100.1, 'entry_order_feedback': {'predicted_slippage_bps': 8.0}},
+    )
+
+    assert long_snapshot['actual_fill_slippage_bps'] == -10.0
+    assert long_snapshot['actual_fill_slippage_abs_bps'] == 10.0
+    assert long_snapshot['slippage_error_bps'] == -18.0
+    assert long_snapshot['within_expected_slippage'] is True
+    assert short_snapshot['actual_fill_slippage_bps'] == -10.0
+    assert short_snapshot['actual_fill_slippage_abs_bps'] == 10.0
+    assert short_snapshot['within_expected_slippage'] is True
+
+
+def test_market_price_at_submit_overrides_candidate_last_price():
+    candidate = SimpleNamespace(side='SHORT', last_price=100.0, stop_price=102.0)
+    snapshot = mod.build_entry_prediction_snapshot(
+        candidate,
+        {
+            'entry_price': 99.8,
+            'entry_order_feedback': {
+                'market_price_at_submit': 99.9,
+                'predicted_slippage_bps': 5.0,
+                'liquidity_grade': 'B',
+            },
+        },
+    )
+    assert snapshot['entry_reference_price'] == 99.9
+    assert snapshot['market_price_at_submit'] == 99.9
+    assert snapshot['liquidity_grade_at_entry'] == 'B'
+    assert snapshot['actual_fill_slippage_bps'] == 10.01
 
 
 def test_install_hooks_persists_snapshot_and_emits_enriched_entry_fill():
@@ -90,6 +136,7 @@ def test_install_hooks_persists_snapshot_and_emits_enriched_entry_fill():
     )
     mod.install_lifecycle_snapshot_hooks(strategy)
     candidate = SimpleNamespace(
+        side='LONG',
         expected_edge=0.9,
         expected_slippage_pct=0.05,
         last_price=100.0,
@@ -122,6 +169,7 @@ def test_install_hooks_persists_snapshot_and_emits_enriched_entry_fill():
     assert enriched['expected_edge'] == 0.9
     assert enriched['maker_or_taker'] == 'maker'
     assert enriched['actual_fill_slippage_bps'] == 10.0
+    assert enriched['market_price_at_submit'] == 100.0
 
 
 def test_install_hooks_is_idempotent():
