@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import statistics
 import threading
 from typing import Any, Iterable
 
@@ -53,6 +54,21 @@ def _percentiles(candidates: list[Any], getter, *, higher_is_better: bool = True
     return result
 
 
+def _cohort_confidence(cohort: list[Any]) -> float:
+    """Shrink cross-sectional tilts when the cohort is small or nearly tied."""
+    if len(cohort) < 3:
+        return 0.0
+    count_confidence = min(1.0, 0.45 + 0.11 * (len(cohort) - 3))
+    bases = [float(getattr(item, 'score', 0.0) or 0.0) for item in cohort]
+    median = statistics.median(bases) if bases else 0.0
+    if abs(median) <= 1e-9:
+        dispersion_confidence = 0.65
+    else:
+        relative_range = (max(bases) - min(bases)) / max(abs(median), 1e-9)
+        dispersion_confidence = max(0.35, min(relative_range / 0.20, 1.0))
+    return round(max(0.0, min(count_confidence * dispersion_confidence, 1.0)), 4)
+
+
 def rerank_candidate_cohort(candidates: Iterable[Any]) -> list[Any]:
     cohort = list(candidates)
     if len(cohort) < 3:
@@ -66,6 +82,7 @@ def rerank_candidate_cohort(candidates: Iterable[Any]) -> list[Any]:
         (0.10, _percentiles(cohort, lambda c: _num(getattr(c, 'quote_volume_24h', None)), higher_is_better=True)),
         (0.15, _percentiles(cohort, _freshness, higher_is_better=True)),
     ]
+    cohort_confidence = _cohort_confidence(cohort)
 
     for candidate in cohort:
         if not hasattr(candidate, 'relative_selection_base_score'):
@@ -79,14 +96,18 @@ def rerank_candidate_cohort(candidates: Iterable[Any]) -> list[Any]:
                 total_weight += weight
                 metric_count += 1
         percentile_score = weighted / total_weight if total_weight > 0 else 0.5
-        multiplier = 1.0 if metric_count < 2 else max(0.94, min(1.06, 1.0 + (percentile_score - 0.5) * 0.12))
+        raw_tilt = (percentile_score - 0.5) * 0.12
+        multiplier = 1.0 if metric_count < 2 else max(0.94, min(1.06, 1.0 + raw_tilt * cohort_confidence))
         candidate.relative_selection_percentile = round(percentile_score, 4)
         candidate.relative_selection_metric_count = metric_count
+        candidate.relative_selection_cohort_size = len(cohort)
+        candidate.relative_selection_confidence = cohort_confidence
         candidate.relative_selection_multiplier = round(multiplier, 4)
         candidate.score = round(float(candidate.relative_selection_base_score) * multiplier, 4)
         reasons = [r for r in list(getattr(candidate, 'reasons', []) or []) if not str(r).startswith('relative_selection=')]
         reasons.append(
-            f'relative_selection=percentile={percentile_score:.3f}:metrics={metric_count}:multiplier={multiplier:.4f}'
+            f'relative_selection=percentile={percentile_score:.3f}:metrics={metric_count}:'
+            f'cohort={len(cohort)}:confidence={cohort_confidence:.3f}:multiplier={multiplier:.4f}'
         )
         candidate.reasons = reasons
     return cohort
