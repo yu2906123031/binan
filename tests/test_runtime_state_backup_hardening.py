@@ -48,6 +48,24 @@ def test_corrupted_primary_positions_recovers_from_backup(tmp_path):
     assert 'BTCUSDT:LONG' in normal
 
 
+def test_corrupted_primary_runtime_state_recovers_from_backup(tmp_path):
+    store = _store(tmp_path)
+    expected = {'cooldown_until': 123.4, 'runtime_mode': 'live'}
+    store.save(expected)
+    (tmp_path / 'runtime_state.json').write_text('{broken', encoding='utf-8')
+
+    assert store.load() == expected
+
+
+def test_corrupted_primary_runtime_state_with_bad_backup_fails_closed(tmp_path):
+    store = _store(tmp_path)
+    store.save({'runtime_mode': 'live'})
+    (tmp_path / 'runtime_state.json').write_text('{broken-primary', encoding='utf-8')
+    (tmp_path / 'runtime_state.json.bak').write_text('{broken-backup', encoding='utf-8')
+
+    assert store.load() == {}
+
+
 def test_both_primary_and_backup_corrupted_returns_default_with_error(tmp_path):
     store = _store(tmp_path)
     store.save_json('positions', {'ETHUSDT:SHORT': {'symbol': 'ETHUSDT', 'side': 'short', 'quantity': 0.2, 'entry_price': 3000}})
@@ -76,10 +94,11 @@ def test_backup_is_refreshed_on_each_successful_save(tmp_path):
 
 def test_installation_is_idempotent(tmp_path):
     mod.install_runtime_state_backup_hardening(runtime_store)
-    first = runtime_store.RuntimeStateStore._atomic_write_json
+    first_atomic = runtime_store.RuntimeStateStore._atomic_write_json
+    first_load = runtime_store.RuntimeStateStore.load
     mod.install_runtime_state_backup_hardening(runtime_store)
-    second = runtime_store.RuntimeStateStore._atomic_write_json
-    assert first is second
+    assert runtime_store.RuntimeStateStore._atomic_write_json is first_atomic
+    assert runtime_store.RuntimeStateStore.load is first_load
 
     store = runtime_store.RuntimeStateStore(str(tmp_path))
     store.save_json('state', {'ok': True})
