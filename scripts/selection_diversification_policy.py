@@ -27,6 +27,26 @@ def _group_key(candidate: Any) -> str:
     return ''
 
 
+def _upstream_score(candidate: Any) -> float:
+    """Return the latest score produced by the relative-selection layer.
+
+    ``rerank_candidate_cohort`` is called repeatedly while a scan cohort grows.
+    Reconstructing the upstream score prevents an early partial-cohort score from
+    becoming a stale diversification baseline while preserving direct-call
+    idempotence when no relative-selection metadata exists.
+    """
+    relative_base = getattr(candidate, 'relative_selection_base_score', None)
+    relative_multiplier = getattr(candidate, 'relative_selection_multiplier', None)
+    if relative_base is not None and relative_multiplier is not None:
+        try:
+            return float(relative_base) * float(relative_multiplier)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(candidate, 'diversification_base_score'):
+        return float(getattr(candidate, 'diversification_base_score', 0.0) or 0.0)
+    return float(getattr(candidate, 'score', 0.0) or 0.0)
+
+
 def apply_selection_diversification(candidates: Iterable[Any]) -> list[Any]:
     """Softly deweight duplicate opportunities within the same explicit group.
 
@@ -40,10 +60,8 @@ def apply_selection_diversification(candidates: Iterable[Any]) -> list[Any]:
         return cohort
 
     for candidate in cohort:
-        if not hasattr(candidate, 'diversification_base_score'):
-            candidate.diversification_base_score = float(getattr(candidate, 'score', 0.0) or 0.0)
-        else:
-            candidate.score = round(float(candidate.diversification_base_score), 4)
+        candidate.diversification_base_score = round(_upstream_score(candidate), 4)
+        candidate.score = candidate.diversification_base_score
 
     grouped_counts: dict[tuple[bool, str], int] = defaultdict(int)
     ordered = sorted(
