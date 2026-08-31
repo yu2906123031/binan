@@ -15,6 +15,7 @@ slippage_calibration_policy_module = __import__('slippage_calibration_policy')
 install_execution_feedback_hardening = __import__('execution_feedback_hardening').install_execution_feedback_hardening
 install_lifecycle_snapshot_hooks = __import__('lifecycle_snapshot').install_lifecycle_snapshot_hooks
 install_reduce_only_risk_guard = __import__('risk_exit_guard').install_reduce_only_risk_guard
+install_relative_selection_hook = __import__('relative_selection_policy').install_relative_selection_hook
 install_rest_guard_retry_after_hardening = __import__('rest_guard_retry_after_hardening').install_rest_guard_retry_after_hardening
 install_runtime_state_backup_hardening = __import__('runtime_state_backup_hardening').install_runtime_state_backup_hardening
 install_runtime_state_hardening = __import__('runtime_state_hardening').install_runtime_state_hardening
@@ -34,6 +35,7 @@ install_trade_bucket_slippage_hardening(trade_bucket_analysis_module)
 install_slippage_cache_staleness_hardening(slippage_calibration_policy_module)
 install_selection_quality_hook(strategy_module)
 install_slippage_calibration_hooks(strategy_module)
+install_relative_selection_hook(strategy_module)
 strategy_main = strategy_module.main
 
 
