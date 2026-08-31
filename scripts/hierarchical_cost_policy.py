@@ -79,19 +79,22 @@ def _notional_bucket(value: Any) -> str:
     return 'XL'
 
 
+def _snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get('entry_prediction_snapshot')
+    return value if isinstance(value, dict) else {}
+
+
 def _slippage_bps(row: dict[str, Any]) -> float | None:
     value = row.get('actual_fill_slippage_bps')
     if value in (None, ''):
-        snapshot = row.get('entry_prediction_snapshot')
-        if isinstance(snapshot, dict):
-            value = snapshot.get('actual_fill_slippage_bps')
+        value = _snapshot(row).get('actual_fill_slippage_bps')
     if value in (None, ''):
         return None
     return _num(value)
 
 
 def _dimension(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
-    snapshot = row.get('entry_prediction_snapshot') if isinstance(row.get('entry_prediction_snapshot'), dict) else {}
+    snapshot: dict[str, Any] = _snapshot(row)
     liquidity = _text(
         row.get('liquidity_grade_at_entry')
         or row.get('execution_liquidity_grade')
@@ -208,7 +211,6 @@ def resolve_hierarchical_cost(candidate: Any, model: dict[str, Any], *, current_
         observed = max(_num(selected.get('conservative_bps')), 0.0)
         stress = max(_num(selected.get('stress_bps')), observed)
         samples = int(selected.get('sample_count') or 0)
-        # Conservative by default, but sufficiently sampled good buckets may relax very slowly.
         floor = baseline * (1.0 - MAX_RELAXATION)
         estimate = max(observed, floor) if baseline > 0 else observed
     return {
