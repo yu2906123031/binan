@@ -9,12 +9,14 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["F"]
+select = ["E4", "E7", "E9", "F", "B"]
 ignore = []
 
 [tool.mypy]
 python_version = "3.11"
 files = [
+  "scripts/binance_momentum_supervisor.py",
+  "scripts/binance_runtime_ctl.py",
   "scripts/candidate_builder.py",
   "scripts/execution_engine.py",
   "scripts/execution_engine_impl.py",
@@ -56,18 +58,3 @@ files = [
 warn_unused_configs = true
 show_error_codes = true
 pretty = true
-
-# The preserved implementation modules still contain legacy heterogeneous runtime
-# dictionaries. Keep exemptions scoped to exact inference-only error classes;
-# canonical wrappers and all new policy/hardening modules have no exemptions.
-[[tool.mypy.overrides]]
-module = "risk_engine"
-disable_error_code = ["call-overload"]
-
-[[tool.mypy.overrides]]
-module = "execution_engine_impl"
-disable_error_code = ["assignment"]
-
-[[tool.mypy.overrides]]
-module = "trade_bucket_analysis_impl"
-disable_error_code = ["assignment", "arg-type"]
