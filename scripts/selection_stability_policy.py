@@ -141,7 +141,9 @@ def update_stability_state(state: dict[str, Any], candidates: Iterable[Any], sca
         old = previous.get(symbol, {})
         streak = _projected_streak(old, scan_id)
         current_percentile = _num(getattr(candidate, 'relative_selection_percentile', None), default=0.5)
-        current_percentile = max(0.0, min(float(current_percentile or 0.5), 1.0))
+        if current_percentile is None:
+            current_percentile = 0.5
+        current_percentile = max(0.0, min(float(current_percentile), 1.0))
         previous_ema = _num(old.get('ema_percentile')) if isinstance(old, dict) else None
         ema = current_percentile if previous_ema is None else (0.65 * previous_ema) + (0.35 * current_percentile)
         try:
