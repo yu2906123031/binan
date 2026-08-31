@@ -36,9 +36,6 @@ def install_slippage_cache_staleness_hardening(policy_module: Any) -> None:
             cache['successful_at_monotonic'] = successful_at
         successful_age = current - successful_at if successful_at > 0 else None
 
-        # The underlying loader short-circuits forever when the events mtime is unchanged.
-        # Force a rebuild once the successful payload reaches its maximum age so rolling
-        # lookback windows continue to advance even without new events.
         if successful_age is not None and successful_age >= max_stale_seconds:
             cache['events_mtime_ns'] = object()
 
@@ -47,11 +44,13 @@ def install_slippage_cache_staleness_hardening(policy_module: Any) -> None:
         result = original(*args, **kwargs)
 
         if not cache.get('last_error'):
-            cache['successful_at_monotonic'] = current
+            rebuilt_payload = cache.get('payload')
+            if previous_payload is None or rebuilt_payload is not previous_payload:
+                cache['successful_at_monotonic'] = current
+            elif previous_successful_at > 0:
+                cache['successful_at_monotonic'] = previous_successful_at
             return result
 
-        # A failed rebuild may return the previous payload. Keep it only while the last
-        # successful analysis is still fresh enough; otherwise fail safe to neutral.
         if previous_payload is not None and previous_successful_at > 0:
             failure_age = current - previous_successful_at
             if 0 <= failure_age < max_stale_seconds:
