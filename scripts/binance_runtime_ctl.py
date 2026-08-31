@@ -99,14 +99,18 @@ def build_doctor_report(
     account_state: dict[str, Any],
 ) -> dict[str, Any]:
     state_dir = Path(runtime_state_dir)
-    ws = _read_json(state_dir / 'book_ticker_ws_status.json', {}) or {}
+    raw_ws = _read_json(state_dir / 'book_ticker_ws_status.json', {})
+    ws: dict[str, Any] = raw_ws if isinstance(raw_ws, dict) else {}
     threads, streams, symbols, ws_status = _ws_counts(ws)
     reasons: list[str] = []
-    if len(list(supervisor_pids)) != 1:
+    supervisor_list = list(supervisor_pids)
+    child_list = list(live_child_pids)
+    deadman_list = list(scanner_deadman_pids)
+    if len(supervisor_list) != 1:
         reasons.append('supervisor_count_not_one')
-    if len(list(live_child_pids)) != 1:
+    if len(child_list) != 1:
         reasons.append('live_child_count_not_one')
-    if list(scanner_deadman_pids):
+    if deadman_list:
         reasons.append('scanner_deadman_present')
     if threads != 1:
         reasons.append('websocket_supervisor_thread_count_not_one')
@@ -125,15 +129,18 @@ def build_doctor_report(
 
 
 def _scan_payload(last_cycle: dict[str, Any]) -> dict[str, Any]:
-    cycle = last_cycle.get('cycle') if isinstance(last_cycle, dict) else {}
-    cycle = cycle if isinstance(cycle, dict) else {}
-    scan = cycle.get('scan') if isinstance(cycle.get('scan'), dict) else cycle
-    funnel = scan.get('funnel') if isinstance(scan, dict) and isinstance(scan.get('funnel'), dict) else {}
-    summary = scan.get('summary_counters') if isinstance(scan, dict) and isinstance(scan.get('summary_counters'), dict) else {}
+    raw_cycle = last_cycle.get('cycle')
+    cycle: dict[str, Any] = raw_cycle if isinstance(raw_cycle, dict) else {}
+    raw_scan = cycle.get('scan')
+    scan: dict[str, Any] = raw_scan if isinstance(raw_scan, dict) else cycle
+    raw_funnel = scan.get('funnel')
+    funnel: dict[str, Any] = raw_funnel if isinstance(raw_funnel, dict) else {}
+    raw_summary = scan.get('summary_counters')
+    summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
     result = dict(funnel)
     result['candidate_count'] = int(funnel.get('candidate_count') or funnel.get('candidate_pool_count') or summary.get('candidate_count') or 0)
     result['selected'] = int(funnel.get('selected_risk_allowed_count') or summary.get('selected_count') or 0)
-    result['degraded'] = bool(scan.get('degraded') if isinstance(scan, dict) else cycle.get('degraded'))
+    result['degraded'] = bool(scan.get('degraded', cycle.get('degraded', False)))
     return result
 
 
@@ -159,10 +166,14 @@ def build_status_report(
     exchange_state: dict[str, Any],
 ) -> dict[str, Any]:
     state_dir = Path(runtime_state_dir)
-    last_cycle = _read_json(state_dir / 'last_cycle.json', {}) or {}
-    ws = _read_json(state_dir / 'book_ticker_ws_status.json', {}) or {}
-    ticker = _read_json(state_dir / 'ticker_24hr_cache.json', {}) or {}
-    rest = _read_json(state_dir / 'binance_rest_guard.json', {}) or {}
+    raw_last_cycle = _read_json(state_dir / 'last_cycle.json', {})
+    raw_ws = _read_json(state_dir / 'book_ticker_ws_status.json', {})
+    raw_ticker = _read_json(state_dir / 'ticker_24hr_cache.json', {})
+    raw_rest = _read_json(state_dir / 'binance_rest_guard.json', {})
+    last_cycle: dict[str, Any] = raw_last_cycle if isinstance(raw_last_cycle, dict) else {}
+    ws: dict[str, Any] = raw_ws if isinstance(raw_ws, dict) else {}
+    ticker: dict[str, Any] = raw_ticker if isinstance(raw_ticker, dict) else {}
+    rest: dict[str, Any] = raw_rest if isinstance(raw_rest, dict) else {}
     current = dt.datetime.fromtimestamp(now, dt.timezone.utc) if now is not None else dt.datetime.now(dt.timezone.utc)
     threads, streams, symbols, ws_status = _ws_counts(ws, now=current)
     funnel = _scan_payload(last_cycle)
@@ -170,12 +181,15 @@ def build_status_report(
     exchange['account_http_200'] = all(int(exchange.get(key) or 0) == 200 for key in (
         'account_status_code', 'balance_status_code', 'position_risk_status_code', 'open_orders_status_code'
     ))
+    supervisor_list = list(supervisor_pids)
+    child_list = list(live_child_pids)
+    deadman_list = list(scanner_deadman_pids)
     return {
         'exchange': exchange,
         'processes': {
-            'supervisor_count': len(list(supervisor_pids)),
-            'live_child_count': len(list(live_child_pids)),
-            'scanner_deadman_count': len(list(scanner_deadman_pids)),
+            'supervisor_count': len(supervisor_list),
+            'live_child_count': len(child_list),
+            'scanner_deadman_count': len(deadman_list),
             'websocket_supervisor_count': threads,
         },
         'runtime_state': {
