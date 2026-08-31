@@ -23,6 +23,21 @@ files = [
   "scripts/runtime_state_risk_helpers.py",
   "scripts/risk_engine.py",
   "scripts/hermes_outer_watcher.py",
+  "scripts/market_direction_bias.py",
+  "scripts/selection_quality_policy.py",
+  "scripts/relative_selection_policy.py",
+  "scripts/selection_diversification_policy.py",
+  "scripts/selection_stability_policy.py",
+  "scripts/selection_outcome_policy.py",
+  "scripts/runtime_state_backup_hardening.py",
+  "scripts/execution_feedback_hardening.py",
+  "scripts/trade_bucket_slippage_hardening.py",
+  "scripts/slippage_calibration_policy.py",
+  "scripts/slippage_cache_staleness_hardening.py",
+  "scripts/lifecycle_snapshot.py",
+  "scripts/risk_exit_guard.py",
+  "scripts/rest_guard_retry_after_hardening.py",
+  "scripts/request_throttle_hardening.py",
   "tests/test_execution_module_regression.py",
   "tests/test_strategy_v2_restore_regression.py",
   "tests/test_cli_args.py",
@@ -35,10 +50,10 @@ warn_unused_configs = true
 show_error_codes = true
 pretty = true
 
-# These two modules deliberately use heterogeneous runtime dictionaries and a
+# These two legacy cores deliberately use heterogeneous runtime dictionaries and a
 # switchable finite/infinite monitor iterator. Keep mypy enabled for them while
-# suppressing only the two inference-only error classes that cannot be expressed
-# precisely without a larger API/type refactor.
+# suppressing only the two inference-only error classes until their public data
+# structures are converted to typed records.
 [[tool.mypy.overrides]]
 module = "risk_engine"
 disable_error_code = ["call-overload"]
