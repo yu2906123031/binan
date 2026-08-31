@@ -6,7 +6,7 @@ import math
 import threading
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TextIO
 
 _STATE = threading.local()
 MIN_GLOBAL_SAMPLES = 20
@@ -74,11 +74,11 @@ def _event_key(row: dict[str, Any]) -> tuple[str, str]:
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        opener = gzip.open if path.suffix == '.gz' else path.open
+        fh: TextIO
         if path.suffix == '.gz':
-            fh = opener(path, 'rt', encoding='utf-8')
+            fh = gzip.open(path, mode='rt', encoding='utf-8')
         else:
-            fh = opener('r', encoding='utf-8')
+            fh = path.open(mode='r', encoding='utf-8')
         with fh:
             for line in fh:
                 line = line.strip()
