@@ -23,6 +23,8 @@
 
 ## 本地启动
 
+生产与开发直接依赖已固定为 CI 验证版本，避免不同部署时间解析出不同的直接依赖版本。
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -166,10 +168,10 @@ python scripts\okx_sentiment_bridge.py --help
 python scripts\rejected_analysis.py --help
 ```
 
-生成平仓 bucket expectancy 报表：
+生成平仓 bucket expectancy 报表时使用 hardened CLI；它会在分析前安装方向滑点修正，避免直接使用旧模块入口时把有利成交也当成正滑点：
 
 ```powershell
-python scripts\trade_bucket_analysis.py --runtime-state-dir runtime-state --lookback-days 7
+python scripts\trade_bucket_analysis_cli.py --runtime-state-dir runtime-state --lookback-days 7
 ```
 
 生成最近 7 天交易诊断打包产物：
@@ -195,7 +197,7 @@ python scripts\symbol_replay.py --symbol DOGEUSDT --runtime-state-dir runtime-st
 - 根入口 `python main.py --help` 可正常启动。
 - `python scripts\okx_sentiment_bridge.py --help` 可正常启动。
 - `python scripts\rejected_analysis.py --help` 可正常启动。
-- `python scripts\trade_bucket_analysis.py --help` 可正常启动。
+- `python scripts\trade_bucket_analysis_cli.py --help` 可正常启动。
 - `python scripts\symbol_replay.py --help` 可正常启动。
 - CI 会运行 compileall、Ruff、mypy 和全量 pytest，并使用 `pytest -rs` 显示所有 skip 原因；以最新 GitHub Actions 运行结果为准，不在文档中硬编码容易过期的通过数量。
 - `tests/test_binance_momentum_supervisor.py` 依赖外部 `scripts/binance_momentum_supervisor.py`；未提供时会明确 skip。
