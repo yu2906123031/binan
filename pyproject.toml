@@ -9,7 +9,7 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B"]
+select = ["E9", "F", "B023", "B904"]
 ignore = []
 
 [tool.mypy]
