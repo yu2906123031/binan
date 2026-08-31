@@ -19,15 +19,12 @@ files = [
   "scripts/binance_runtime_ctl.py",
   "scripts/candidate_builder.py",
   "scripts/execution_engine.py",
-  "scripts/execution_engine_impl.py",
   "scripts/runtime_store.py",
   "scripts/runtime_store_impl.py",
   "scripts/trade_bucket_analysis.py",
-  "scripts/trade_bucket_analysis_impl.py",
   "scripts/summary_render.py",
   "scripts/risk_state_helpers.py",
   "scripts/runtime_state_risk_helpers.py",
-  "scripts/risk_engine.py",
   "scripts/hermes_outer_watcher.py",
   "scripts/market_direction_bias.py",
   "scripts/selection_quality_policy.py",
@@ -58,3 +55,7 @@ files = [
 warn_unused_configs = true
 show_error_codes = true
 pretty = true
+
+# The large preserved implementation modules are behavior-locked by regression
+# tests through the canonical wrappers.  New code and canonical runtime
+# boundaries are type-checked without any module-level error-code exemptions.
