@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from layer_attribution import install_layer_attribution_hook
 from lifecycle_snapshot import install_lifecycle_snapshot_hooks
 from request_throttle_hardening import install_request_throttle_hardening
 from rest_guard_retry_after_hardening import install_rest_guard_retry_after_hardening
@@ -41,3 +42,7 @@ def install_startup_hardening(
     install_selection_stability_hook(relative_selection_policy_module, strategy_module)
     install_selection_outcome_hook(relative_selection_policy_module, strategy_module)
     relative_selection_policy_module.install_relative_selection_hook(strategy_module)
+
+    # Attribution stays outermost so it observes the fully composed cohort but
+    # never changes any ranking or execution decision.
+    install_layer_attribution_hook(strategy_module)
