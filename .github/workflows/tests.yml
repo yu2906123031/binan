@@ -17,8 +17,8 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: requirements-dev.txt
-      - run: python -m pip install -r requirements-dev.txt
+          cache-dependency-path: requirements-ci.lock
+      - run: python -m pip install -r requirements-ci.lock
       - run: python -m compileall -q main.py scripts tests tests_support
       - run: python -m ruff check main.py scripts tests tests_support
       - run: python -m mypy
