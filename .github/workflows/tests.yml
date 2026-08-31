@@ -20,4 +20,4 @@ jobs:
       - run: python -m compileall -q main.py scripts tests
       - run: python -m ruff check main.py scripts tests
       - run: python -m mypy
-      - run: python -m pytest -q
+      - run: python -m pytest -q -rs
