@@ -208,7 +208,7 @@ class BinanceRequestManager:
             self.queue.put_nowait(item)
         except asyncio.QueueFull:
             self.metrics.dropped_requests += 1
-            raise RuntimeError("Binance request queue full")
+            raise RuntimeError("Binance request queue full") from None
         self.metrics.enqueued_requests += 1
         self.metrics.queue_size = self.queue.qsize()
         try:
@@ -256,9 +256,13 @@ class BinanceRequestManager:
                 if item.future.cancelled():
                     continue
                 started = time.monotonic()
+                current_request = item.request
+                current_future = item.future
                 result = await self.retry_manager.run(
-                    lambda: self._run_transport(item.request),
-                    is_retryable=lambda exc: not item.future.cancelled() and self._is_retryable_request(item.request, exc),
+                    lambda request=current_request: self._run_transport(request),
+                    is_retryable=lambda exc, request=current_request, future=current_future: (
+                        not future.cancelled() and self._is_retryable_request(request, exc)
+                    ),
                     on_retry=self._record_retry,
                 )
                 self.metrics.last_latency_ms = (time.monotonic() - started) * 1000.0
