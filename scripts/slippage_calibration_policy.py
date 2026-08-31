@@ -17,11 +17,13 @@ DEFAULT_MIN_RATIO = 1.05
 DEFAULT_MAX_MULTIPLIER = 1.50
 DEFAULT_REFRESH_SECONDS = 300.0
 DEFAULT_EVENT_LIMIT = 5000
+DEFAULT_LOOKBACK_DAYS = 30
 
 _POLICY_CACHE: Dict[str, Any] = {
     'loaded_at_monotonic': 0.0,
     'events_mtime_ns': None,
     'payload': None,
+    'last_error': '',
 }
 
 
@@ -60,6 +62,7 @@ def load_calibration_payload(
     runtime_state_dir: Path | None = None,
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
     event_limit: int = DEFAULT_EVENT_LIMIT,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     now_monotonic: float | None = None,
 ) -> Dict[str, Any]:
     events_path = _runtime_events_path(runtime_state_dir)
@@ -78,20 +81,40 @@ def load_calibration_payload(
         _POLICY_CACHE['loaded_at_monotonic'] = current_monotonic
         return cached_payload
 
-    if not events_path.exists():
-        payload: Dict[str, Any] = {}
-    else:
-        payload = build_trade_bucket_analysis_payload(load_events(events_path, limit=event_limit))
+    try:
+        if not events_path.exists():
+            payload: Dict[str, Any] = {}
+        else:
+            rows = load_events(events_path, limit=max(int(event_limit or 0), 1))
+            payload = build_trade_bucket_analysis_payload(
+                rows,
+                lookback_days=max(int(lookback_days or 0), 0),
+            )
+    except Exception as exc:
+        _POLICY_CACHE['loaded_at_monotonic'] = current_monotonic
+        _POLICY_CACHE['events_mtime_ns'] = mtime_ns
+        _POLICY_CACHE['last_error'] = f'{exc.__class__.__name__}: {exc}'
+        if isinstance(cached_payload, dict):
+            return cached_payload
+        _POLICY_CACHE['payload'] = {}
+        return {}
+
     _POLICY_CACHE.update({
         'loaded_at_monotonic': current_monotonic,
         'events_mtime_ns': mtime_ns,
         'payload': payload,
+        'last_error': '',
     })
     return payload
 
 
 def reset_calibration_cache() -> None:
-    _POLICY_CACHE.update({'loaded_at_monotonic': 0.0, 'events_mtime_ns': None, 'payload': None})
+    _POLICY_CACHE.update({
+        'loaded_at_monotonic': 0.0,
+        'events_mtime_ns': None,
+        'payload': None,
+        'last_error': '',
+    })
 
 
 def _eligible_multiplier(
