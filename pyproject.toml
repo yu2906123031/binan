@@ -17,7 +17,11 @@ python_version = "3.11"
 files = [
   "scripts/candidate_builder.py",
   "scripts/execution_engine.py",
+  "scripts/execution_engine_impl.py",
   "scripts/runtime_store.py",
+  "scripts/runtime_store_impl.py",
+  "scripts/trade_bucket_analysis.py",
+  "scripts/trade_bucket_analysis_impl.py",
   "scripts/summary_render.py",
   "scripts/risk_state_helpers.py",
   "scripts/runtime_state_risk_helpers.py",
@@ -52,17 +56,17 @@ warn_unused_configs = true
 show_error_codes = true
 pretty = true
 
-# Legacy cores still use heterogeneous runtime dictionaries. Keep the exemptions
-# scoped to the exact inference-only error classes while new policy/hardening
-# modules are checked without exemptions.
+# The preserved implementation modules still contain legacy heterogeneous runtime
+# dictionaries. Keep exemptions scoped to exact inference-only error classes;
+# canonical wrappers and all new policy/hardening modules have no exemptions.
 [[tool.mypy.overrides]]
 module = "risk_engine"
 disable_error_code = ["call-overload"]
 
 [[tool.mypy.overrides]]
-module = "execution_engine"
+module = "execution_engine_impl"
 disable_error_code = ["assignment"]
 
 [[tool.mypy.overrides]]
-module = "trade_bucket_analysis"
+module = "trade_bucket_analysis_impl"
 disable_error_code = ["assignment", "arg-type"]
