@@ -1,7 +1,7 @@
 [tool.ruff]
 line-length = 140
 target-version = "py311"
-ext-exclude = [
+extend-exclude = [
   ".hermes",
   ".git",
   "__pycache__",
