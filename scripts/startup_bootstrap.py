@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from decision_risk_optimization import install_decision_risk_optimization_hook
 from layer_attribution import install_layer_attribution_hook
 from lifecycle_snapshot import install_lifecycle_snapshot_hooks
 from request_throttle_hardening import install_request_throttle_hardening
@@ -36,13 +37,15 @@ def install_startup_hardening(
     install_selection_quality_hook(strategy_module)
     slippage_calibration_policy_module.install_slippage_calibration_hooks(strategy_module)
 
-    # The relative-selection wrapper chain must be composed before the strategy
-    # scan hook captures rerank_candidate_cohort.
+    # Compose cohort-level selection first. Decision-risk optimization is then
+    # installed below those rerank wrappers but before the relative scan wrapper,
+    # so it sees final cohort metadata and can only reduce live planned notional.
     install_selection_diversification_hook(relative_selection_policy_module)
     install_selection_stability_hook(relative_selection_policy_module, strategy_module)
     install_selection_outcome_hook(relative_selection_policy_module, strategy_module)
+    install_decision_risk_optimization_hook(strategy_module)
     relative_selection_policy_module.install_relative_selection_hook(strategy_module)
 
-    # Attribution stays outermost so it observes the fully composed cohort but
-    # never changes any ranking or execution decision.
+    # Attribution stays outermost so it observes the fully composed cohort and
+    # the conservative sizing/cost annotations without changing decisions itself.
     install_layer_attribution_hook(strategy_module)
