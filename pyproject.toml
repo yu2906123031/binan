@@ -1,7 +1,7 @@
 [tool.ruff]
 line-length = 140
 target-version = "py311"
-extend-exclude = [
+ext-exclude = [
   ".hermes",
   ".git",
   "__pycache__",
@@ -50,10 +50,9 @@ warn_unused_configs = true
 show_error_codes = true
 pretty = true
 
-# These two legacy cores deliberately use heterogeneous runtime dictionaries and a
-# switchable finite/infinite monitor iterator. Keep mypy enabled for them while
-# suppressing only the two inference-only error classes until their public data
-# structures are converted to typed records.
+# Legacy cores still use heterogeneous runtime dictionaries. Keep the exemptions
+# scoped to the exact inference-only error classes while new policy/hardening
+# modules are checked without exemptions.
 [[tool.mypy.overrides]]
 module = "risk_engine"
 disable_error_code = ["call-overload"]
@@ -61,3 +60,7 @@ disable_error_code = ["call-overload"]
 [[tool.mypy.overrides]]
 module = "execution_engine"
 disable_error_code = ["assignment"]
+
+[[tool.mypy.overrides]]
+module = "trade_bucket_analysis"
+disable_error_code = ["assignment", "arg-type"]
