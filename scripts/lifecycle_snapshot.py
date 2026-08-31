@@ -33,9 +33,17 @@ ENTRY_FEEDBACK_FIELDS = (
     'maker_or_taker',
     'predicted_slippage_bps',
     'actual_fill_slippage_bps',
+    'actual_fill_slippage_abs_bps',
+    'slippage_error_bps',
+    'within_expected_slippage',
+    'predicted_fill_price',
+    'fill_price',
+    'market_price_at_submit',
     'fill_latency_ms',
     'fill_ratio',
+    'maker_fill_ratio',
     'liquidity_grade_at_entry',
+    'liquidity_grade',
     'liquidity_grade_reason',
     'post_only_taker_fallback',
 )
@@ -50,6 +58,21 @@ def _to_float(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalize_side(value: Any) -> str:
+    text = str(value or '').strip().upper()
+    if text in {'SELL', 'SHORT'}:
+        return 'SHORT'
+    return 'LONG'
+
+
+def _directional_slippage_bps(side: Any, fill_price: float, reference_price: float) -> float | None:
+    if fill_price <= 0 or reference_price <= 0:
+        return None
+    if _normalize_side(side) == 'SHORT':
+        return (reference_price - fill_price) / reference_price * 10000.0
+    return (fill_price - reference_price) / reference_price * 10000.0
 
 
 def build_entry_prediction_snapshot(candidate: Any, live_execution: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,23 +99,44 @@ def build_entry_prediction_snapshot(candidate: Any, live_execution: Dict[str, An
         if _value_present(value):
             snapshot[field] = value
 
-    entry_price = _to_float(live_execution.get('entry_price') or entry_feedback.get('avg_price'))
-    reference_price = _to_float(getattr(candidate, 'last_price', 0.0))
+    if not _value_present(snapshot.get('liquidity_grade_at_entry')):
+        feedback_grade = entry_feedback.get('liquidity_grade')
+        if _value_present(feedback_grade):
+            snapshot['liquidity_grade_at_entry'] = feedback_grade
+
+    entry_price = _to_float(
+        live_execution.get('entry_price')
+        or entry_feedback.get('fill_price')
+        or entry_feedback.get('avg_price')
+    )
+    reference_price = _to_float(
+        entry_feedback.get('market_price_at_submit')
+        or getattr(candidate, 'last_price', 0.0)
+    )
     stop_price = _to_float(getattr(candidate, 'stop_price', 0.0))
+    side = getattr(candidate, 'position_side', None) or getattr(candidate, 'side', None)
     if entry_price > 0:
         snapshot['entry_price_at_fill'] = entry_price
+        snapshot.setdefault('fill_price', entry_price)
     if reference_price > 0:
         snapshot['entry_reference_price'] = reference_price
+        snapshot['market_price_at_submit'] = reference_price
         snapshot.setdefault('shadow_entry_price', reference_price)
     if stop_price > 0:
         snapshot['initial_stop_price'] = stop_price
     if not _value_present(snapshot.get('stop_distance_pct')) and reference_price > 0 and stop_price > 0:
         snapshot['stop_distance_pct'] = abs(reference_price - stop_price) / reference_price * 100.0
 
+    directional_bps = _directional_slippage_bps(side, entry_price, reference_price)
+    if directional_bps is not None:
+        snapshot['actual_fill_slippage_bps'] = round(directional_bps, 4)
+        snapshot['actual_fill_slippage_abs_bps'] = round(abs(directional_bps), 4)
+
     predicted_bps = _to_float(snapshot.get('predicted_slippage_bps'))
     actual_bps = _to_float(snapshot.get('actual_fill_slippage_bps'))
-    if predicted_bps or actual_bps:
-        snapshot['slippage_error_bps'] = actual_bps - predicted_bps
+    if _value_present(snapshot.get('predicted_slippage_bps')) or _value_present(snapshot.get('actual_fill_slippage_bps')):
+        snapshot['slippage_error_bps'] = round(actual_bps - predicted_bps, 4)
+        snapshot['within_expected_slippage'] = actual_bps <= predicted_bps
     snapshot['prediction_snapshot_native'] = True
     snapshot['prediction_source_event'] = 'live_entry_lifecycle'
     return snapshot
