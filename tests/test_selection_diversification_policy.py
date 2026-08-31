@@ -101,6 +101,24 @@ def test_diversification_is_idempotent():
     assert second_result == first_result
 
 
+def test_diversification_refreshes_latest_relative_selection_score():
+    mod = load_module()
+    row = candidate('AAAUSDT', 100.0, 'L1')
+    peer = candidate('BBBUSDT', 90.0, 'L2')
+    row.relative_selection_base_score = 100.0
+    row.relative_selection_multiplier = 1.02
+    peer.relative_selection_base_score = 90.0
+    peer.relative_selection_multiplier = 1.00
+    mod.apply_selection_diversification([row, peer])
+    assert row.diversification_base_score == 102.0
+    assert row.score == 102.0
+
+    row.relative_selection_multiplier = 1.06
+    mod.apply_selection_diversification([row, peer])
+    assert row.diversification_base_score == 106.0
+    assert row.score == 106.0
+
+
 def test_hook_wraps_relative_reranking_once():
     mod = load_module()
     calls = []
