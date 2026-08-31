@@ -92,6 +92,24 @@ def test_backup_is_refreshed_on_each_successful_save(tmp_path):
     assert error['recovered_from_backup'] is True
 
 
+def test_corrupt_latest_backup_falls_back_to_older_generation(tmp_path):
+    store = _store(tmp_path)
+    store.save_json('settings', {'generation': 1})
+    store.save_json('settings', {'generation': 2})
+    store.save_json('settings', {'generation': 3})
+    assert (tmp_path / 'settings.json.bak.1').exists()
+    assert (tmp_path / 'settings.json.bak.2').exists()
+
+    (tmp_path / 'settings.json').write_text('{broken-primary', encoding='utf-8')
+    (tmp_path / 'settings.json.bak').write_text('{broken-latest-backup', encoding='utf-8')
+    recovered, error = store.load_json_with_error('settings', {})
+    assert recovered == {'generation': 2}
+    assert error is not None
+    assert error['recovered_from_backup'] is True
+    assert error['backup_file'] == 'settings.json.bak.1'
+    assert error['backup_generation'] == 1
+
+
 def test_installation_is_idempotent(tmp_path):
     mod.install_runtime_state_backup_hardening(runtime_store)
     first_atomic = runtime_store.RuntimeStateStore._atomic_write_json
