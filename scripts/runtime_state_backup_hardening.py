@@ -83,6 +83,25 @@ def install_runtime_state_backup_hardening(runtime_store_module: Any) -> None:
         atomic_write_with_backup._backup_hardened = True  # type: ignore[attr-defined]
         store_cls._atomic_write_json = atomic_write_with_backup
 
+    original_load = getattr(store_cls, 'load', None)
+    if callable(original_load) and not getattr(original_load, '_backup_hardened', False):
+        def load_with_backup(self: Any):
+            path = self._path()
+            with self._file_lock(path):
+                if not path.exists():
+                    return {}
+                try:
+                    payload = json.loads(path.read_text(encoding='utf-8'))
+                    return payload if isinstance(payload, dict) else {}
+                except Exception:
+                    backup_payload, backup_meta = _load_backup(path)
+            if backup_meta and backup_meta.get('recovered_from_backup') and isinstance(backup_payload, dict):
+                return backup_payload
+            return {}
+
+        load_with_backup._backup_hardened = True  # type: ignore[attr-defined]
+        store_cls.load = load_with_backup
+
     original_load_with_error = getattr(store_cls, 'load_json_with_error', None)
     if callable(original_load_with_error) and not getattr(original_load_with_error, '_backup_hardened', False):
         def load_json_with_backup(self: Any, name: str, default: Any = None):
