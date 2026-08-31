@@ -153,7 +153,8 @@ def test_runtime_calibration_refresh_is_throttled_even_when_events_change(tmp_pa
         calls['load'] += 1
         return []
 
-    def fake_build(rows):
+    def fake_build(rows, **kwargs):
+        assert kwargs['lookback_days'] == 30
         calls['build'] += 1
         return {'generation': calls['build']}
 
@@ -169,3 +170,69 @@ def test_runtime_calibration_refresh_is_throttled_even_when_events_change(tmp_pa
     assert second == first
     assert third == {'generation': 2}
     assert calls == {'load': 2, 'build': 2}
+
+
+def test_runtime_calibration_uses_configured_recent_lookback(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    events_path = runtime_dir / 'events.jsonl'
+    events_path.write_text('{}\n', encoding='utf-8')
+    received = {}
+
+    monkeypatch.setattr(mod, 'load_events', lambda path, limit=5000: [{'event_type': 'trade_invalidated'}])
+
+    def fake_build(rows, **kwargs):
+        received.update(kwargs)
+        return {'ok': True}
+
+    monkeypatch.setattr(mod, 'build_trade_bucket_analysis_payload', fake_build)
+    mod.reset_calibration_cache()
+    payload = mod.load_calibration_payload(
+        runtime_state_dir=runtime_dir,
+        refresh_seconds=0.0,
+        lookback_days=14,
+        now_monotonic=10.0,
+    )
+    assert payload == {'ok': True}
+    assert received['lookback_days'] == 14
+
+
+def test_calibration_analysis_failure_keeps_last_known_good_payload(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    events_path = runtime_dir / 'events.jsonl'
+    events_path.write_text('{}\n', encoding='utf-8')
+    mod.reset_calibration_cache()
+    mod._POLICY_CACHE.update({
+        'payload': {'generation': 'good'},
+        'loaded_at_monotonic': 0.0,
+        'events_mtime_ns': -1,
+    })
+    monkeypatch.setattr(mod, 'load_events', lambda path, limit=5000: (_ for _ in ()).throw(ValueError('corrupt events')))
+
+    payload = mod.load_calibration_payload(
+        runtime_state_dir=runtime_dir,
+        refresh_seconds=0.0,
+        now_monotonic=100.0,
+    )
+    assert payload == {'generation': 'good'}
+    assert 'ValueError: corrupt events' in mod._POLICY_CACHE['last_error']
+
+
+def test_calibration_analysis_failure_without_cache_fails_open_to_neutral(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    (runtime_dir / 'events.jsonl').write_text('{}\n', encoding='utf-8')
+    mod.reset_calibration_cache()
+    monkeypatch.setattr(mod, 'build_trade_bucket_analysis_payload', lambda rows, **kwargs: (_ for _ in ()).throw(RuntimeError('analysis failed')))
+
+    payload = mod.load_calibration_payload(
+        runtime_state_dir=runtime_dir,
+        refresh_seconds=0.0,
+        now_monotonic=100.0,
+    )
+    assert payload == {}
+    assert 'RuntimeError: analysis failed' in mod._POLICY_CACHE['last_error']
+    result = mod.resolve_slippage_calibration(SimpleNamespace(side='LONG'), payload=payload)
+    assert result['multiplier'] == 1.0
+    assert result['active'] is False
