@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import gzip
 import importlib.util
 import json
@@ -181,6 +182,47 @@ def test_multiplier_is_bounded():
     multiplier, evidence, _score = mod.compute_selection_outcome_multiplier(row, calibration)
     assert evidence == 1
     assert multiplier == 1.04
+
+
+def test_old_timestamped_outcomes_expire_from_effective_evidence():
+    mod = load_module()
+    now = datetime.datetime(2026, 8, 31, tzinfo=datetime.timezone.utc)
+    rows = []
+    for index in range(10):
+        pair = trade_events(index, 2.0, 'BREAKOUT')
+        pair[-1]['closed_at'] = '2026-06-01T00:00:00Z'
+        rows.extend(pair)
+    for index in range(10, 20):
+        pair = trade_events(index, -1.0, 'BREAKOUT')
+        pair[-1]['closed_at'] = '2026-08-30T00:00:00Z'
+        rows.extend(pair)
+    calibration = mod.build_selection_outcome_calibration(rows, now=now)
+    trigger_bucket = calibration['buckets']['trigger:BREAKOUT']
+    assert calibration['sample_count'] == 20
+    assert calibration['effective_sample_count'] < 11.0
+    assert trigger_bucket['effective_sample_count'] < 11.0
+    assert trigger_bucket['avg_realized_r'] < 0
+
+
+def test_regime_conditioned_evidence_separates_same_trigger_across_market_states():
+    mod = load_module()
+    rows = []
+    for index in range(10):
+        rows.extend(trade_events(index, 1.2, 'BREAKOUT'))
+    for index in range(10, 20):
+        pair = trade_events(index, -1.2, 'BREAKOUT')
+        pair[0]['market_regime_label'] = 'RANGE'
+        rows.extend(pair)
+    calibration = mod.build_selection_outcome_calibration(rows)
+    trend = candidate('BREAKOUT')
+    range_candidate = candidate('BREAKOUT')
+    range_candidate.market_regime_label = 'RANGE'
+    trend_multiplier, trend_evidence, trend_score = mod.compute_selection_outcome_multiplier(trend, calibration)
+    range_multiplier, range_evidence, range_score = mod.compute_selection_outcome_multiplier(range_candidate, calibration)
+    assert trend_evidence >= 2
+    assert range_evidence >= 2
+    assert trend_score > range_score
+    assert trend_multiplier > range_multiplier
 
 
 def test_hook_is_idempotent():
