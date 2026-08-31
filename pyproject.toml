@@ -46,6 +46,7 @@ files = [
   "scripts/startup_bootstrap.py",
   "tests/test_execution_module_regression.py",
   "tests/test_strategy_v2_restore_regression.py",
+  "tests_support/strategy_v2_restore_regression_impl.py",
   "tests/test_cli_args.py",
   "tests/test_run_loop_smoke.py",
   "tests/test_scan_summary_mode_regression.py",
